@@ -1,10 +1,16 @@
-//! Linked IDs: union-find over the link pairs, then a flat lookup table from
-//! a user code to the code of its person's name (the byte-wise smallest ID).
+//! Linked IDs: union-find over the link pairs, then a lookup table from a
+//! user code to the code of its person's name (the byte-wise smallest ID).
 //!
 //! The union-find lives inside one hash table (`Forest`): a node holds an ID
 //! and the slot of its parent, so finding an ID and reaching its tree node is
 //! one memory access, and the lines that the pairs coming up will need are
 //! prefetched while the current pair is joined.
+//!
+//! The lookup table (`LinkTable`) is written from the forest in one pass, in
+//! the order of the IDs' hashes: a bitmap that says which IDs have an entry,
+//! and the entries packed with no gaps. It is about a quarter of the size of
+//! a hash table of the same IDs, and most IDs that have no entry never get
+//! past the bitmap.
 //!
 //! A build can also be given a grouping of the IDs (`build_grouped`). A link
 //! component is then simple when all its members are in one group and complex
@@ -17,57 +23,68 @@ use std::hash::BuildHasherDefault;
 use super::codes::{id_cmp, mix, unmix, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE};
 use crate::reference::FastHasher;
 
-const HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
-/// Set in a stored name when the ID's link component is complex.
+/// Set in a name on its way into the table when the component is complex.
 const COMPLEX_BIT: u64 = 1 << 63;
 
-/// Open-addressing table of `(user code, name code)` for every linked ID whose
-/// person is named by a different ID, and for every member of a complex
-/// component, its own name included; those names carry `COMPLEX_BIT`.
-/// Anything not in the table names itself and is simple.
+/// An entry of the table, from the low bits up: the complex flag; how many
+/// positions after its home position the entry sits; the bits of the ID's
+/// hash that the home position does not give; and the name code.
+const ENTRY_COMPLEX: u64 = 1;
+const ENTRY_NAME_SHIFT: u32 = 64 - CODE_BITS;
+const ENTRY_KEY_MASK: u64 = (1 << ENTRY_NAME_SHIFT) - 2;
+/// The table has 2^bits positions, with bits between these. At the fewest an
+/// entry has 19 hash bits and 2 displacement bits beside the flag.
+const MIN_POSITION_BITS: u32 = 23;
+const MAX_POSITION_BITS: u32 = CODE_BITS - 1;
+/// A lookup looks at up to 2^this entries; more displacement goes to the stash.
+const MAX_DISPLACEMENT_BITS: u32 = 4;
+
+/// The lookup table: an entry for every linked ID whose person is named by a
+/// different ID, and for every member of a complex component, its own name
+/// included. Anything without an entry names itself and is simple.
+///
+/// An ID's hash gives its home position among 2^23 or more. `bits` has a bit
+/// for every position that holds an entry, and the entries themselves are
+/// packed in position order in `entries`, so most IDs without an entry are
+/// answered by one bit of a small bitmap, and an entry costs 8 bytes with no
+/// empty slots between. An entry sits at its home position or just after it,
+/// and says how far; the position and the hash bits it keeps identify its ID.
 pub struct LinkTable {
-    slots: Vec<[u64; 2]>,
-    mask: usize,
-    shift: u32,
+    bits: Vec<u64>,
+    /// For every 256 positions: the entries before them (from bit 24 up),
+    /// and the entries of the block before its words 1, 2 and 3 (8 bits each).
+    blocks: Vec<u64>,
+    entries: Vec<u64>,
+    /// Hash bits below the ones that pick the home position.
+    rem_bits: u32,
+    displacement_bits: u32,
+    /// The entries that found no room close enough to their home position:
+    /// ID to name, with `COMPLEX_BIT`. Empty unless hashes crowd.
+    stash: HashMap<u64, u64>,
     /// Every member of every complex component.
     complex: Vec<u64>,
-    /// The name of every simple component of two or more IDs. The slots do
-    /// not hold these IDs, since they name themselves.
+    /// The name of every simple component of two or more IDs. These IDs
+    /// have no entry, since they name themselves.
     simple_names: Vec<u64>,
 }
 
 impl LinkTable {
-    fn with_capacity(entries: usize) -> Self {
-        let bits = (entries.max(4) * 2).next_power_of_two().trailing_zeros();
-        let capacity = 1usize << bits;
-        Self {
-            slots: vec![[0, 0]; capacity],
-            mask: capacity - 1,
-            shift: 64 - bits,
-            complex: Vec::new(),
-            simple_names: Vec::new(),
-        }
-    }
-
-    /// `name` is the name code, with `COMPLEX_BIT` for a complex component.
-    fn insert(&mut self, user: u64, name: u64) {
-        let mut at = (user.wrapping_mul(HASH_MULTIPLIER) >> self.shift) as usize;
-        loop {
-            if self.slots[at][0] == 0 {
-                self.slots[at] = [user, name];
-                return;
-            }
-            at = (at + 1) & self.mask;
-        }
-    }
-
-    /// Starts loading the cache line `person(user)` reads first, so that a
-    /// lookup a few records later finds it in the cache. Changes no result.
+    /// Starts loading what `lookup(user)` will read, so that a lookup a few
+    /// records later finds it in the cache. Changes no result.
+    ///
+    /// The bitmap is small and stays cached; the entry is what a lookup
+    /// would wait for. So this reads the ID's bit itself and prefetches the
+    /// entry when there is one. It takes no branch on the bit, which is as
+    /// good as random.
     #[inline(always)]
     pub fn prefetch(&self, user: u64) {
-        let at = (user.wrapping_mul(HASH_MULTIPLIER) >> self.shift) as usize;
-        // `at` is inside the table: the same index `person` starts from.
-        prefetch_line(self.slots.as_ptr().wrapping_add(at));
+        let home = (mix(user) >> self.rem_bits) as usize;
+        // SAFETY: `bits` has a word for every home position.
+        let word = unsafe { *self.bits.get_unchecked(home >> 6) };
+        // The entry, when there is one; otherwise this table, which is in the cache.
+        let set = (word >> (home & 63)) & 1 != 0;
+        let entry = self.entries.as_ptr().wrapping_add(self.rank(home, word));
+        prefetch_line(if set { entry } else { self as *const Self as *const u64 });
     }
 
     /// The name code of the person `user` belongs to. Codes are never 0.
@@ -77,21 +94,56 @@ impl LinkTable {
     }
 
     /// The name code of the person `user` belongs to, and whether that
-    /// person's link component is complex, in one probe. An ID that is in no
-    /// link line names itself and is simple.
+    /// person's link component is complex. An ID that is in no link line
+    /// names itself and is simple.
     #[inline(always)]
     pub fn lookup(&self, user: u64) -> (u64, bool) {
-        let mut at = (user.wrapping_mul(HASH_MULTIPLIER) >> self.shift) as usize;
-        loop {
-            // SAFETY: `at` is always masked into the table.
-            let slot = unsafe { self.slots.get_unchecked(at) };
-            if slot[0] == user {
-                return (slot[1] & CODE_MASK, slot[1] & COMPLEX_BIT != 0);
-            }
-            if slot[0] == 0 {
+        // The same hash as the forest's, so the forest's order is the table's.
+        let hash = mix(user);
+        let home = (hash >> self.rem_bits) as usize;
+        // SAFETY: `bits` has a word for every home position.
+        let word = unsafe { *self.bits.get_unchecked(home >> 6) };
+        if (word >> (home & 63)) & 1 == 0 {
+            return (user, false);
+        }
+        let rank = self.rank(home, word);
+        let key = (hash << (self.displacement_bits + 1)) & ENTRY_KEY_MASK;
+        // SAFETY: a set bit has an entry at its rank.
+        let entry = unsafe { *self.entries.get_unchecked(rank) };
+        if entry & ENTRY_KEY_MASK == key {
+            return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        }
+        self.lookup_further(user, home, rank, key)
+    }
+
+    /// How many entries are at positions before `home`, whose word of `bits` is `word`.
+    #[inline(always)]
+    fn rank(&self, home: usize, word: u64) -> usize {
+        // SAFETY: `blocks` has a word for every four words of `bits`.
+        let block = unsafe { *self.blocks.get_unchecked(home >> 8) };
+        let in_block = ((block << 8) >> (8 * ((home >> 6) & 3))) & 0xFF;
+        (block >> 24) as usize + in_block as usize + (word & ((1u64 << (home & 63)) - 1)).count_ones() as usize
+    }
+
+    /// The rest of `lookup` when the entry at the home position is another
+    /// ID's: the entries at the positions after it, then the stash.
+    #[inline(never)]
+    fn lookup_further(&self, user: u64, home: usize, rank: usize, key: u64) -> (u64, bool) {
+        for step in 1..1usize << self.displacement_bits {
+            let at = home + step;
+            // SAFETY: `bits` has room for the positions after the last home position.
+            if (unsafe { *self.bits.get_unchecked(at >> 6) } >> (at & 63)) & 1 == 0 {
                 return (user, false);
             }
-            at = (at + 1) & self.mask;
+            // SAFETY: the positions from `home` to `at` all hold entries, in rank order.
+            let entry = unsafe { *self.entries.get_unchecked(rank + step) };
+            if entry & ENTRY_KEY_MASK == key | (step as u64) << 1 {
+                return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+            }
+        }
+        match self.stash.get(&user) {
+            Some(&name) => (name & CODE_MASK, name & COMPLEX_BIT != 0),
+            None => (user, false),
         }
     }
 
@@ -108,14 +160,100 @@ impl LinkTable {
     /// their components. An ID that is alone in a simple component (linked
     /// only to itself, and in a group) is not visited. In no particular order.
     pub fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
-        for slot in &self.slots {
-            if slot[0] != 0 {
-                visit(slot[0], slot[1] & CODE_MASK, slot[1] & COMPLEX_BIT != 0);
+        let rem_mask = (1u64 << self.rem_bits) - 1;
+        let mut rank = 0;
+        for (index, &word) in self.bits.iter().enumerate() {
+            let mut left = word;
+            while left != 0 {
+                let at = (index * 64 + left.trailing_zeros() as usize) as u64;
+                left &= left - 1;
+                let entry = self.entries[rank];
+                rank += 1;
+                // The position less the displacement is the home position:
+                // the high bits of the ID's hash, above the bits the entry kept.
+                let key = (entry & ENTRY_KEY_MASK) >> 1;
+                let home = at - (key & ((1 << self.displacement_bits) - 1));
+                let hash = (home << self.rem_bits) | ((key >> self.displacement_bits) & rem_mask);
+                visit(unmix(hash), entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
             }
+        }
+        for (&user, &name) in &self.stash {
+            visit(user, name & CODE_MASK, name & COMPLEX_BIT != 0);
         }
         for &name in &self.simple_names {
             visit(name, name, false);
         }
+    }
+}
+
+/// Fills a `LinkTable` from entries that come in the order of their hashes.
+struct TableWriter {
+    table: LinkTable,
+    /// The first position after the last entry.
+    next_free: usize,
+}
+
+impl TableWriter {
+    /// A writer for about `entries` entries.
+    fn new(entries: usize) -> Self {
+        // At most a quarter of the positions hold an entry.
+        let position_bits = (entries * 4).next_power_of_two().trailing_zeros();
+        Self::with_position_bits(entries, position_bits.clamp(MIN_POSITION_BITS, MAX_POSITION_BITS))
+    }
+
+    fn with_position_bits(entries: usize, position_bits: u32) -> Self {
+        let displacement_bits = (position_bits + ENTRY_NAME_SHIFT - CODE_BITS - 1).min(MAX_DISPLACEMENT_BITS);
+        // A word of padding for the positions that entries of the last home
+        // positions are displaced to, and one more so that the last block is whole.
+        let words = (1usize << position_bits) / 64 + 4;
+        let table = LinkTable {
+            bits: vec![0; words],
+            blocks: vec![0; words / 4],
+            entries: Vec::with_capacity(entries),
+            rem_bits: CODE_BITS - position_bits,
+            displacement_bits,
+            stash: HashMap::new(),
+            complex: Vec::new(),
+            simple_names: Vec::new(),
+        };
+        Self { table, next_free: 0 }
+    }
+
+    /// Adds the entry of the ID with hash `hash`: its name, with
+    /// `COMPLEX_BIT` for a complex component. Hashes must not decrease.
+    #[inline(always)]
+    fn push(&mut self, hash: u64, name: u64) {
+        let table = &mut self.table;
+        let home = (hash >> table.rem_bits) as usize;
+        // The first free position from home on. Everything from home up to
+        // it holds entries, which is what a lookup relies on.
+        let at = home.max(self.next_free);
+        let step = at - home;
+        if step >> table.displacement_bits != 0 {
+            table.stash.insert(unmix(hash), name);
+            return;
+        }
+        // SAFETY: `at` is less than 2^`MAX_DISPLACEMENT_BITS` positions after
+        // a home position, inside the padding of `bits`.
+        unsafe { *table.bits.get_unchecked_mut(at >> 6) |= 1 << (at & 63) };
+        let key = ((hash << table.displacement_bits) | step as u64) << 1 & ENTRY_KEY_MASK;
+        table.entries.push((name & CODE_MASK) << ENTRY_NAME_SHIFT | key | name >> 63);
+        self.next_free = at + 1;
+    }
+
+    fn finish(self) -> LinkTable {
+        let mut table = self.table;
+        let mut before = 0u64;
+        for (block, packed) in table.blocks.iter_mut().enumerate() {
+            let words = &table.bits[block * 4..block * 4 + 4];
+            let first = u64::from(words[0].count_ones());
+            let second = first + u64::from(words[1].count_ones());
+            let third = second + u64::from(words[2].count_ones());
+            *packed = before << 24 | first | second << 8 | third << 16;
+            before = before + third + u64::from(words[3].count_ones());
+        }
+        debug_assert_eq!(before as usize, table.entries.len());
+        table
     }
 }
 
@@ -137,10 +275,8 @@ const HOME_LOOKAHEAD: usize = 32;
 /// Pairs wait this many deep between being located and being joined, while
 /// the lines of their parents load. A power of two.
 const JOIN_DELAY: usize = 16;
-/// How many slots ahead of the one being named its parent is prefetched.
-const SCAN_LOOKAHEAD: usize = 24;
-/// Renamed IDs wait this many deep while their lookup-table slots load.
-const INSERT_BATCH: usize = 32;
+/// How many lines ahead of the one being named the parents are prefetched.
+const SCAN_LOOKAHEAD: usize = 12;
 
 /// Slots in one line of the forest: a cache line of 8-byte nodes.
 const LINE_SLOTS: usize = 8;
@@ -283,11 +419,17 @@ impl<'a> Forest<'a> {
         prefetch_line(self.nodes.wrapping_add((self.node(at) & self.parent_mask) as usize));
     }
 
+    /// The hash of the ID in `slot`, whose node is `node`.
+    #[inline(always)]
+    fn hash_at(&self, slot: usize, node: u64) -> u64 {
+        let home_line = (slot / LINE_SLOTS) as u64 - ((node >> SPILL_SHIFT) & MAX_SPILL as u64);
+        (home_line << self.rem_bits) | ((node & BELOW_SPILL) >> self.parent_bits)
+    }
+
     /// The code of the ID in `slot`, whose node is `node`.
     #[inline(always)]
     fn code_at(&self, slot: usize, node: u64) -> u64 {
-        let home_line = (slot / LINE_SLOTS) as u64 - ((node >> SPILL_SHIFT) & MAX_SPILL as u64);
-        unmix((home_line << self.rem_bits) | ((node & BELOW_SPILL) >> self.parent_bits))
+        unmix(self.hash_at(slot, node))
     }
 
     /// The slot of `code`, which becomes a new root if it was not there.
@@ -488,50 +630,71 @@ fn build_in_forest(
     }
 
     // The table holds every ID that is not the root of its tree, under the
-    // root's name, and the root of every complex tree under its own. The
-    // joins counted both, so no pass over the forest is needed to size it.
-    let entries = forest.merges + forest.complex_trees;
-    let mut table = LinkTable::with_capacity(entries);
-    let mut batch = [(0u64, 0u64); INSERT_BATCH];
-    let mut waiting = 0;
-    let mut stored = 0;
-    for slot in 0..forest.slot_count {
-        if slot + SCAN_LOOKAHEAD < forest.slot_count {
-            forest.prefetch_parent(slot + SCAN_LOOKAHEAD);
-        }
-        let node = forest.node(slot);
-        if node == 0 {
-            continue;
-        }
-        let root = forest.find(slot);
-        let root_node = forest.node(root);
-        let complex = root_node & MARKED != 0;
-        if root == slot && !complex {
-            // A root that names others is not stored, only listed.
-            if node & JOINED != 0 {
-                table.simple_names.push(forest.code_at(slot, node));
+    // root's name, and the root of every complex tree under its own; the
+    // joins counted both. It wants them in the order of their hashes, which
+    // is the order of the forest's lines but for the nodes that spilled. A
+    // node is never stored past a line with room, so a line with an empty
+    // slot ends a run: everything seen so far hashes below everything after.
+    let mut writer = TableWriter::new(forest.merges + forest.complex_trees);
+    let mut complex = Vec::new();
+    let mut simple_names = Vec::new();
+    let mut run: Vec<(u64, u64)> = Vec::new();
+    for first in (0..forest.slot_count).step_by(LINE_SLOTS) {
+        let ahead = first + SCAN_LOOKAHEAD * LINE_SLOTS;
+        if ahead < forest.slot_count {
+            for slot in ahead..ahead + LINE_SLOTS {
+                forest.prefetch_parent(slot);
             }
-            continue;
         }
-        let (user, name) = (forest.code_at(slot, node), forest.code_at(root, root_node));
-        if complex {
-            table.complex.push(user);
-        }
-        table.prefetch(user);
-        batch[waiting] = (user, if complex { name | COMPLEX_BIT } else { name });
-        waiting += 1;
-        stored += 1;
-        if waiting == INSERT_BATCH {
-            for &(user, name) in &batch {
-                table.insert(user, name);
+        // Neither half of the test matches a key of all ones: only empty slots hit.
+        let empty = line_hits(forest.nodes.wrapping_add(first), 0, u64::MAX);
+        let mut occupied = !empty & ((1 << LINE_SLOTS) - 1);
+        while occupied != 0 {
+            let slot = first + occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            let node = forest.node(slot);
+            let root = forest.find(slot);
+            let root_node = forest.node(root);
+            let is_complex = root_node & MARKED != 0;
+            if root == slot && !is_complex {
+                // A root that names others has no entry; it is only listed.
+                if node & JOINED != 0 {
+                    simple_names.push(forest.code_at(slot, node));
+                }
+                continue;
             }
-            waiting = 0;
+            let hash = forest.hash_at(slot, node);
+            let name = forest.code_at(root, root_node) | if is_complex { COMPLEX_BIT } else { 0 };
+            if is_complex {
+                complex.push(unmix(hash));
+            }
+            // Runs are a few entries long: keep them sorted as they grow.
+            let mut at = run.len();
+            run.push((hash, name));
+            while at > 0 && run[at - 1].0 > hash {
+                run[at] = run[at - 1];
+                at -= 1;
+            }
+            run[at] = (hash, name);
+        }
+        if empty != 0 {
+            for &(hash, name) in &run {
+                writer.push(hash, name);
+            }
+            run.clear();
         }
     }
-    for &(user, name) in &batch[..waiting] {
-        table.insert(user, name);
+    for &(hash, name) in &run {
+        writer.push(hash, name);
     }
-    debug_assert_eq!(stored, entries, "the joins miscounted the table's entries");
+    let mut table = writer.finish();
+    debug_assert_eq!(
+        table.entries.len() + table.stash.len(),
+        forest.merges + forest.complex_trees,
+        "the joins miscounted the table's entries"
+    );
+    table.complex = complex;
+    table.simple_names = simple_names;
     Some(table)
 }
 
@@ -593,16 +756,24 @@ fn build_general(
         several[root] |= at != root;
     }
     let stored = |at: usize| name[root_of[at] as usize] != codes[at] || complex[root_of[at] as usize];
-    let mut table = LinkTable::with_capacity((0..codes.len()).filter(|&at| stored(at)).count());
+    let mut members: Vec<u64> = Vec::new();
+    let mut entries: Vec<(u64, u64)> = Vec::new();
     for at in 0..codes.len() {
         if stored(at) {
             let root = root_of[at] as usize;
             if complex[root] {
-                table.complex.push(codes[at]);
+                members.push(codes[at]);
             }
-            table.insert(codes[at], if complex[root] { name[root] | COMPLEX_BIT } else { name[root] });
+            entries.push((mix(codes[at]), if complex[root] { name[root] | COMPLEX_BIT } else { name[root] }));
         }
     }
+    entries.sort_unstable();
+    let mut writer = TableWriter::new(entries.len());
+    for &(hash, name) in &entries {
+        writer.push(hash, name);
+    }
+    let mut table = writer.finish();
+    table.complex = members;
     for root in 0..codes.len() {
         if root_of[root] as usize == root && several[root] && !complex[root] {
             table.simple_names.push(name[root]);
@@ -1036,6 +1207,90 @@ mod tests {
                 let plain = line_hits_plain(line.0.as_ptr(), key_mask, key);
                 assert_eq!(line_hits(line.0.as_ptr(), key_mask, key), plain);
             }
+        }
+    }
+
+    #[test]
+    fn ids_whose_hashes_crowd_one_place() {
+        // `unmix` of consecutive numbers gives IDs with consecutive hashes:
+        // one home line in any forest, one home position in the table. Sixty
+        // of them fit a forest and overflow the table's displacement into
+        // its stash; three hundred overflow the forest too.
+        let users = Interner::default();
+        for count in [60, 300] {
+            let codes: Vec<u64> = (1..)
+                .map(|low| unmix((0x155_5555 << 17) | low))
+                .filter(|&code| code < EXOTIC_BASE)
+                .take(count + 40)
+                .collect();
+            let (linked, unlinked) = codes.split_at(count);
+            let list: Vec<(u64, u64)> = linked.windows(2).map(|pair| (pair[0], pair[1])).collect();
+            let name = *linked.iter().min().unwrap();
+            for (path, limits) in PATHS {
+                for complex in [false, true] {
+                    let group = |_: u64| if complex { None } else { Some(0) };
+                    let table = build_within(&[list.clone()], &users, &group, limits);
+                    assert!(table.stash.len() >= count - 20, "{path}: {} in the stash", table.stash.len());
+                    for &code in linked {
+                        assert_eq!(table.lookup(code), (name, complex), "{path}");
+                    }
+                    for &code in unlinked {
+                        assert_eq!(table.lookup(code), (code, false), "{path}");
+                    }
+                    let mut visited: Vec<u64> = Vec::new();
+                    table.for_each_member(|member, to, flag| {
+                        assert_eq!((to, flag), (name, complex), "{path}");
+                        visited.push(member);
+                    });
+                    visited.sort_unstable();
+                    let mut expected = linked.to_vec();
+                    expected.sort_unstable();
+                    assert_eq!(visited, expected, "{path}");
+                    assert_eq!(table.complex_members().len(), if complex { count } else { 0 }, "{path}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tables_of_every_size_answer_like_a_map() {
+        let mut random = Random(4242);
+        for position_bits in [23, 24, 25, 26, 27, 28] {
+            // Random hashes, and clumps of nearby ones to displace entries.
+            let mut hashes: Vec<u64> = (0..3000).map(|_| random.next() & CODE_MASK).collect();
+            for _ in 0..200 {
+                let base = random.next() & CODE_MASK & !0xFFFF;
+                hashes.extend((0..1 + random.below(40)).map(|_| base | (random.next() & 0xFFFF)));
+            }
+            hashes.sort_unstable();
+            hashes.dedup();
+            let mut expected: HashMap<u64, (u64, bool)> = HashMap::new();
+            let mut writer = TableWriter::with_position_bits(hashes.len(), position_bits);
+            for &hash in &hashes {
+                let (name, complex) = (1 + (random.next() & (CODE_MASK >> 1)), random.chance(3));
+                writer.push(hash, name | if complex { COMPLEX_BIT } else { 0 });
+                expected.insert(unmix(hash), (name, complex));
+            }
+            let table = writer.finish();
+            assert_eq!(table.entries.len() + table.stash.len(), hashes.len());
+            for (&user, &answer) in &expected {
+                table.prefetch(user);
+                assert_eq!(table.lookup(user), answer, "{position_bits} bits");
+            }
+            // IDs without an entry, many of them next to ones that have one.
+            for &hash in &hashes {
+                for other in [hash ^ 1, hash ^ (1 << 20), hash.wrapping_add(1 << table.rem_bits) & CODE_MASK] {
+                    let user = unmix(other);
+                    if !expected.contains_key(&user) {
+                        assert_eq!(table.lookup(user), (user, false), "{position_bits} bits");
+                    }
+                }
+            }
+            let mut visited: HashMap<u64, (u64, bool)> = HashMap::new();
+            table.for_each_member(|member, name, complex| {
+                assert!(visited.insert(member, (name, complex)).is_none());
+            });
+            assert_eq!(visited, expected, "{position_bits} bits");
         }
     }
 
