@@ -21,17 +21,17 @@
 //! table at all: the lines of a user are a handful, a union-find over the
 //! user's aliases settles them, and the user's summary entry (the name and
 //! the aliases of its one component) answers every lookup for its IDs. The
-//! users are done in shards of 4096 on as many threads as the caller gives.
-//! Only the lines that leave a user, and all lines of the users they touch
-//! or whose links one entry cannot describe, go through a forest and into a
-//! table, which is small.
+//! users are done in shards of a few thousand on as many threads as the
+//! caller gives. Only the lines that leave a user, and all lines of the
+//! users they touch or whose links one entry cannot describe, go through a
+//! forest and into a table, which is small.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
-use super::codes::{id_cmp, mix, unmix, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE};
-use super::keys::Keys;
+use super::codes::{id_cmp, mix, unmix, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE, P37};
+use super::keys::{Keys, MASK as NUMBER_MASK};
 use crate::reference::FastHasher;
 
 /// Set in a name on its way into the table when the component is complex.
@@ -200,10 +200,13 @@ impl Table {
 /// Bits of a user number below the user index: which of the user's IDs it is.
 const ALIAS_BITS: u32 = 9;
 const ALIAS_MASK: u64 = (1 << ALIAS_BITS) - 1;
-/// User indexes per shard of an index-mode build, as a shift: the lines and
-/// the entries of a shard stay in the second-level cache.
+/// User indexes per shard of an index-mode build, as a shift: the lines of a
+/// shard, and what is noted per user while they are grouped, stay in the
+/// second-level cache.
 const SHARD_BITS: u32 = 12;
 const SHARD_USERS: usize = 1 << SHARD_BITS;
+/// The summaries have a word of bits for every 64 users.
+const SHARD_WORDS: usize = SHARD_USERS / 64;
 /// Set in a user's summary: the user has one link component of two or more
 /// IDs, all of its own, named by the code in the low bits, and word 1 has a
 /// bit for the alias of each of its members.
@@ -225,29 +228,37 @@ pub struct LinkTable {
     indexed: Option<Indexed>,
 }
 
-/// The summaries of an index-mode build.
+/// The summaries of an index-mode build. Most user indexes have no links
+/// (the bound on the indexes is far above the users there are), so a bit per
+/// user says whether it has an entry, and the entries are packed.
 struct Indexed {
     keys: Keys,
-    /// The entries of every `SHARD_USERS` user indexes; no entries for a
-    /// shard none of whose users has links.
-    shards: Vec<Vec<[u64; 2]>>,
+    /// For every 64 user indexes: a bit for each user that has an entry, and
+    /// where in `entries` the entries of these users are, in user order.
+    words: Vec<[u64; 2]>,
+    /// The summaries that are not all zero.
+    entries: Vec<[u64; 2]>,
 }
 
 impl Indexed {
     /// The summary of a user index below the keys' bound.
     #[inline(always)]
     fn entry(&self, user: u64) -> [u64; 2] {
-        match self.shards.get((user >> SHARD_BITS) as usize) {
-            Some(shard) => shard.get(user as usize & (SHARD_USERS - 1)).copied().unwrap_or([0, 0]),
-            None => [0, 0],
+        let Some(&[bits, first]) = self.words.get((user >> 6) as usize) else {
+            return [0, 0];
+        };
+        let bit = 1u64 << (user & 63);
+        if bits & bit == 0 {
+            return [0, 0];
         }
+        self.entries[first as usize + (bits & (bit - 1)).count_ones() as usize]
     }
 
     /// The answer of `lookup` when the summaries have it: for an ID of a
     /// user whose entry is not `SLOW`.
     #[inline(always)]
     fn lookup(&self, code: u64) -> Option<(u64, bool)> {
-        let number = self.keys.user_number_of_code(code)?;
+        let number = user_number_of_code(&self.keys, code)?;
         let [head, mask] = self.entry(number >> ALIAS_BITS);
         if head & SLOW != 0 {
             return None;
@@ -259,6 +270,55 @@ impl Indexed {
     }
 }
 
+/// For two base-37 digits of a code, `first * 37 + second`: the number that
+/// the two characters are in base 36, or `NO_PAIR` when either digit is 0
+/// (no character there).
+static PAIR_VALUE: [u16; 37 * 37] = pair_values();
+const NO_PAIR: u16 = 1 << 15;
+
+const fn pair_values() -> [u16; 37 * 37] {
+    let mut values = [NO_PAIR; 37 * 37];
+    let mut first = 1;
+    while first < 37 {
+        let mut second = 1;
+        while second < 37 {
+            values[first * 37 + second] = ((first - 1) * 36 + (second - 1)) as u16;
+            second += 1;
+        }
+        first += 1;
+    }
+    values
+}
+
+/// `keys.user_number_of_code(code)`: the user number behind the code of a
+/// generated ID. Nearly all generated IDs have eight characters, and for
+/// those this reads the characters two at a time; the keys decide the rest.
+#[inline(always)]
+fn user_number_of_code(keys: &Keys, code: u64) -> Option<u64> {
+    if code >= EXOTIC_BASE {
+        return None;
+    }
+    // Four pairs of base-37 digits, each below 37 * 37.
+    let (high, low) = (code / P37[4], code % P37[4]);
+    let first = (high / P37[2]) as usize;
+    let pairs = [
+        PAIR_VALUE[first],
+        PAIR_VALUE[(high % P37[2]) as usize],
+        PAIR_VALUE[(low / P37[2]) as usize],
+        PAIR_VALUE[(low % P37[2]) as usize],
+    ];
+    // Fewer than eight characters, or `0` as the first of them.
+    if (pairs[0] | pairs[1] | pairs[2] | pairs[3]) & NO_PAIR != 0 || first < 2 * 37 {
+        return keys.user_number_of_code(code);
+    }
+    let value = ((u64::from(pairs[0]) * 1296 + u64::from(pairs[1])) * 1296 + u64::from(pairs[2])) * 1296
+        + u64::from(pairs[3]);
+    if value > NUMBER_MASK {
+        return None;
+    }
+    keys.user_number(value)
+}
+
 impl LinkTable {
     /// Starts loading what `lookup(user)` will read, so that a lookup a few
     /// records later finds it in the cache. Changes no result.
@@ -267,16 +327,9 @@ impl LinkTable {
         let Some(indexed) = &self.indexed else {
             return self.table.prefetch(user);
         };
-        match indexed.keys.user_number_of_code(user) {
-            Some(number) => {
-                let user = number >> ALIAS_BITS;
-                match indexed.shards.get((user >> SHARD_BITS) as usize) {
-                    Some(shard) if !shard.is_empty() => {
-                        prefetch_line(shard.as_ptr().wrapping_add(user as usize & (SHARD_USERS - 1)));
-                    }
-                    _ => {}
-                }
-            }
+        match user_number_of_code(&indexed.keys, user) {
+            // The word of bits of the user; its entry, if any, is one more read.
+            Some(number) => prefetch_line(indexed.words.as_ptr().wrapping_add((number >> (ALIAS_BITS + 6)) as usize)),
             None => self.table.prefetch(user),
         }
     }
@@ -320,16 +373,21 @@ impl LinkTable {
         let Some(indexed) = &self.indexed else {
             return;
         };
-        for (shard, entries) in indexed.shards.iter().enumerate() {
-            for (local, &[head, mask]) in entries.iter().enumerate() {
+        for (at, &[bits, first]) in indexed.words.iter().enumerate() {
+            let mut users = bits;
+            let mut entry = first as usize;
+            while users != 0 {
+                let user = (at * 64) as u64 + u64::from(users.trailing_zeros());
+                users &= users - 1;
+                let [head, mask] = indexed.entries[entry];
+                entry += 1;
                 if head & SIMPLE == 0 {
                     continue;
                 }
-                let user = (shard << SHARD_BITS | local) as u64;
-                let mut left = mask;
-                while left != 0 {
-                    let alias = u64::from(left.trailing_zeros());
-                    left &= left - 1;
+                let mut aliases = mask;
+                while aliases != 0 {
+                    let alias = u64::from(aliases.trailing_zeros());
+                    aliases &= aliases - 1;
                     visit(indexed.keys.code_of_user_number(user << ALIAS_BITS | alias), head & CODE_MASK, false);
                 }
             }
@@ -892,6 +950,7 @@ const MAX_USER_BOUND: u64 = 1 << 32;
 /// above (from `CODE_BITS`), and in the first word, above the alias, the
 /// user index within its shard.
 const LINE_LOCAL_SHIFT: u32 = CODE_BITS + ALIAS_BITS;
+const _: () = assert!(LINE_LOCAL_SHIFT + SHARD_BITS <= 64);
 
 /// What one thread makes of its share of the lines.
 struct Sorted {
@@ -903,13 +962,44 @@ struct Sorted {
     touched: Vec<u32>,
 }
 
-/// What one thread makes of its share of the shards.
-#[derive(Default)]
-struct Summarized {
-    /// The summary entries of each shard it did.
-    shards: Vec<(usize, Vec<[u64; 2]>)>,
-    /// The lines of the users that are handed over to the table.
-    handed_over: Vec<(u64, u64)>,
+/// The room for the summary entries of all users. The threads fill it a
+/// shard at a time: each takes the entries that its shard needs.
+struct EntryRoom<'a> {
+    entries: *mut [u64; 2],
+    capacity: usize,
+    taken: std::sync::atomic::AtomicUsize,
+    owner: std::marker::PhantomData<&'a mut [[u64; 2]]>,
+}
+
+// SAFETY: `take` hands every entry out at most once, so no two threads have
+// the same one.
+unsafe impl Sync for EntryRoom<'_> {}
+
+impl<'a> EntryRoom<'a> {
+    fn new(entries: &'a mut [[u64; 2]]) -> Self {
+        Self {
+            entries: entries.as_mut_ptr(),
+            capacity: entries.len(),
+            taken: std::sync::atomic::AtomicUsize::new(0),
+            owner: std::marker::PhantomData,
+        }
+    }
+
+    /// The next `count` entries, which no other caller gets, and where in
+    /// the room they start.
+    fn take(&self, count: usize) -> (usize, &'a mut [[u64; 2]]) {
+        let first = self.taken.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        assert!(count <= self.capacity && first <= self.capacity - count, "more summary entries than lines");
+        // SAFETY: the range lies in the slice this room was made from (just
+        // checked), which is borrowed for `'a`, and `taken` has moved past
+        // it, so no other call returns any part of it.
+        (first, unsafe { std::slice::from_raw_parts_mut(self.entries.add(first), count) })
+    }
+
+    /// How many entries were taken in all.
+    fn taken(&self) -> usize {
+        self.taken.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Runs `work` on up to `helpers` new threads and on this one, and returns
@@ -933,11 +1023,15 @@ fn build_indexed_within(
     limits: Limits,
 ) -> LinkTable {
     let user_of = |code: u64| keys.user_index_of_code(code);
-    if keys.user_bound > MAX_USER_BOUND {
-        // More users than a line's words can say: every user is looked up.
+    let pair_count: usize = pairs.iter().map(Vec::len).sum();
+    if keys.user_bound > MAX_USER_BOUND || pair_count > u32::MAX as usize {
+        // More users than a line's words can say, or more lines than a
+        // shard counts: every user is looked up.
         return LinkTable { table: build_within(pairs, users, &user_of, limits), indexed: None };
     }
-    let shard_count = (keys.user_bound >> SHARD_BITS) as usize + 1;
+    // A word of bits for every 64 users, a shard for every `SHARD_WORDS` words.
+    let word_count = (keys.user_bound >> 6) as usize + 1;
+    let shard_count = word_count.div_ceil(SHARD_WORDS);
 
     // Every line is inside a user or not; the lines inside go to the user's shard.
     let tasks: Vec<(usize, usize)> = pairs
@@ -951,7 +1045,7 @@ fn build_indexed_within(
         while let Some(&(list, start)) = tasks.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
             let lines = &pairs[list];
             for &(code_a, code_b) in &lines[start..(start + SORT_CHUNK).min(lines.len())] {
-                let one = keys.user_number_of_code(code_a);
+                let one = user_number_of_code(keys, code_a);
                 if code_a == code_b {
                     // An ID linked to itself: nothing, unless it is no user's
                     // ID, which is then a complex component of one.
@@ -960,7 +1054,7 @@ fn build_indexed_within(
                     }
                     continue;
                 }
-                let other = keys.user_number_of_code(code_b);
+                let other = user_number_of_code(keys, code_b);
                 match (one, other) {
                     (Some(one), Some(other)) if one >> ALIAS_BITS == other >> ALIAS_BITS => {
                         let user = one >> ALIAS_BITS;
@@ -982,173 +1076,203 @@ fn build_indexed_within(
         sorted
     });
 
-    let mut touched = vec![0u64; (keys.user_bound >> 6) as usize + 1];
+    // A touched user has an ID in a complex component.
+    let mut touched = vec![0u64; word_count];
     for &user in sorted.iter().flat_map(|sorted| &sorted.touched) {
         touched[(user >> 6) as usize] |= 1 << (user & 63);
     }
 
-    // The shards with lines, each done by one thread.
-    let busy: Vec<usize> =
-        (0..shard_count).filter(|&shard| sorted.iter().any(|sorted| !sorted.shards[shard].is_empty())).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let summarized = on_threads(helpers, || {
-        let mut scratch = ShardScratch::new();
-        let mut done = Summarized::default();
-        while let Some(&shard) = busy.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            let entries = scratch.summarize(shard, &sorted, &touched, &mut done.handed_over);
-            done.shards.push((shard, entries));
-        }
-        done
-    });
+    // The shards, each done by one thread. A user with an entry has a line
+    // inside it or is touched, so there are no more entries than this; the
+    // pages that no entry is written to stay untouched.
+    let inside: usize = sorted.iter().flat_map(|sorted| &sorted.shards).map(Vec::len).sum();
+    let touches: usize = sorted.iter().map(|sorted| sorted.touched.len()).sum();
+    let mut words = vec![[0u64; 2]; word_count];
+    let mut entries = vec![[0u64; 2]; inside + touches];
+    let (handed_over, taken) = {
+        let room = EntryRoom::new(&mut entries);
+        let shards = std::sync::Mutex::new(words.chunks_mut(SHARD_WORDS).enumerate());
+        let handed_over = on_threads(helpers, || {
+            let mut scratch = ShardScratch::new();
+            let mut handed_over: Vec<(u64, u64)> = Vec::new();
+            loop {
+                // The lock is held while a shard is taken, not while it is done.
+                let shard = shards.lock().expect("a link build thread").next();
+                let Some((shard, words)) = shard else {
+                    break;
+                };
+                scratch.summarize(shard, words, &sorted, &touched, &room, &mut handed_over);
+            }
+            handed_over
+        });
+        (handed_over, room.taken())
+    };
+    entries.truncate(taken);
 
-    let mut shards: Vec<Vec<[u64; 2]>> = vec![Vec::new(); shard_count];
     let mut rest: Vec<(u64, u64)> = Vec::new();
-    for done in summarized {
-        for (shard, entries) in done.shards {
-            shards[shard] = entries;
-        }
-        rest.extend(done.handed_over);
+    for lines in &handed_over {
+        rest.extend(lines);
     }
     for sorted in &sorted {
         rest.extend(&sorted.across);
-        // A touched user has an ID in a complex component.
-        for &user in &sorted.touched {
-            let shard = &mut shards[(user >> SHARD_BITS) as usize];
-            if shard.is_empty() {
-                *shard = vec![[0, 0]; SHARD_USERS];
-            }
-            shard[user as usize & (SHARD_USERS - 1)] = [SLOW, 0];
-        }
     }
     // The threads share out the work as it comes: sorted, the table does
     // not depend on which did what.
     rest.sort_unstable();
     let table = build_within(&[rest], users, &user_of, limits);
-    LinkTable { table, indexed: Some(Indexed { keys: *keys, shards }) }
+    LinkTable { table, indexed: Some(Indexed { keys: *keys, words, entries }) }
 }
 
 /// What a thread keeps from shard to shard.
 struct ShardScratch {
-    /// Where the lines of each user of the shard end in `lines`.
-    ends: Vec<u32>,
-    /// The lines of the shard, grouped by user.
+    /// For each user of the shard: how many lines it has, then where its
+    /// next line goes in `lines`. All zero between shards.
+    places: Box<[u32; SHARD_USERS]>,
+    /// A bit for each user of the shard that has lines. All zero between shards.
+    lined: [u64; SHARD_WORDS],
+    /// The lines of the shard, those of a user together.
     lines: Vec<[u64; 2]>,
-    /// Union-find over the aliases of one user: the parent of each alias
-    /// that `stamp` says belongs to the user at hand.
-    parent: [u16; 1 << ALIAS_BITS],
-    stamp: [u32; 1 << ALIAS_BITS],
-    user_stamp: u32,
+    /// Union-find over the aliases below 64 of one user.
+    parent: [u8; 64],
 }
 
 impl ShardScratch {
     fn new() -> Self {
         Self {
-            ends: vec![0; SHARD_USERS],
+            places: vec![0u32; SHARD_USERS].into_boxed_slice().try_into().expect("a place for each user"),
+            lined: [0; SHARD_WORDS],
             lines: Vec::new(),
-            parent: [0; 1 << ALIAS_BITS],
-            stamp: [0; 1 << ALIAS_BITS],
-            user_stamp: 0,
+            parent: [0; 64],
         }
     }
 
-    /// The summary entries of the users of `shard`. The lines of the users
-    /// that are touched, or whose links one entry cannot describe, are added
-    /// to `handed_over`.
+    /// The summaries of the users of `shard`: fills in its `words`, and
+    /// takes the entries they need from `room` and fills them. The lines of
+    /// the users that are touched, or whose links one entry cannot describe,
+    /// are added to `handed_over`.
     fn summarize(
         &mut self,
         shard: usize,
+        words: &mut [[u64; 2]],
         sorted: &[Sorted],
         touched: &[u64],
+        room: &EntryRoom,
         handed_over: &mut Vec<(u64, u64)>,
-    ) -> Vec<[u64; 2]> {
-        // Group the lines by user: count, then place.
+    ) {
+        let touched = &touched[shard * SHARD_WORDS..][..words.len()];
         let local_of = |line: &[u64; 2]| (line[0] >> LINE_LOCAL_SHIFT) as usize & (SHARD_USERS - 1);
-        self.ends.fill(0);
-        let mut count = 0;
-        for line in sorted.iter().flat_map(|sorted| &sorted.shards[shard]) {
-            self.ends[local_of(line)] += 1;
-            count += 1;
+        // Count each user's lines, and note who has any.
+        let mut line_count = 0;
+        for lines in sorted.iter().map(|sorted| &sorted.shards[shard]) {
+            for line in lines {
+                let local = local_of(line);
+                self.places[local] += 1;
+                self.lined[local >> 6] |= 1 << (local & 63);
+            }
+            line_count += lines.len();
         }
-        let mut before = 0;
-        for end in self.ends.iter_mut() {
-            (*end, before) = (before, before + *end);
+        // The users with an entry: those with lines and those that are touched.
+        let entry_count: u32 = self.lined.iter().zip(touched).map(|(lined, touched)| (lined | touched).count_ones()).sum();
+        if entry_count == 0 {
+            return;
         }
-        self.lines.clear();
-        self.lines.resize(count, [0, 0]);
-        for line in sorted.iter().flat_map(|sorted| &sorted.shards[shard]) {
-            let at = &mut self.ends[local_of(line)];
-            self.lines[*at as usize] = *line;
-            *at += 1;
+        let (mut next, entries) = room.take(entry_count as usize);
+        let mut entries = entries.iter_mut();
+
+        // Where each user's lines start, the users in order; then every line to its place.
+        let mut start = 0;
+        for (at, &lined) in self.lined.iter().enumerate() {
+            let mut users = lined;
+            while users != 0 {
+                let local = at * 64 + users.trailing_zeros() as usize;
+                users &= users - 1;
+                start += std::mem::replace(&mut self.places[local], start);
+            }
+        }
+        if self.lines.len() < line_count {
+            self.lines.resize(line_count, [0, 0]);
+        }
+        for lines in sorted.iter().map(|sorted| &sorted.shards[shard]) {
+            for line in lines {
+                let place = &mut self.places[local_of(line)];
+                self.lines[*place as usize] = *line;
+                *place += 1;
+            }
         }
 
-        let mut entries = vec![[0u64; 2]; SHARD_USERS];
+        // Every user with an entry, in order. `places` has where the lines
+        // of a user with lines end, and the lines of the user before it end
+        // where its own start.
         let mut start = 0;
-        for local in 0..SHARD_USERS {
-            let end = self.ends[local] as usize;
-            if start == end {
+        for (at, word) in words.iter_mut().enumerate() {
+            let lined = std::mem::take(&mut self.lined[at]);
+            let bits = lined | touched[at];
+            if bits == 0 {
                 continue;
             }
-            let user = shard << SHARD_BITS | local;
-            let is_touched = (touched[user >> 6] >> (user & 63)) & 1 != 0;
-            let one_component = if is_touched { None } else { self.one_component(start, end) };
-            match one_component {
-                Some((name, mask)) => entries[local] = [name | SIMPLE, mask],
-                None => {
-                    entries[local] = [SLOW, 0];
-                    let lines = self.lines[start..end].iter();
-                    handed_over.extend(lines.map(|line| (line[0] & CODE_MASK, line[1] & CODE_MASK)));
-                }
-            }
-            start = end;
-        }
-        entries
-    }
-
-    /// If the lines `start..end`, all inside one user, make one component of
-    /// IDs with aliases below 64: the smallest of its codes and the mask of
-    /// its aliases.
-    fn one_component(&mut self, start: usize, end: usize) -> Option<(u64, u64)> {
-        self.user_stamp = self.user_stamp.wrapping_add(1);
-        if self.user_stamp == 0 {
-            // Stamps of four billion users ago could pass for this user's.
-            self.stamp.fill(0);
-            self.user_stamp = 1;
-        }
-        let (mut ids, mut joins, mut smallest, mut mask, mut wide) = (0, 0, u64::MAX, 0u64, false);
-        for at in start..end {
-            let mut roots = [0usize; 2];
-            for side in 0..2 {
-                let word = self.lines[at][side];
-                let alias = (word >> CODE_BITS & ALIAS_MASK) as usize;
-                if self.stamp[alias] != self.user_stamp {
-                    self.stamp[alias] = self.user_stamp;
-                    self.parent[alias] = alias as u16;
-                    ids += 1;
-                    // Generated IDs have pattern codes, which order like the IDs.
-                    smallest = smallest.min(word & CODE_MASK);
-                    if alias < 64 {
-                        mask |= 1 << alias;
-                    } else {
-                        wide = true;
+            *word = [bits, next as u64];
+            let mut users = bits;
+            while users != 0 {
+                let bit = users.trailing_zeros();
+                users &= users - 1;
+                let end = match (lined >> bit) & 1 {
+                    0 => start,
+                    _ => std::mem::take(&mut self.places[at * 64 + bit as usize]) as usize,
+                };
+                let lines = &self.lines[start..end];
+                start = end;
+                let is_touched = (touched[at] >> bit) & 1 != 0;
+                let one_component = if is_touched { None } else { one_component(lines, &mut self.parent) };
+                let entry = entries.next().expect("an entry for every user with a bit");
+                *entry = match one_component {
+                    Some((name, mask)) => [name | SIMPLE, mask],
+                    None => {
+                        handed_over.extend(lines.iter().map(|line| (line[0] & CODE_MASK, line[1] & CODE_MASK)));
+                        [SLOW, 0]
                     }
-                }
-                let mut root = alias;
-                while self.parent[root] as usize != root {
-                    let above = self.parent[root] as usize;
-                    self.parent[root] = self.parent[above];
-                    root = above;
-                }
-                roots[side] = root;
-            }
-            if roots[0] != roots[1] {
-                self.parent[roots[0].max(roots[1])] = roots[0].min(roots[1]) as u16;
-                joins += 1;
+                };
+                next += 1;
             }
         }
-        // Every ID starts as a tree of its own and each join makes one tree
-        // of two: one component when the joins are one fewer than the IDs.
-        (!wide && joins + 1 == ids).then_some((smallest, mask))
     }
+}
+
+/// If the lines, all inside one user, make one component of IDs with aliases
+/// below 64: the smallest of its codes and the mask of its aliases.
+#[inline]
+fn one_component(lines: &[[u64; 2]], parent: &mut [u8; 64]) -> Option<(u64, u64)> {
+    let (mut seen, mut joins, mut smallest) = (0u64, 0, u64::MAX);
+    for line in lines {
+        let aliases = [(line[0] >> CODE_BITS) & ALIAS_MASK, (line[1] >> CODE_BITS) & ALIAS_MASK];
+        if aliases[0].max(aliases[1]) >= 64 {
+            // An alias that the mask has no bit for.
+            return None;
+        }
+        // Generated IDs have pattern codes, which order like the IDs.
+        smallest = smallest.min(line[0] & CODE_MASK).min(line[1] & CODE_MASK);
+        let mut roots = [0usize; 2];
+        for side in 0..2 {
+            let alias = aliases[side] as usize;
+            if (seen >> alias) & 1 == 0 {
+                seen |= 1 << alias;
+                parent[alias] = alias as u8;
+            }
+            let mut root = alias;
+            while parent[root] as usize != root {
+                let above = parent[root] as usize & 63;
+                parent[root] = parent[above];
+                root = above;
+            }
+            roots[side] = root;
+        }
+        if roots[0] != roots[1] {
+            parent[roots[0].max(roots[1])] = roots[0].min(roots[1]) as u8;
+            joins += 1;
+        }
+    }
+    // Every ID starts as a tree of its own and each join makes one tree of
+    // two: one component when the joins are one fewer than the IDs.
+    (joins + 1 == seen.count_ones()).then_some((smallest, seen))
 }
 
 fn find(parent: &mut [u32], mut at: u32) -> u32 {
@@ -1715,7 +1839,7 @@ mod tests {
         let mut random = Random(0xA076_1D64_78BD_642F);
         for round in 0..40 {
             // Users over one shard or several, some past the keys' bound.
-            let users = [1, 2, 7, 60, 700, 5000, 9000][round % 7];
+            let users = [1, 2, 7, 60, 700, 5000, 20_000][round % 7];
             let user_bound = [users, users + 5, users - users / 4, users / 2 + 1][round % 4];
             let keys = test_keys(&mut random, user_bound);
             let exotic = Interner::default();
@@ -1725,6 +1849,47 @@ mod tests {
         // No lines at all.
         let keys = test_keys(&mut random, 100);
         check_shards(&mut random, &keys, &Interner::default(), &[]);
+    }
+
+    #[test]
+    fn the_quick_number_of_a_code_is_the_keys_own() {
+        let mut random = Random(0x1234_5678_9ABC_DEF1);
+        let exotic = Interner::default();
+        let keys = test_keys(&mut random, 1 << 22);
+        let small = test_keys(&mut random, 3);
+        let mut codes: Vec<u64> = vec![0, 1, 36, 37, 38, P37[4] - 1, P37[4], P37[4] + 1, EXOTIC_BASE - 1, EXOTIC_BASE, EXOTIC_BASE + 5, CODE_MASK];
+        // The IDs of users in and out of range, long and short.
+        for user in (0..2000u64).chain((1 << 22) - 3..(1 << 22) + 3) {
+            for alias in [0, 1, 63, 64, 511] {
+                codes.push(keys.code_of_user_number(user << ALIAS_BITS | alias));
+            }
+        }
+        for _ in 0..200_000 {
+            // Any code below the exotic ones, and any number as an ID.
+            codes.push(random.next() % EXOTIC_BASE);
+            codes.push(crate::fast::keys::code37_of_value(random.next() & NUMBER_MASK));
+            codes.push(crate::fast::keys::code37_of_value(random.next() & NUMBER_MASK >> random.below(40)));
+            // Texts of every length, with `0` in front or not, or one character too high.
+            let length = 1 + random.below(8);
+            let text: Vec<u8> = (0..length)
+                .map(|at| {
+                    let digit = if at == 0 && random.chance(4) { 0 } else { random.below(36) };
+                    b"0123456789abcdefghijklmnopqrstuvwxyz"[digit]
+                })
+                .collect();
+            let mut id = vec![b'u'];
+            id.extend(&text);
+            codes.push(id_code(&id, b'u', &exotic));
+        }
+        let mut found = 0;
+        for &code in &codes {
+            for keys in [&keys, &small] {
+                let expected = keys.user_number_of_code(code);
+                assert_eq!(user_number_of_code(keys, code), expected, "code {code}");
+                found += usize::from(expected.is_some());
+            }
+        }
+        assert!(found > 10_000, "{found} codes with a user number");
     }
 
     #[test]
