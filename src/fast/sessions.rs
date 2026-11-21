@@ -1370,6 +1370,57 @@ impl Person {
         true
     }
 
+    /// The person's next `count` events at once (1 to 4): what `count` calls
+    /// of `add` do, with their timestamps in the first `count` 64-bit lanes
+    /// of `ts` in the order they come. The other lanes may hold anything.
+    /// `false`, with nothing changed, when the events are not in time order
+    /// or the batch's sessions have no room for four more; the caller then
+    /// goes on one event at a time.
+    ///
+    /// # Safety
+    /// Needs AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub unsafe fn add_first(&mut self, sessions: &mut [[u64; 2]], ts: std::arch::x86_64::__m256i, count: usize) -> bool {
+        use std::arch::x86_64::*;
+        debug_assert!((1..=4).contains(&count));
+        if self.open + 5 > sessions.len() {
+            return false;
+        }
+        // The lanes that are events.
+        let taken = (1usize << count) - 1;
+        // Each timestamp next to the one before it.
+        let before = _mm256_blend_epi32::<0b0000_0011>(
+            _mm256_permute4x64_epi64::<0b10_01_00_00>(ts),
+            _mm256_set1_epi64x(i64::from(self.latest)),
+        );
+        let earlier = _mm256_cmpgt_epi64(before, ts);
+        if _mm256_movemask_pd(_mm256_castsi256_pd(earlier)) as usize & taken != 0 {
+            return false;
+        }
+        let long = _mm256_cmpgt_epi64(_mm256_sub_epi64(ts, before), _mm256_set1_epi64x(i64::from(GAP)));
+        let cuts = _mm256_movemask_pd(_mm256_castsi256_pd(long)) as usize & taken;
+        // The sessions that begin here, moved together: their starts and
+        // their words (the events so far, one more per lane), and four
+        // entries written whatever their number is. What is written after
+        // the last of them is overwritten before anything reads it, as the
+        // one entry is that `add` writes ahead.
+        let order = _mm256_loadu_si256(FOUR_TOGETHER[cuts].as_ptr() as *const __m256i);
+        let words = _mm256_add_epi64(_mm256_set1_epi64x(self.word as i64), _mm256_set_epi64x(3, 2, 1, 0));
+        let starts = _mm256_permutevar8x32_epi32(ts, order);
+        let words = _mm256_permutevar8x32_epi32(words, order);
+        // SAFETY: entries `open + 1` to `open + 4` exist, checked above.
+        let at = sessions.as_mut_ptr().add(self.open + 1) as *mut __m256i;
+        _mm256_storeu_si256(at, _mm256_unpacklo_epi64(starts, words));
+        _mm256_storeu_si256(at.add(1), _mm256_unpackhi_epi64(starts, words));
+        self.open += cuts.count_ones() as usize;
+        self.word += count as u64;
+        let mut stamps = [0u64; 4];
+        _mm256_storeu_si256(stamps.as_mut_ptr() as *mut __m256i, ts);
+        self.latest = stamps[count - 1] as u32;
+        true
+    }
+
     /// The event just given is a purchase: `word` is `price | category << 32`
     /// and `purchases` the second of `ScratchC::batch_scratch`.
     #[inline(always)]
@@ -1383,6 +1434,31 @@ impl Person {
         (self.word & EVENTS_MASK) - self.events_before
     }
 }
+
+/// For `Person::add_first`: per set of lanes that begin a session (bit
+/// `lane` of the index), the 32-bit halves that bring those lanes together.
+/// The first of them goes to 64-bit lane 0, the second to lane 2, the third
+/// to lane 1 and the fourth to lane 3, so that the low and the high unpack
+/// of starts and words give the entries in order.
+#[cfg(target_arch = "x86_64")]
+const FOUR_TOGETHER: [[u32; 8]; 16] = {
+    let mut table = [[0u32; 8]; 16];
+    let mut cuts = 0;
+    while cuts < 16 {
+        let places = [0, 2, 1, 3];
+        let (mut lane, mut found) = (0, 0);
+        while lane < 4 {
+            if cuts >> lane & 1 == 1 {
+                table[cuts][2 * places[found]] = 2 * lane as u32;
+                table[cuts][2 * places[found] + 1] = 2 * lane as u32 + 1;
+                found += 1;
+            }
+            lane += 1;
+        }
+        cuts += 1;
+    }
+    table
+};
 
 /// Rows and cells of the persons in the batch; the batch is empty afterwards.
 fn finish_batch(
@@ -2594,6 +2670,20 @@ mod tests {
         tables_of(&out)
     }
 
+    /// A second `Params` with the same contents.
+    fn params_copy(params: &Params) -> Params {
+        Params {
+            first_day: params.first_day,
+            day_offset: params.day_offset,
+            day_count: params.day_count,
+            campaigns: params.campaigns,
+            organic: params.organic,
+            categories: params.categories,
+            category_rank: params.category_rank.clone(),
+            person_shift: params.person_shift,
+        }
+    }
+
     /// Hands one person to the batch, event by event. `false` when its
     /// events are not in time order: the batch is then as it was before.
     fn give_to_batch(
@@ -3226,6 +3316,73 @@ mod tests {
                 assert_eq!(value, u32::from(lane >= zeros), "pattern {pattern:#06x}");
             }
         }
+    }
+
+    /// Up to four events at once against one at a time: gaps on both sides
+    /// of 30 minutes, timestamps out of order, lanes that are not events,
+    /// and a batch with no room left.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn events_at_once_match_one_at_a_time() {
+        use std::arch::x86_64::_mm256_set_epi64x;
+        let params = Params::new(0, 0, 14, 3, 2, &[], TEST_PERSON_SHIFT);
+        let mut rng = Rng(23);
+        let mut out = PassCOut {
+            names: Vec::new(),
+            days: Vec::new(),
+            sessions: Vec::new(),
+            events: Vec::new(),
+            revenue: Vec::new(),
+            top_category: Vec::new(),
+            campaign_days: vec![[0; 4]; 3 * 14],
+        };
+        let (mut wide, mut plain) =
+            (ScratchC::with(params_copy(&params), Tuning::DEFAULT), ScratchC::with(params, Tuning::DEFAULT));
+        let (mut taken, mut refused) = (0, 0);
+        for round in 0..40_000 {
+            let first = rng.below(1_000_000) as u32;
+            let (mut one, mut other) = (wide.begin_person(&mut out, &[], first), plain.begin_person(&mut out, &[], first));
+            // Now and then the person begins where four more sessions do not fit.
+            let room = if rng.one_in(50) { rng.range(one.open as u64 + 1, one.open as u64 + 6) as usize } else { usize::MAX };
+            let mut ts = first;
+            for _ in 0..rng.range(1, 6) {
+                let count = rng.range(1, 4) as usize;
+                let mut four = [0u64; 4];
+                for (lane, value) in four.iter_mut().enumerate() {
+                    if lane >= count {
+                        // Not an event: anything at all.
+                        *value = rng.next() >> rng.below(64);
+                        continue;
+                    }
+                    let step = rng.pick(&[0, 0, 1, 1000, 60_000, GAP - 1, GAP, GAP + 1, GAP + 2, 2 * GAP]);
+                    ts = if rng.one_in(40) { ts.saturating_sub(rng.range(1, 2000) as u32) } else { (ts + step).min(TS_MASK as u32) };
+                    *value = u64::from(ts);
+                }
+                let lanes = unsafe { _mm256_set_epi64x(four[3] as i64, four[2] as i64, four[1] as i64, four[0] as i64) };
+                let events = &four[..count];
+                let sessions = wide.batch_scratch().0;
+                let limit = room.min(sessions.len());
+                let took = unsafe { one.add_first(&mut sessions[..limit], lanes, count) };
+                let in_order = events[0] >= u64::from(other.latest) && events.windows(2).all(|pair| pair[0] <= pair[1]);
+                assert_eq!(took, in_order && other.open + 5 <= limit, "round {round}");
+                if !took {
+                    refused += 1;
+                    assert_eq!((one.open, one.word, one.latest), (other.open, other.word, other.latest), "round {round}");
+                    break;
+                }
+                taken += 1;
+                let sessions = plain.batch_scratch().0;
+                for &value in events {
+                    assert!(other.add(sessions, value as u32));
+                }
+                assert_eq!((one.open, one.word, one.latest), (other.open, other.word, other.latest), "round {round}");
+                assert_eq!(wide.batch_scratch().0[..=one.open], plain.batch_scratch().0[..=other.open], "round {round}");
+            }
+            // Neither person is kept: the next round begins where this one did.
+            wide.abort_person(one);
+            plain.abort_person(other);
+        }
+        assert!(taken > 10_000 && refused > 1_000, "{taken} taken, {refused} refused");
     }
 
     /// The AVX2 kernels against plain code, on values at the ends of their ranges.

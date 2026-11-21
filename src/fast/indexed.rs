@@ -45,6 +45,53 @@ const COMPLEX: u64 = 1 << 63;
 /// purchase word.
 pub type Record = [u64; 3];
 
+/// Four slots at a time for the scan.
+#[cfg(target_arch = "x86_64")]
+mod wide {
+    use std::arch::x86_64::*;
+
+    use super::TS_MASK;
+
+    /// The four slots at `slots`: one bit per slot (bit 0 for the first)
+    /// that does NOT hold a valid event of a generated user ID that the
+    /// partition placed (`event` is such a slot's word 0 apart from the
+    /// timestamp), of user index `user` under an alias that has its bit in
+    /// `main`, and without a purchase; and the four timestamps in the
+    /// 64-bit lanes in the order of the slots, each one meaningful where
+    /// its bit is clear.
+    ///
+    /// # Safety
+    /// Needs AVX2, and four slots readable at `slots`.
+    #[inline(always)]
+    pub unsafe fn four_events(slots: *const [u64; 2], event: u64, user: u64, main: u64) -> (__m256i, u32) {
+        let first = _mm256_loadu_si256(slots as *const __m256i);
+        let second = _mm256_loadu_si256(slots.add(2) as *const __m256i);
+        // Slots 0 and 2, and slots 1 and 3: then word 0 and word 1 of the
+        // four slots in order.
+        let even = _mm256_permute2x128_si256::<0x20>(first, second);
+        let odd = _mm256_permute2x128_si256::<0x31>(first, second);
+        let word0 = _mm256_unpacklo_epi64(even, odd);
+        let word1 = _mm256_unpackhi_epi64(even, odd);
+        // Such an event leaves only its timestamp here: tag, the bit for a
+        // generated ID and the valid bit cancel out.
+        let own = _mm256_xor_si256(word0, _mm256_set1_epi64x(event as i64));
+        // And here nothing from bit 28 up (the user index, and an alias
+        // below 64) and nothing at bit 0 (no purchase).
+        let whose = _mm256_xor_si256(word1, _mm256_set1_epi64x((user << 31) as i64));
+        let other = _mm256_or_si256(
+            _mm256_and_si256(own, _mm256_set1_epi64x(!(TS_MASK << 1) as i64)),
+            _mm256_and_si256(whose, _mm256_set1_epi64x((!0u64 << 28 | 1) as i64)),
+        );
+        // The alias's bit of `main`, at bit 0.
+        let alias = _mm256_and_si256(_mm256_srli_epi64::<22>(word1), _mm256_set1_epi64x(63));
+        let named = _mm256_srlv_epi64(_mm256_set1_epi64x(main as i64), alias);
+        let unnamed = _mm256_andnot_si256(named, _mm256_set1_epi64x(1));
+        let right = _mm256_cmpeq_epi64(_mm256_or_si256(other, unnamed), _mm256_setzero_si256());
+        let wrong = !_mm256_movemask_pd(_mm256_castsi256_pd(right)) as u32 & 0b1111;
+        (_mm256_srli_epi64::<1>(own), wrong)
+    }
+}
+
 /// Slot word 0, from the bottom: the record's valid bit, its timestamp, the
 /// bit that says its user is a user number, and the tag of the partition
 /// that placed it.
@@ -573,6 +620,9 @@ pub struct Runner {
     /// either way.
     hold_assists: bool,
     hold_sessions: bool,
+    /// Whether the scan of a batch takes four slots at a time where it can
+    /// (`SS_WIDE=1`, for A/B runs: the same sessions either way).
+    wide: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
     aliases: Vec<[u64; 2]>,
@@ -620,6 +670,7 @@ impl Runner {
             batched: batch != Some(0),
             hold_assists: hold >= 1,
             hold_sessions: hold >= 2,
+            wide: std::env::var_os("SS_WIDE").is_some_and(|value| value == "1"),
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
@@ -704,6 +755,8 @@ impl Runner {
         let mut person = Person::default();
         let mut alone = Sessions::default();
         let event = self.place.event();
+        #[cfg(target_arch = "x86_64")]
+        let four_at_a_time = self.wide;
         let slot_count = self.place.slots.len();
         let mut slot = 0usize;
         while slot < slot_count {
@@ -728,6 +781,23 @@ impl Runner {
                 };
                 if BATCHED {
                     let sessions = self.kernel.batch_scratch().0;
+                    #[cfg(target_arch = "x86_64")]
+                    while four_at_a_time && slot + 4 <= slots.len() {
+                        // Four slots at a time: the ones before the first
+                        // that is not such an event without a purchase are
+                        // taken together, the last ones of a run included.
+                        // SAFETY: the four slots are there; AVX2 is what the build targets.
+                        let (ts, wrong) = unsafe { wide::four_events(slots.as_ptr().add(slot), event, current, main) };
+                        let events = (wrong.trailing_zeros() as usize).min(4);
+                        // SAFETY: AVX2, as above.
+                        if events == 0 || !unsafe { person.add_first(sessions, ts, events) } {
+                            break;
+                        }
+                        slot += events;
+                        if events < 4 {
+                            break;
+                        }
+                    }
                     while slot < slots.len() {
                         // A purchase is taken below, one slot at a time: the
                         // loop then has nothing to call.
@@ -1230,4 +1300,105 @@ pub fn stats(keys: &Keys, links: &LinkTable, indexed_lists: &[Vec<PartList>], pa
         "SS_STATS occupied={occupied} valid={valid} numbered={numbered} other_user={other_user} runs={runs} \
          user_back={user_back} ts_back_runs={ts_back_runs} complex_events={complex_events} multi_name_runs={multi_name_runs}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SplitMix64.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// The four-slot test of the scan against the decisions it takes for one
+    /// slot: every way a slot can fail to be the main person's next plain
+    /// event, in every lane.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn four_slots_match_one_at_a_time() {
+        use std::arch::x86_64::{__m256i, _mm256_storeu_si256};
+        let mut rng = Rng(5);
+        let mut seen = [0u32; 16];
+        for round in 0..200_000 {
+            let tag = 1 + rng.below(TAG_MAX);
+            let event = tag << TAG_SHIFT | NUMBERED | VALID;
+            let user = rng.below(1 << 30);
+            let main = match rng.below(4) {
+                0 => 1 << rng.below(64),
+                1 => u64::MAX,
+                _ => rng.next() | 1 << rng.below(64),
+            };
+            let mut slots = [[0u64; 2]; 4];
+            let mut expected = ([0u64; 4], 0u32);
+            for (lane, slot) in slots.iter_mut().enumerate() {
+                let ts = match rng.below(4) {
+                    0 => 0,
+                    1 => TS_MASK,
+                    _ => rng.below(TS_MASK + 1),
+                };
+                // An alias of the main person, most of the time.
+                let mut alias = rng.below(64);
+                while (main >> alias) & 1 == 0 {
+                    alias = (alias + 1) % 64;
+                }
+                let (mut word0, mut number, mut purchase) = (event | ts << 1, user << 9 | alias, 0);
+                let mut ours = true;
+                // One slot in six is something else, in one of eight ways.
+                if rng.below(6) == 0 {
+                    ours = false;
+                    match rng.below(8) {
+                        0 => word0 ^= VALID,
+                        1 => word0 ^= NUMBERED,
+                        2 => word0 = (word0 & RECORD_BITS) | (1 + (tag + rng.below(TAG_MAX - 1)) % TAG_MAX) << TAG_SHIFT,
+                        3 => word0 &= RECORD_BITS,
+                        4 => number = (user ^ 1 << rng.below(30)) << 9 | alias,
+                        5 => number = user << 9 | (64 + rng.below(448)),
+                        6 => purchase = 1,
+                        _ => match (0..64).find(|&bit| (main >> bit) & 1 == 0) {
+                            Some(bit) => number = user << 9 | bit,
+                            None => ours = true,
+                        },
+                    }
+                }
+                *slot = [word0, number << 22 | rng.below(1 << 21) << 1 | purchase];
+                // The decisions of the scan for one slot.
+                let [word0, word1] = *slot;
+                let placed = word0 >> TAG_SHIFT == tag && word0 & VALID != 0 && word0 & NUMBERED != 0;
+                let alias = (word1 >> 22) & (ALIASES - 1);
+                let named = word1 >> 31 == user && alias < 64 && (main >> alias) & 1 != 0;
+                assert_eq!(placed && named && word1 & 1 == 0, ours, "round {round}");
+                if ours {
+                    expected.0[lane] = (word0 >> 1) & TS_MASK;
+                } else {
+                    expected.1 |= 1 << lane;
+                }
+            }
+            // SAFETY: four slots; the tests run where the build targets AVX2.
+            let (lanes, wrong) = unsafe { wide::four_events(slots.as_ptr(), event, user, main) };
+            let mut stamps = [0u64; 4];
+            // SAFETY: four words to write to.
+            unsafe { _mm256_storeu_si256(stamps.as_mut_ptr() as *mut __m256i, lanes) };
+            for lane in 0..4 {
+                if wrong >> lane & 1 == 1 {
+                    stamps[lane] = 0;
+                }
+            }
+            assert_eq!((stamps, wrong), expected, "round {round}");
+            seen[wrong as usize] += 1;
+        }
+        assert!(seen.iter().all(|&count| count > 50), "{seen:?}");
+    }
 }
