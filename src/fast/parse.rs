@@ -371,11 +371,104 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN};
+    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, MODE_STORE};
     match event_kernel() {
         KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
-        _ => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        // Checked rows go one by one through the loop that compares them.
+        _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        // Index mode has no diagnostic modes of its own: SS_DIAG=2 and 7 pick them here.
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
+            events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
+        }
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
+            events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
+        }
+        _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
+}
+
+/// The lean kernel's loop when rows are stored (or, in a diagnostic mode,
+/// dropped). Nothing is called on its common path.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_row_lean_step, lean_setup, ROW_DECLINE, ROW_PAD};
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
+    let (lean, window_length) = lean_setup(ctx);
+    // Opaque to the optimizer: see `LeanTables`.
+    let lean = std::hint::black_box(lean);
+    let mut row = EventRow::default();
+    while position < stop {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`, and the
+        // tables are those of `ctx`.
+        let (length, guess, status) = unsafe {
+            event_row_lean_step::<MODE, INDEXED>(ctx, lean, window_length, buffer.as_ptr().add(position), out, &mut row)
+        };
+        if status == ROW_DECLINE {
+            position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+        } else if length != guess {
+            position = row_end_elsewhere(position, length);
+        } else {
+            position += guess + 1;
+        }
+    }
+    // Diagnostic modes fold their work into `row.event`; keep it alive.
+    std::hint::black_box(row.event);
+    position
+}
+
+/// One row the lean kernel declined: through the general kernel and, if
+/// that declines it too, through the general parser. Returns where the next
+/// row starts.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+fn event_row_declined<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    position: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_row_fast, MODE_STORE, ROW_DONE, ROW_DROP, ROW_LONG};
+    let mut row = EventRow::default();
+    // SAFETY: at least ROW_PAD readable bytes follow `position`.
+    let (length, status) =
+        unsafe { event_row_fast::<MODE, INDEXED>(ctx, buffer.as_ptr().add(position), out, &mut row) };
+    std::hint::black_box(row.event);
+    let line_end = if status == ROW_LONG {
+        find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset)
+    } else {
+        position + length
+    };
+    // Stored (ROW_DONE) or malformed (ROW_DROP) is settled; anything else is
+    // the general parser's. The diagnostic modes store nothing.
+    if MODE == MODE_STORE && status != ROW_DONE && status != ROW_DROP {
+        let line = &buffer[position..line_end];
+        if INDEXED {
+            let keys = ctx.keys.as_ref().expect("index mode needs keys");
+            emit_slow_indexed(out, &event_row_slow_indexed(ctx, keys, line));
+        } else if let Some(row) = event_row_slow(ctx, line) {
+            emit_event(out, &row);
+        }
+    }
+    line_end + 1
+}
+
+/// The lean kernel read a row whose end is not where its early look for the
+/// newline said (a row under 64 or over 96 bytes). A call on purpose: it
+/// keeps this a branch the processor predicts, so that in the common case
+/// the next row's start does not wait for this row's last field.
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+fn row_end_elsewhere(position: usize, length: usize) -> usize {
+    position + length + 1
 }
 
 /// `events_fast_loop` with one of the event kernels (`simd::KERNEL_*`).
