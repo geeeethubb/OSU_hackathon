@@ -15,6 +15,11 @@
 //!   in one array that covers every index (an atomic "smaller ingest wins"
 //!   update), and afterwards the threads read the array in order.
 //!
+//! lists-wc: the lists scheme with write combining: a record first goes into
+//!   a 64-byte buffer of its partition (the buffers of all partitions stay in
+//!   the cache), and a full buffer is written to the list with non-temporal
+//!   stores, so the list memory is never read before it is written.
+//!
 //! All big arrays ask for transparent huge pages on Linux, as the engine's
 //! allocator does.
 //!
@@ -165,6 +170,114 @@ fn main() {
         let lists_sum = total.load(Ordering::Relaxed);
         drop(lists);
 
+        // ---- lists with write combining and non-temporal stores
+        let started = Instant::now();
+        const WC_BLOCK: usize = 256;
+        let wc_lists: Vec<(Lists, Vec<[[u64; 2]; 4]>, Vec<u8>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let (order, copies) = (&order, &copies);
+                    scope.spawn(move || {
+                        let mine = (order.len() + copies.len()) / threads + 1;
+                        let mut lists = Lists {
+                            arena: huge(mine + parts * WC_BLOCK),
+                            used: 0,
+                            cursor: vec![0; parts],
+                            room: vec![0; parts],
+                            blocks: (0..parts).map(|_| Vec::with_capacity(16)).collect(),
+                        };
+                        let staging: &'static mut [[[u64; 2]; 4]] = huge(parts);
+                        let mut fill = vec![0u8; parts];
+                        let mut emit = |index: u64, copy: u64| {
+                            let part = (index >> SHIFT) as usize;
+                            let at = fill[part] as usize;
+                            staging[part][at] = record(index, copy);
+                            if at == 3 {
+                                if lists.room[part] == 0 {
+                                    lists.blocks[part].push(lists.used as u32);
+                                    lists.cursor[part] = lists.used as u32;
+                                    lists.room[part] = WC_BLOCK as u32;
+                                    lists.used += WC_BLOCK;
+                                }
+                                // SAFETY: the arena is 2 MiB aligned and the cursor a multiple of
+                                // four records, so the target is a whole 64-byte line of the arena.
+                                unsafe {
+                                    use std::arch::x86_64::*;
+                                    let from = staging[part].as_ptr() as *const __m256i;
+                                    let to = lists.arena.as_mut_ptr().add(lists.cursor[part] as usize) as *mut __m256i;
+                                    _mm256_stream_si256(to, _mm256_load_si256(from));
+                                    _mm256_stream_si256(to.add(1), _mm256_load_si256(from.add(1)));
+                                }
+                                lists.cursor[part] += 4;
+                                lists.room[part] -= 4;
+                                fill[part] = 0;
+                            } else {
+                                fill[part] = at as u8 + 1;
+                            }
+                        };
+                        let (from, to) = share(order.len(), thread);
+                        for &index in &order[from..to] {
+                            emit(u64::from(index), 1);
+                        }
+                        let (from, to) = share(copies.len(), thread);
+                        for &index in &copies[from..to] {
+                            emit(u64::from(index), 0);
+                        }
+                        // SAFETY: plain instruction; orders the streamed lines before the readers.
+                        unsafe { std::arch::x86_64::_mm_sfence() };
+                        (lists, staging.to_vec(), fill)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+        let wc_produced = started.elapsed();
+        let next = AtomicUsize::new(0);
+        let total = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let (wc_lists, next, total) = (&wc_lists, &next, &total);
+                scope.spawn(move || {
+                    let mut slots = vec![[0u64; 2]; 1 << SHIFT];
+                    let mut sum = 0u64;
+                    loop {
+                        let part = next.fetch_add(1, Ordering::Relaxed);
+                        if part >= parts {
+                            break;
+                        }
+                        slots.fill([0, 0]);
+                        let mut put = |[word0, word1]: [u64; 2]| {
+                            let slot = &mut slots[(word0 & ((1 << SHIFT) - 1)) as usize];
+                            if slot[1] == 0 || (word1 & 0x3F_FFFF) < (slot[1] & 0x3F_FFFF) {
+                                *slot = [word0, word1];
+                            }
+                        };
+                        for (list, staging, fill) in wc_lists {
+                            let blocks = &list.blocks[part];
+                            for (at, &start) in blocks.iter().enumerate() {
+                                let end =
+                                    if at + 1 == blocks.len() { list.cursor[part] as usize } else { start as usize + WC_BLOCK };
+                                for &pair in &list.arena[start as usize..end] {
+                                    put(pair);
+                                }
+                            }
+                            // What was still waiting in the partition's buffer.
+                            for &pair in &staging[part][..fill[part] as usize] {
+                                put(pair);
+                            }
+                        }
+                        for slot in &slots {
+                            sum = sum.wrapping_add(slot[1] >> 22);
+                        }
+                    }
+                    total.fetch_add(sum, Ordering::Relaxed);
+                });
+            }
+        });
+        let wc_total = started.elapsed();
+        let wc_sum = total.load(Ordering::Relaxed);
+        drop(wc_lists);
+
         // ---- direct: one word per slot, ingest above the payload so that
         // "smaller wins" is one atomic minimum. Zero means empty, so a record
         // is stored inverted and the maximum is kept.
@@ -212,14 +325,17 @@ fn main() {
         let direct_sum = total.load(Ordering::Relaxed);
         let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
         println!(
-            "round {round}: lists produce {:.1} + place and read {:.1} = {:.1} ms | direct produce {:.1} + read {:.1} = {:.1} ms | same winners: {}",
+            "round {round}: lists produce {:.1} + place and read {:.1} = {:.1} ms | lists-wc produce {:.1} + place and read {:.1} = {:.1} ms | direct produce {:.1} + read {:.1} = {:.1} ms | same winners: {}",
             ms(produced),
             ms(lists_total - produced),
             ms(lists_total),
+            ms(wc_produced),
+            ms(wc_total - wc_produced),
+            ms(wc_total),
             ms(produced_direct),
             ms(direct_total - produced_direct),
             ms(direct_total),
-            lists_sum == direct_sum,
+            lists_sum == direct_sum && lists_sum == wc_sum,
         );
     }
 }
