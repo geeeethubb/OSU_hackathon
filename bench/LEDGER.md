@@ -207,7 +207,11 @@ known so far is 1.38 s for `e4eef020`).
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `2b2cccd1ba1cb12bc5a074a899ce54c868205b86` | **0.71 s** | BB-3EDA1225 | observed in the team's signed-in submission history by the ChatGPT submission watch, relayed 2026-11-21 |
+| `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | **0.5231 s** | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
+| `2dae9298f4e1e0a5259eec54c400501b00fae26f` | 0.6389 s (shown earlier as 0.64 s) | not relayed | relayed by the user 2026-11-21 |
+| `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e` (candidate C) | 0.64 s | not relayed | same |
+| `4567e9532f4019fbfd0e92908fd01cc49f24f67d` | 0.66 s | BB-898B1D4A | same |
+| `2b2cccd1ba1cb12bc5a074a899ce54c868205b86` | 0.71 s | BB-3EDA1225 | observed in the team's signed-in submission history by the ChatGPT submission watch, relayed 2026-11-21 |
 | `23b285da8246d00275b1ad191da0fffb8c5f81e4` | 0.84 s | not relayed | same |
 | `e4eef020ce0bb9e005c329e57ea241c6e842dde8` | 1.38 s | not relayed | same |
 
@@ -673,3 +677,52 @@ base was `b890895` and the comparison was against candidate E.
 - **Next for the lead:** the stage before the event parse (11 to 16 ms elapsed, about 60 CPU-ms on
   870k link rows; timers added to split it), the whale tail of the index pass (12 ms on one or two
   threads), and the 60M check of candidate F.
+
+### 23:30 UTC
+
+- **Official: candidate F scored 0.5231 s** (`1033956062d3cd948462c664d822f2636bcf1153`, receipt
+  BB-337F162E), against 0.6389 s for `2dae9298`: 115.8 ms less, 18.1%. Relayed by the user; rank 37
+  when checked, the board's best 0.2778 s. `bench/BEST_SHA` now names F: every CI run from here on pairs
+  against the officially scored commit.
+- **Calibration row (data, not a model):** between `2dae9298` and F the paired CI changes were 56 to 67
+  ms (E against `2dae9298`, Xeon 6975P-C) plus 127 to 137 ms (F against E, Xeon 6975P-C) or 155 to 169
+  ms (F against E on the slower runner of the fresh-seed run): 183 to 236 ms in all on 2-core, 4-thread
+  runners. Officially: 115.8 ms on the scorer (4 cores, 8 threads, CPU model not known to us). That is
+  0.49 to 0.63 official milliseconds per CI millisecond for this step; earlier steps gave 0.26 to 0.9.
+  Nothing here fixes a floor or a rule: the runners differ from each other by more than that spread,
+  and one official number has unknown run-to-run variation.
+- **Candidate F, full evidence.** 20M against candidate E, seeds 2 / 3 / 5 (run 44960193444, Xeon
+  6975P-C, 2 cores x 2 threads): +126.6 / +136.7 / +127.1 ms, 18/18 pairs (medians 799.8 -> 673.9,
+  809.5 -> 672.6, 785.1 -> 657.8), A/A medians +2.5 / +3.9 / -0.4; 23/23 runs per seed MATCH
+  `/reference`. Fresh seeds 17 / 19 / 23 (run 44961013928): **+155.3 / +169.1 / +161.9 ms**, 18/18
+  pairs (978.8 -> 821.4, 1,024.1 -> 854.0, 1,017.1 -> 852.6), A/A medians +1.8 / -0.3 / -1.5; all
+  MATCH. 60M (seed 2, Xeon 8573C): 2,652.2 -> 2,174.4 ms, +479.4 ms, 6/6 pairs, 19/19 runs MATCH
+  `/reference`, peak memory 1.87 GiB (limit 13 GiB there, 24 GiB on the scorer). Fixtures 36/36 and
+  43/43, dev MATCH. Locally, on the tree before the output step: eight switch settings each 36/36,
+  43/43, dev MATCH, and 180/180 runs on the small and mutated sets.
+- **Elapsed critical path of F** (run 44960193444, Xeon 6975P-C, seed 2, one instrumented run):
+  container 670.3 ms; process 608.3 = startup 1.3, link stage 10.1 (link rows 9.6; the lookup tables
+  took 10.9 on their own thread and nobody waited), parse stage 435.2 (workers 409.8, click index
+  25.2), odd events 2.8, index pass 155.9 (partitions 142.9, whale tail 12.5), general remainder 2.1,
+  output 0.9. Summed worker time for scale: event parse 1,435, click parse 202, link builder 117, index
+  partitions 532 (placing 128, session kernel 226, the rest 179), output encode 30 CPU-ms. **The event
+  parse is 59% of the process on that runner: 69 ns per row and hardware thread for about 222 to 254
+  instructions, roughly one instruction per cycle per thread with two threads on a core.** Why it is
+  that low is not known: perf counters are the next measurement.
+- **Parser steps after the one in F, each paired directly against its parent** (EPYC 7763): loop and
+  store inside the assembly (`dafe006` against `5db6322`, run 44960744992): +14.8 / +6.5 / +8.1 ms,
+  17/18 pairs; eleven instructions fewer (`94f1cbb` against `dafe006`, run 44960377730): +13.1 / +3.9 /
+  +6.8 ms, 14/18 pairs, A/A up to +8: positive, close to the noise. `dafe006` against candidate E:
+  +74.6 / +80.8 / +79.1 ms (run 44959147433) and +46.7 / +23.9 / +41.8 ms on an EPYC 7763, where the
+  same image with `SS_KERNEL=plain` is 38.7 / 32.0 / 39.1 ms slower (18/18).
+- **Branch padding (Skylake-family erratum), candidate F plus the build flag against F** (run
+  44960336101, EPYC 7763, which is not an affected CPU): 3.9 / 1.0 / 5.3 ms **slower**, 14/18 pairs.
+  The parser agent measured on the Linux object that the flag does pad the assembly loop: 8 of its 24
+  jumps touched a 32-byte boundary before, none after, at the price of 8 no-ops per row. Whether the
+  scorer is an affected CPU is not known; no CI runner is one. Not in any candidate; it can only be
+  judged by an official score, and the padding can be had without the no-ops by hand if that score
+  says it helps.
+- **Sessions switches, same image** (`9407f49`, seeds 2 and 3, default against variant; negative means
+  the default is faster): `SS_PLACE=1` -5.2 / +1.7; `SS_PLACE=2` +9.7 (two outliers) / -4.8 (6/6);
+  `SS_PLACE=3` -21.9 / +15.4; `SS_BATCH=8` -6.6 / -3.4; `SS_BATCH=128` +1.3 / +2.5. No variant beats
+  the default on both seeds: all rejected as defaults, the switches stay for later runners.
