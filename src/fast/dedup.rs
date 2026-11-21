@@ -13,6 +13,9 @@ use super::{CLICK_BLOCK, LOCAL_BITS, LOCAL_MASK, PARTS, PERSON_BLOCK};
 
 const TS_MASK: u64 = 0x7FFF_FFFF;
 const INGEST_MASK: u64 = 0x1F_FFFF;
+/// How many records ahead of its lookup a person-table slot is prefetched.
+/// The table is far bigger than the cache, so an unprefetched lookup stalls.
+const AHEAD: usize = 16;
 
 /// What one worker writes in pass B.
 pub struct PassBOut {
@@ -125,6 +128,10 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
     });
 
     // The winner's own valid bit decides: an invalid winner drops the event.
+    // Survivors wait in a small ring while their person-table slot loads.
+    let mut ring = [[0u64; 3]; AHEAD];
+    let mut waiting = 0usize;
+    let mut slot = 0usize;
     let mut sequence = 0u32;
     for_each_record(lists, |word0, word1, purchase| {
         let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
@@ -132,29 +139,54 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
         if (word0 & 1) & !is_lost == 0 {
             return;
         }
-        let mixed = mix(links.person(word1 >> 22));
-        let part = (mixed >> LOCAL_BITS) as usize;
-        let is_purchase = word1 & 1;
-        let key = ((mixed & LOCAL_MASK) << 32) | (word0 & (TS_MASK << 1)) | is_purchase;
-        let at = out.events[part].reserve(&mut out.arena, PERSON_BLOCK, 1 + is_purchase as usize);
-        // SAFETY: `reserve` returned room for one word, or two for a purchase.
-        unsafe {
-            *at = key;
-            if is_purchase == 1 {
-                *at.add(1) = purchase;
-            }
+        links.prefetch(word1 >> 22);
+        if waiting == AHEAD {
+            let [old0, old1, old_purchase] = ring[slot];
+            forward(links, out, old0, old1, old_purchase);
+        } else {
+            waiting += 1;
         }
+        ring[slot] = [word0, word1, purchase];
+        slot = (slot + 1) % AHEAD;
     });
+    // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
+    let first = if waiting == AHEAD { slot } else { 0 };
+    for offset in 0..waiting {
+        let [word0, word1, purchase] = ring[(first + offset) % AHEAD];
+        forward(links, out, word0, word1, purchase);
+    }
+}
+
+/// Writes one surviving event to its person's partition.
+#[inline(always)]
+fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purchase: u64) {
+    let mixed = mix(links.person(word1 >> 22));
+    let part = (mixed >> LOCAL_BITS) as usize;
+    let is_purchase = word1 & 1;
+    let key = ((mixed & LOCAL_MASK) << 32) | (word0 & (TS_MASK << 1)) | is_purchase;
+    // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
+    // number of writers; `reserve` returns room for the words written.
+    unsafe {
+        let at = out.events.get_unchecked_mut(part).reserve(&mut out.arena, PERSON_BLOCK, 1 + is_purchase as usize);
+        *at = key;
+        if is_purchase == 1 {
+            *at.add(1) = purchase;
+        }
+    }
 }
 
 /// Map a batch of parsed clicks to their persons' partitions.
 pub fn map_clicks(links: &LinkTable, clicks: &[ClickRecord], out: &mut PassBOut) {
-    for click in clicks {
+    for (index, click) in clicks.iter().enumerate() {
+        if let Some(later) = clicks.get(index + AHEAD) {
+            links.prefetch(later.user);
+        }
         let mixed = mix(links.person(click.user));
         let part = (mixed >> LOCAL_BITS) as usize;
-        let at = out.clicks[part].reserve(&mut out.arena, CLICK_BLOCK, 2);
-        // SAFETY: `reserve` returned room for two words.
+        // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
+        // number of writers; `reserve` returns room for two words.
         unsafe {
+            let at = out.clicks.get_unchecked_mut(part).reserve(&mut out.arena, CLICK_BLOCK, 2);
             *at = ((mixed & LOCAL_MASK) << 32) | (u64::from(click.ts) << 1);
             *at.add(1) = click.code_and_campaign;
         }

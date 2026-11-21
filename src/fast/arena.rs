@@ -11,9 +11,42 @@ const CHUNK_WORDS: usize = 1 << 21;
 const HEADER_WORDS: usize = 2;
 
 pub struct Arena {
+    /// Chunks from the global allocator (where huge pages are not available).
     chunks: Vec<Vec<u64>>,
     cursor: *mut u64,
     left: usize,
+}
+
+/// Anonymous memory that asks for transparent huge pages. On the CI runners a
+/// gigabyte of 4 KiB pages costs 100 to 150 ms more (page faults while
+/// writing, then teardown at exit, both inside the timed interval) than the
+/// same gigabyte in 2 MiB pages. Never unmapped: the process exits.
+#[cfg(target_os = "linux")]
+mod huge {
+    const HUGE_PAGE: usize = 2 << 20;
+    const PROT_READ_WRITE: i32 = 1 | 2;
+    const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+    const MADV_HUGEPAGE: i32 = 14;
+
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+
+    /// At least `bytes` of zeroed memory aligned to 2 MiB, or null.
+    pub fn alloc(bytes: usize) -> *mut u8 {
+        let size = (bytes + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+        // SAFETY: a fresh private anonymous mapping; the advice is only a hint.
+        unsafe {
+            let raw = mmap(std::ptr::null_mut(), size + HUGE_PAGE, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
+            if raw as isize == -1 {
+                return std::ptr::null_mut();
+            }
+            let aligned = ((raw as usize + HUGE_PAGE - 1) & !(HUGE_PAGE - 1)) as *mut u8;
+            madvise(aligned, size, MADV_HUGEPAGE);
+            aligned
+        }
+    }
 }
 
 // SAFETY: an arena is owned and written by one thread at a time; the blocks it
@@ -29,7 +62,17 @@ impl Arena {
     #[cold]
     #[inline(never)]
     fn refill(&mut self, words: usize) {
-        let mut chunk: Vec<u64> = Vec::with_capacity(CHUNK_WORDS.max(words));
+        let words = CHUNK_WORDS.max(words);
+        #[cfg(target_os = "linux")]
+        {
+            let chunk = huge::alloc(words * 8);
+            if !chunk.is_null() {
+                self.cursor = chunk as *mut u64;
+                self.left = words;
+                return;
+            }
+        }
+        let mut chunk: Vec<u64> = Vec::with_capacity(words);
         self.cursor = chunk.as_mut_ptr();
         self.left = chunk.capacity();
         self.chunks.push(chunk);
