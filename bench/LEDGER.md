@@ -607,3 +607,69 @@ official_receipt_and_score: not yet submitted
   `SS_BATCH=0`).
 - **Startup edge cases (local, exact):** datasets with no link rows, no click rows, or neither, at 1, 4
   and 8 threads: all MATCH `/reference`, index mode chosen each time.
+
+### 23:05 UTC
+
+Round result: seven steps measured alone in CI, six kept, and candidate F assembled from them. Every
+number is a median of six shuffled AB/BA pairs per seed on one runner; "x/18" counts pairs won.
+(Reading note: in the same-image variant block of the CI report A is the default and B the variant. I
+read one batch of them with the sign reversed at 22:20 and corrected it at 22:36; the lines below are
+checked against the per-run medians.)
+
+| Step (commit, owner) | Against | Paired result | Same-image variant | Decision |
+|---|---|---|---|---|
+| Event kernel in assembly, in step (`5db6322`, parser) | candidate E | **+82.4 / +71.3 / +69.4 ms**, 18/18, Xeon 6975P-C (run 44956742090); +31.1 / +31.5 / +24.1 ms, 18/18, EPYC 9V45 (run 44956768241) | `SS_KERNEL=plain` 23.3 / 23.9 / 31.7 ms slower, 18/18 | keep |
+| Sessions while the slots are read (`9a2b760`, sessions step 1) | candidate E | +18.8 / +13.2 / +17.9 ms, 18/18, EPYC 7763 (run 44953779232) | none | keep |
+| Persons in batches (`093ad2e` / `2d58de3`, step 2) | candidate E | +7.3 / +10.5 / +15.0 (15/18) and +15.2 / +9.3 / +16.2 (17/18), EPYC 9V45: not distinguishable from step 1 alone | `SS_BATCH=0` on `2d58de3`: 5.6 ms faster (3/6) and 12.8 ms slower (5/6), Xeon 6973P-C: neutral | kept only because step 3 builds on it |
+| Slot tags instead of the bitmap, leaner scan (`cfc7799`, step 3) | its parent `2d58de3` | +29.4 / +7.0 / +11.6 ms, 17/18, Xeon 6975P-C (run 44956028362); +15.5 / +13.0 / +14.7 ms, 16/18 (run 44956292915) | `SS_BATCH=0` 20.3 / 23.2 / 20.7 ms slower, 17/18: with the tag scan the batch pays | keep |
+| Table-driven click kernel (`ff5feff`, clicks) | candidate E | +9.5 / +13.1 / +9.4 ms, 18/18, EPYC 7763 (run 44956303415; a first run on a noisy runner gave +12.2 / +2.2 / +7.7) | `SS_CLICK_KERNEL=lean` 5.2 / 6.4 / 5.3 ms slower, 13/18 | keep (about 5 ms) |
+| Links: packed summaries, quick code-to-number (`f080503`, links) | candidate E | +9.3 / +6.1 / +8.8 ms, 14/18 (run 44956751344); builder 146 -> 65 CPU-ms, parse workers done 1.7 ms earlier | none | keep (about 3 to 5 ms) |
+| user_daily written while its rows are produced (`bec7dfd`, output) | candidate E | +21.0 / +14.9 / +30.4 ms, 18/18, **Xeon Platinum 8370C** (run 44957382595) | `SS_STREAM=0` 14.2 / 12.2 / 17.3 ms slower, 17/18 | keep |
+| Input mappings let go beside the index pass (`9a9c467`, lead) | candidate E | +7.7 / +7.4 / +13.8, +14.2 / +8.9 / +24.4, +11.4 / +10.4 / +11.2 ms on nine seeds (runs 44955536301, 44957004270, 44957028968) | `SS_RELEASE=0` slower by 5.1 / 12.8 / 14.1, 1.0 / 1.5 / 18.2, 8.5 / 4.4 / 17.4 ms; 39/54 pairs | keep, see below |
+| Click lists of 16,384 users (`CLICK_SHIFT` 14) | its base `b890895` | 7.9 / 7.2 / 10.6 ms **slower**, 16/18 (run 44956730007): click index build 21.9 -> 31.7 ms | none | rejected |
+| Click lists of 4,096 users (`CLICK_SHIFT` 12) | its base `b890895` | +0.3 / +11.6 / +2.8 ms, 10/18 (run 44956695585): inside the noise | none | rejected |
+
+All fixed-cost numbers before a step's own share include about 4 ms of the fast exit where the step's
+base was `b890895` and the comparison was against candidate E.
+
+- **Exit teardown, the measured facts.** The time between the last stage and the container's end,
+  minus a no-op container, was 17 to 34 ms. With the mappings let go early it is 11 to 14 ms shorter
+  on all three seeds of the first run (77.8 against 90.3, 84.9 against 95.7, 74.9 against 88.8 ms). The
+  success line I set before the run (variant at least 10 ms slower on every seed, 5 of 6 pairs) is not
+  met as written: four of nine seeds are below 10 ms. Kept on the pooled evidence instead: all nine seed
+  medians favour it, 39 of 54 pairs, median of the nine 8.5 ms, and the gain against candidate E is
+  positive on all nine seeds. Worth about 5 to 10 ms on a 2-core runner; with eight threads the helpers
+  cost a smaller share, which is an inference.
+- **Click rows are not bounded by their kernel or their lists.** A quarter fewer instructions bought 1
+  to 6% of click CPU (5 ms); 8 and 32 times fewer lists bought 4% and lost it again in the index build.
+  Click rows cost 35 to 48 ns in the pipeline against 12 to 15 ns for the kernel alone in one thread.
+  Inference: two threads share each core (measured above: the second thread adds only 27%), and the
+  input is read cold. Remaining click gains are proportional to instructions; no structural item left.
+- **Why the assembly kernel gains three times as much on the Intel runner.** Not measured directly.
+  The compiler's kernel kept the row's values on the stack and reloaded them; the assembly keeps them
+  in registers. The Xeon 6975P-C run lost 9% of container time to that, the EPYC 9V45 run 5%. The
+  scorer is an Intel Xeon of an older generation; how it behaves is unknown until it scores this.
+- **Runner closest to the scorer's class seen so far:** Xeon Platinum 8370C (Ice Lake, 2 cores x 2
+  threads): candidate E + fast exit takes about 900 to 930 ms of container time there. One runner, one
+  run: data for the calibration table, not a model.
+- **Correctness hazard found and fixed** (correctness agent): Parquet files already in the two table
+  folders were left in place and the engine's part numbers differ from run to run, so a second run into
+  the same output folder would have been read together with the first. `a9852a1` removes `*.parquet`
+  in `user_daily/` and `campaign_daily/` before anything is written (tested with stale parts and a
+  stale campaign file; other files are left alone). The accepted official runs show the scorer's folder
+  was clean; this closes the case where it is not.
+- **Correctness agent on `b890895`:** 0 disagreements in about 13,500 engine runs (link mutations at
+  every alias boundary, link floods and cycles, click twins and strays, lookup tables of every size,
+  thread counts 1 to 8, early-exit repetitions). Now on the merged steps: slot-tag traps for `cfc7799`,
+  row fuzz for the assembly kernel.
+- **Candidate F (integrated, local):** `b890895` + assembly event kernel + sessions steps 1 to 3 +
+  links step + table-driven click kernel + output written during the index pass + mappings let go
+  early + output folder cleared + startup timers. Unit tests 49/49, fixtures 36/36 and 43/43, dev, 20M
+  seeds 2 and 3 MATCH on the merge before the output step; the full tree is verified again before the
+  push. Its CI run carries `[60m]`; the PR keeps naming candidate E until that run confirms F.
+- **In CI now:** parser step 2, loop and store inside the assembly (`dafe006`, branch
+  `exp-ci-parse-2`, variant `SS_KERNEL=plain`); sessions switches `9407f49` (`exp-ci-sessions-4`):
+  `SS_PLACE=1/2/3` (how the lists are read into the slot table) and `SS_BATCH=8/128`.
+- **Next for the lead:** the stage before the event parse (11 to 16 ms elapsed, about 60 CPU-ms on
+  870k link rows; timers added to split it), the whale tail of the index pass (12 ms on one or two
+  threads), and the 60M check of candidate F.
