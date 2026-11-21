@@ -59,6 +59,11 @@ pub struct ScratchB {
     table: Vec<Slot>,
     /// One bit per record, in iteration order: set for losing copies.
     lost: Vec<u64>,
+    /// Diagnostics (`SS_TIMING`): nanoseconds this worker spent choosing
+    /// winners and forwarding survivors.
+    pub measure: bool,
+    pub winners_nanos: u64,
+    pub forward_nanos: u64,
 }
 
 /// Calls `visit(word0, word1, purchase_word)` for every record of the lists.
@@ -99,6 +104,7 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
 
     // Step 2 of the rules: per event ID keep the copy with the smallest
     // ingest_ts (the first seen among equal ones, which are identical).
+    let started = scratch.measure.then(std::time::Instant::now);
     let mut sequence = 0u32;
     for_each_record(lists, |word0, word1, _| {
         let key = (word0 >> 32) as u32;
@@ -128,6 +134,8 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
         sequence += 1;
     });
 
+    let between = scratch.measure.then(std::time::Instant::now);
+
     // The winner's own valid bit decides: an invalid winner drops the event.
     // Survivors wait in a small ring while their person-table slot loads.
     let mut ring = [[0u64; 3]; AHEAD];
@@ -155,6 +163,10 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
     for offset in 0..waiting {
         let [word0, word1, purchase] = ring[(first + offset) % AHEAD];
         forward(links, out, word0, word1, purchase);
+    }
+    if let (Some(started), Some(between)) = (started, between) {
+        scratch.winners_nanos += (between - started).as_nanos() as u64;
+        scratch.forward_nanos += between.elapsed().as_nanos() as u64;
     }
 }
 

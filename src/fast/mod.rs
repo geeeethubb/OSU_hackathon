@@ -463,11 +463,16 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
     let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
+    let winners_nanos = AtomicU64::new(0);
+    let forward_nanos = AtomicU64::new(0);
+    let click_map_nanos = AtomicU64::new(0);
     parallel(threads, |thread| {
         // SAFETY: slot `thread` belongs to this thread for the whole phase.
         let out = unsafe { b_out.get(thread) };
         let mut scratch = ScratchB::default();
+        scratch.measure = measure;
         let mut lists: Vec<PartList> = Vec::with_capacity(event_lists.len());
+        let mut clicks_spent = 0u64;
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             if at < event_parts {
@@ -475,12 +480,22 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
                 dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - event_parts) {
+                let started = measure.then(Instant::now);
                 dedup::map_clicks(&link_table, batch, out);
+                if let Some(started) = started {
+                    clicks_spent += started.elapsed().as_nanos() as u64;
+                }
             } else {
                 break;
             }
         }
+        winners_nanos.fetch_add(scratch.winners_nanos, Ordering::Relaxed);
+        forward_nanos.fetch_add(scratch.forward_nanos, Ordering::Relaxed);
+        click_map_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
     });
+    timing.detail("cpu_dedup_winners", winners_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("cpu_dedup_forward", forward_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.stage("dedup");
 
     // Pass C.
