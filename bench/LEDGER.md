@@ -108,3 +108,20 @@ known so far is 1.38 s for `e4eef020`).
 - **Current limiting work:** parse (half of the process time), then dedup forward, then sessions.
 - **Next experiment:** make the inline path cheap in that order (one fast conversion per click, one
   fused pass over the slots, whales without the serial copy), then a same-image CI variant.
+
+### 18:50 UTC
+
+- **Correctness fix on top of the candidate:** the fast ISO timestamp path bounded month and day only by
+  99 and then looked the date up by `month * 32 + day`, so a day of 32 to 99 landed on a real date of the
+  next month (`2026-09-33T10:00:00Z` was read as October 1 and the row counted as valid). Found by the
+  parser agent with a six-row probe; every commit since the date table was introduced has it, `16bc175b`
+  included. The generator never writes such a day (its impossible dates are month 13, February 30,
+  February 29 outside a leap year, hour 24 and second 60, none of which alias), so no generated dataset,
+  fixture or score changes; a hand-written case could. Fixed by bounding month and day by 12 and 31
+  (`d0caa70`). On the probe the old binary reports one user row too many and the fixed one matches
+  `/reference`. Laptop checks on the fixed tree with `SS_VERIFY=1`: 22 unit tests, 36/36, 43/43, dev and
+  20M seeds 2 and 3 MATCH.
+- **Best verified candidate:** still `16bc175b` until CI has measured the fixed commit (this commit:
+  same engine plus the fix, paired against `16bc175b`, with the 60M run). The fix changes two constants,
+  so the expected paired difference is noise.
+- **Next:** the inline index path continues on branch `exp-index-inline` (default path untouched).

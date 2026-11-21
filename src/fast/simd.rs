@@ -69,7 +69,8 @@ impl TsTables {
         for offset in 0..62 {
             let (year, month, day) = civil_from_days(base_day + offset);
             let year_index = (year - year0) as usize;
-            if year_index <= 1 {
+            // A year past 9999 has no four-digit text, so its days stay out.
+            if year_index <= 1 && year <= 9999 {
                 date[(year_index << 12) | ((month as usize) << 5) | day as usize] = offset as u8;
             }
         }
@@ -115,9 +116,13 @@ unsafe fn iso_shuffle() -> __m128i {
     _mm_setr_epi8(2, 3, 5, 6, 8, 9, 11, 12, 14, 15, Z, Z, Z, Z, Z, Z)
 }
 
+/// Largest month, day, hour, minute and second. Month and day must stay
+/// below 13 and 32 here: `month * 32 + day` picks the date's table entry, and
+/// a larger day would land on another date's entry (day 33 of September on
+/// October 1).
 #[inline(always)]
 unsafe fn iso_ceilings() -> __m128i {
-    _mm_setr_epi16(99, 99, 23, 59, 59, 0x7FFF, 0x7FFF, 0x7FFF)
+    _mm_setr_epi16(12, 31, 23, 59, 59, 0x7FFF, 0x7FFF, 0x7FFF)
 }
 
 /// `month * 32 + day`, `hour * 3600 + minute * 60`, `second`.
