@@ -1309,14 +1309,14 @@ mod tests {
         true
     }
 
-    /// Sample files for `scripts/check_parquet_samples.py`, which reads them
+    /// Sample files for `checks/check_parquet_samples.py`, which reads them
     /// with polars and pyarrow and compares the rows with the JSON next to
     /// them. They reach the paths the two output tables never take: long
     /// runs, long and empty texts, nulls outside the head, INT64 columns,
     /// integers outside the direct map, every index width, PLAIN fallbacks.
     ///
     /// Run: `SS_PARQUET_SAMPLES=<empty dir> cargo test --release parquet_samples`
-    /// and then `python scripts/check_parquet_samples.py <dir>`. Without the
+    /// and then `python checks/check_parquet_samples.py <dir>`. Without the
     /// variable the files go to a temporary folder and are only written.
     #[test]
     fn parquet_samples() {
