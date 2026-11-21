@@ -712,7 +712,50 @@ impl ScratchC {
         let work = Work::new(&params, tuning);
         Self { params, tuning, group: Group::default(), work }
     }
+
+    /// One whole person outside the partition pass: index mode sessionizes a
+    /// person where it finds it. `events` holds the person's `count`
+    /// timestamps first, in any order, and is at least `count + EVENT_SPARE`
+    /// long; `purchases` are `[ts, price | category << 32]` and `clicks`
+    /// `[ts since seven days before the window, click code | campaign << 42]`.
+    /// The person's assists stay pending until `flush`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn one_person(
+        &mut self,
+        out: &mut PassCOut,
+        click_exotic: &[Box<[u8]>],
+        name: u64,
+        events: &mut [u32],
+        count: usize,
+        purchases: &[[u64; 2]],
+        clicks: &[[u64; 2]],
+    ) {
+        person(&self.params, self.tuning, &mut self.work, out, click_exotic, name, events, count, purchases, clicks);
+    }
+
+    /// Adds the assists that `one_person` left pending to `out`.
+    pub fn flush(&mut self, out: &mut PassCOut) {
+        apply_assists(&mut self.work.pending, &mut out.campaign_days);
+    }
+
+    /// Reserves room for `rows` more rows in `out`'s columns, the first time
+    /// it is called; the partition pass then leaves the reservation alone.
+    pub fn reserve_rows(&mut self, out: &mut PassCOut, rows: usize) {
+        if !self.work.reserved {
+            self.work.reserved = true;
+            out.names.reserve(rows);
+            out.days.reserve(rows);
+            out.sessions.reserve(rows);
+            out.events.reserve(rows);
+            out.revenue.reserve(rows);
+            out.top_category.reserve(rows);
+        }
+    }
 }
+
+/// Readable words `ScratchC::one_person` needs after a person's events.
+pub const EVENT_SPARE: usize = EVENT_PAD;
 
 /// The lowest `count` bits (`count` up to 64).
 #[inline(always)]
