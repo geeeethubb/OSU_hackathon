@@ -81,6 +81,9 @@ struct Profile {
     last: u64,
     ticks: [u64; PHASES.len()],
     born: (std::time::Instant, u64),
+    /// When the current partition began, and the longest one so far: `(ticks, partition)`.
+    began: u64,
+    longest: (u64, usize),
 }
 
 #[inline(always)]
@@ -96,13 +99,28 @@ fn time_stamp() -> u64 {
 
 impl Profile {
     fn new() -> Self {
-        Self { last: 0, ticks: [0; PHASES.len()], born: (std::time::Instant::now(), time_stamp()) }
+        Self {
+            last: 0,
+            ticks: [0; PHASES.len()],
+            born: (std::time::Instant::now(), time_stamp()),
+            began: 0,
+            longest: (0, 0),
+        }
     }
 
     #[inline(always)]
     fn start(&mut self) {
         if PROFILE {
             self.last = time_stamp();
+            self.began = self.last;
+        }
+    }
+
+    /// Notes how long the partition that `start` began has taken.
+    #[inline(always)]
+    fn end(&mut self, part: usize) {
+        if PROFILE {
+            self.longest = self.longest.max((time_stamp().wrapping_sub(self.began), part));
         }
     }
 
@@ -125,7 +143,8 @@ impl Profile {
             total += ms;
             line += &format!(" {name}={ms:.2}");
         }
-        eprintln!("{line} total={total:.2}");
+        let (ticks, part) = self.longest;
+        eprintln!("{line} total={total:.2} longest={:.2} longest_part={part}", ticks as f64 / ticks_per_ms);
     }
 }
 
@@ -216,10 +235,16 @@ struct Tuning {
     /// compared one by one with every click while `sessions * clicks` is
     /// below this; above, a per-bucket table answers.
     lookup_min: usize,
+    /// A partition with at most this many list words is grouped through the
+    /// staging arrays, one pass over its lists. A bigger one is read twice
+    /// instead (count, then fill): a little slower per record, but a huge
+    /// partition then needs no staging room, which would be touched once
+    /// and never used again.
+    stage_max: usize,
 }
 
 impl Tuning {
-    const DEFAULT: Tuning = Tuning { network: true, sort_max: 0, lookup_min: 2048 };
+    const DEFAULT: Tuning = Tuning { network: true, sort_max: 0, lookup_min: 2048, stage_max: 1 << 17 };
 }
 
 /// Asks for every cache line of a block. The lists were written by other
@@ -243,6 +268,23 @@ fn prefetch(block: &[u64]) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = block;
+}
+
+/// Calls `visit` with every block of the lists in order. The block after
+/// the one being visited is asked for first, so that it arrives meanwhile.
+#[inline(always)]
+fn for_each_block<'a>(lists: &'a [PartList], mut visit: impl FnMut(&'a [u64])) {
+    for list in lists {
+        let mut blocks = list.blocks();
+        let mut following = blocks.next();
+        while let Some(block) = following {
+            following = blocks.next();
+            if let Some(next) = following {
+                prefetch(next);
+            }
+            visit(block);
+        }
+    }
 }
 
 /// The persons of one partition and their rows, grouped.
@@ -364,75 +406,64 @@ impl Group {
         }
     }
 
-    /// Reads the partition's event lists: finds every person, counts its
-    /// events and purchases, and stages both with the person's index.
-    fn read_events(&mut self, lists: &[PartList]) {
+    /// Reads the partition's event lists (`words` words in all): finds every
+    /// person, counts its events and purchases, and stages both with the
+    /// person's index.
+    fn read_events(&mut self, lists: &[PartList], words: usize) {
         self.staged.clear();
+        // At most one event per word.
+        self.staged.reserve_exact(words);
         self.staged_purchases.clear();
-        for list in lists {
-            let mut blocks = list.blocks();
-            let mut following = blocks.next();
-            while let Some(block) = following {
-                // The block after this one arrives while this one is read.
-                following = blocks.next();
-                if let Some(next) = following {
-                    prefetch(next);
+        let staged = self.staged.as_mut_ptr();
+        let mut count = 0;
+        for_each_block(lists, |block| {
+            assert!(count + block.len() <= words);
+            let mut at = 0;
+            while at < block.len() {
+                let key = block[at];
+                at += 1;
+                let index = self.person((key >> 32) as u32);
+                let head = ((index as u64) << 32) | ((key >> 1) & TS_MASK);
+                // SAFETY: `index` was just returned for an entry of `ends`;
+                // one word is staged per event, and the block's words fit in
+                // what is reserved, as checked above.
+                unsafe {
+                    self.ends.get_unchecked_mut(index)[0] += 1;
+                    *staged.add(count) = head;
                 }
-                // At most one event per word.
-                self.staged.reserve(block.len());
-                let staged = self.staged.as_mut_ptr();
-                let mut count = self.staged.len();
-                let mut at = 0;
-                while at < block.len() {
-                    let key = block[at];
+                count += 1;
+                if key & 1 == 1 {
+                    // A block holds whole records: the purchase's second word follows.
+                    self.ends[index][1] += 1;
+                    self.staged_purchases.push([head, block[at]]);
                     at += 1;
-                    let index = self.person((key >> 32) as u32);
-                    let head = ((index as u64) << 32) | ((key >> 1) & TS_MASK);
-                    // SAFETY: `index` was just returned for an entry of `ends`;
-                    // one word is staged per event and `block.len()` are reserved.
-                    unsafe {
-                        self.ends.get_unchecked_mut(index)[0] += 1;
-                        *staged.add(count) = head;
-                    }
-                    count += 1;
-                    if key & 1 == 1 {
-                        // A block holds whole records: the purchase's second word follows.
-                        self.ends[index][1] += 1;
-                        self.staged_purchases.push([head, block[at]]);
-                        at += 1;
-                    }
                 }
-                // SAFETY: every word below `count` was written above.
-                unsafe { self.staged.set_len(count) };
             }
-        }
+        });
+        // SAFETY: every word below `count` was written above.
+        unsafe { self.staged.set_len(count) };
     }
 
-    /// Reads the partition's click lists, keeping the clicks of persons that have events.
-    fn read_clicks(&mut self, lists: &[PartList]) {
+    /// Reads the partition's click lists (`words` words in all), keeping the
+    /// clicks of persons that have events.
+    fn read_clicks(&mut self, lists: &[PartList], words: usize) {
         self.staged_clicks.clear();
-        for list in lists {
-            let mut blocks = list.blocks();
-            let mut following = blocks.next();
-            while let Some(block) = following {
-                following = blocks.next();
-                if let Some(next) = following {
-                    prefetch(next);
-                }
-                // A block holds whole records: two words per click.
-                for click in block.chunks_exact(2) {
-                    if let Some(index) = self.find((click[0] >> 32) as u32) {
-                        self.ends[index][2] += 1;
-                        self.staged_clicks.push([((index as u64) << 32) | ((click[0] >> 1) & TS_MASK), click[1]]);
-                    }
+        self.staged_clicks.reserve_exact(words / 2);
+        for_each_block(lists, |block| {
+            // A block holds whole records: two words per click.
+            for click in block.chunks_exact(2) {
+                if let Some(index) = self.find((click[0] >> 32) as u32) {
+                    self.ends[index][2] += 1;
+                    self.staged_clicks.push([((index as u64) << 32) | ((click[0] >> 1) & TS_MASK), click[1]]);
                 }
             }
-        }
+        });
     }
 
-    /// Moves everything staged into per-person slices. Afterwards person
-    /// `index` owns `ends[index - 1][kind]..ends[index][kind]` of each array.
-    fn scatter(&mut self) {
+    /// Turns the per-person counts into slice starts and gives the grouped
+    /// arrays their lengths, with no more room than the biggest partition
+    /// so far needed.
+    fn lay_out(&mut self) {
         let mut totals = [0u32; 3];
         for end in &mut self.ends {
             for kind in 0..3 {
@@ -441,14 +472,17 @@ impl Group {
                 totals[kind] += count;
             }
         }
-        // Every slot below the staged lengths is written by the loops that
-        // follow: the counts add up to the staged rows.
-        self.events.clear();
-        self.events.resize(self.staged.len() + EVENT_PAD, 0);
-        self.purchases.clear();
-        self.purchases.resize(self.staged_purchases.len(), [0; 2]);
-        self.clicks.clear();
-        self.clicks.resize(self.staged_clicks.len(), [0; 2]);
+        resize_exact(&mut self.events, totals[0] as usize + EVENT_PAD, 0);
+        resize_exact(&mut self.purchases, totals[1] as usize, [0; 2]);
+        resize_exact(&mut self.clicks, totals[2] as usize, [0; 2]);
+    }
+
+    /// Moves everything staged into per-person slices. Afterwards person
+    /// `index` owns `ends[index - 1][kind]..ends[index][kind]` of each array.
+    fn scatter(&mut self) {
+        // Every slot is written by the loops that follow: the counts add up
+        // to the staged rows.
+        self.lay_out();
         for &word in &self.staged {
             let cursor = &mut self.ends[(word >> 32) as usize][0];
             self.events[*cursor as usize] = word as u32;
@@ -465,6 +499,67 @@ impl Group {
             *cursor += 1;
         }
     }
+
+    /// The same grouping without the staging arrays, for a huge partition:
+    /// one pass over the lists counts, a second one fills the slices.
+    fn group_in_two_passes(&mut self, event_lists: &[PartList], click_lists: &[PartList]) {
+        for_each_block(event_lists, |block| {
+            let mut at = 0;
+            while at < block.len() {
+                let key = block[at];
+                at += 1;
+                let index = self.person((key >> 32) as u32);
+                self.ends[index][0] += 1;
+                if key & 1 == 1 {
+                    self.ends[index][1] += 1;
+                    at += 1;
+                }
+            }
+        });
+        for_each_block(click_lists, |block| {
+            for click in block.chunks_exact(2) {
+                if let Some(index) = self.find((click[0] >> 32) as u32) {
+                    self.ends[index][2] += 1;
+                }
+            }
+        });
+        self.lay_out();
+        for_each_block(event_lists, |block| {
+            let mut at = 0;
+            while at < block.len() {
+                let key = block[at];
+                at += 1;
+                // Every person was met in the first pass.
+                let index = self.person((key >> 32) as u32);
+                let ts = (key >> 1) & TS_MASK;
+                let cursor = &mut self.ends[index];
+                self.events[cursor[0] as usize] = ts as u32;
+                cursor[0] += 1;
+                if key & 1 == 1 {
+                    self.purchases[cursor[1] as usize] = [ts, block[at]];
+                    cursor[1] += 1;
+                    at += 1;
+                }
+            }
+        });
+        for_each_block(click_lists, |block| {
+            for click in block.chunks_exact(2) {
+                if let Some(index) = self.find((click[0] >> 32) as u32) {
+                    let cursor = &mut self.ends[index][2];
+                    self.clicks[*cursor as usize] = [(click[0] >> 1) & TS_MASK, click[1]];
+                    *cursor += 1;
+                }
+            }
+        });
+    }
+}
+
+/// Empties the vector and gives it `length` copies of `value`, in room that
+/// is not rounded up.
+fn resize_exact<T: Clone>(vector: &mut Vec<T>, length: usize, value: T) {
+    vector.clear();
+    vector.reserve_exact(length);
+    vector.resize(length, value);
 }
 
 /// The AVX2 kernels. The crate is compiled for x86-64-v3, so the intrinsics
@@ -755,7 +850,8 @@ impl Drop for ScratchC {
     fn drop(&mut self) {
         if PROFILE {
             self.work.profile.report();
-            eprintln!("SESSIONS_SCRATCH bytes={}", self.group.bytes() + self.work.bytes());
+            let staged = held(&self.group.staged) + held(&self.group.staged_purchases) + held(&self.group.staged_clicks);
+            eprintln!("SESSIONS_SCRATCH bytes={} staged={staged}", self.group.bytes() + self.work.bytes());
         }
     }
 }
@@ -1381,24 +1477,30 @@ fn partition_core(
     scratch: &mut ScratchC,
 ) {
     let ScratchC { params, tuning, group, work } = scratch;
-    // The first block of every list, while the table is cleared.
+    // The first block of every list, while the lists are measured.
     for list in event_lists.iter().chain(click_lists) {
         if let Some(block) = list.blocks().next() {
             prefetch(block);
         }
     }
     work.profile.start();
-    group.begin();
-    group.read_events(event_lists);
-    work.profile.lap(0);
-    if group.locals.is_empty() {
+    let event_words: usize = event_lists.iter().map(PartList::words).sum();
+    if event_words == 0 {
         return;
     }
-    group.read_clicks(click_lists);
-    work.profile.lap(1);
+    let click_words: usize = click_lists.iter().map(PartList::words).sum();
     // Person indexes and slice ends are kept in 31 and 32 bits.
-    assert!(group.staged.len() <= INDEX_MASK as usize && group.staged_clicks.len() <= u32::MAX as usize);
-    group.scatter();
+    assert!(event_words <= INDEX_MASK as usize && click_words <= u32::MAX as usize);
+    group.begin();
+    if event_words + click_words <= tuning.stage_max {
+        group.read_events(event_lists, event_words);
+        work.profile.lap(0);
+        group.read_clicks(click_lists, click_words);
+        work.profile.lap(1);
+        group.scatter();
+    } else {
+        group.group_in_two_passes(event_lists, click_lists);
+    }
     work.profile.lap(2);
 
     let mut starts = [0usize; 3];
@@ -1421,6 +1523,7 @@ fn partition_core(
     }
     apply_assists(&mut work.pending, &mut out.campaign_days);
     work.profile.lap(9);
+    work.profile.end(part);
     if !work.reserved {
         // The first partition with rows tells how many rows a partition
         // has. Room for half of all partitions' rows is asked for at once:
@@ -1934,6 +2037,7 @@ mod tests {
                 network: rng.one_in(2),
                 sort_max: rng.pick(&[0, 1, 2, 5, 16, 32, 100, 100_000]),
                 lookup_min: rng.pick(&[0, 1, 64, 512, usize::MAX]),
+                stage_max: rng.pick(&[0, 200, usize::MAX]),
             };
             let got = run(&world, tuning, &partitions, &mut rng);
             assert!(got == want, "seed {seed}: tables differ");
@@ -2003,7 +2107,8 @@ mod tests {
         for network in [true, false] {
             for sort_max in [0, 40] {
                 for lookup_min in [0, 2048, usize::MAX] {
-                    tunings.push(Tuning { network, sort_max, lookup_min });
+                    let stage_max = if tunings.len() % 2 == 0 { usize::MAX } else { 0 };
+                    tunings.push(Tuning { network, sort_max, lookup_min, stage_max });
                 }
             }
         }
