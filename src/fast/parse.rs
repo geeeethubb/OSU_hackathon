@@ -409,9 +409,6 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
             events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
         }
-        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 3 => {
-            events_lean_loop::<3, INDEXED>(ctx, buffer, position, end, out)
-        }
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
             events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
         }
@@ -421,15 +418,6 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
 
 /// The lean kernel's loop when rows are stored (or, in a diagnostic mode,
 /// dropped). Nothing is called on its common path.
-///
-/// The kernel works in two halves, and the loop runs them out of step: the
-/// first half of the next row, then the second half of this one. A row's
-/// first half is everything that takes long to arrive (loads, the vector
-/// units); run one row early, its results are there when the second half
-/// needs them, and the processor never sits with a window full of work that
-/// is waiting. The next row's start is taken from this row's early guess of
-/// its own length; where that was wrong, or the row is declined, the first
-/// half is simply run again at the right place.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
@@ -439,78 +427,24 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{
-        event_lean_back, event_lean_front, event_lean_masks, lean_setup, LeanFront, LeanSink, LEAN_PAD,
-        ROW_DECLINE,
-    };
-    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(LEAN_PAD));
+    use super::simd::{event_row_lean_step, lean_setup, ROW_DECLINE, ROW_PAD};
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
     let (lean, window_length) = lean_setup(ctx);
     // Opaque to the optimizer: see `LeanTables`.
     let lean = std::hint::black_box(lean);
-    let base = buffer.as_ptr();
     let mut row = EventRow::default();
-    if MODE == 2 {
-        while position < stop {
-            // SAFETY: at least LEAN_PAD readable bytes follow `position`.
-            let (folded, guess) = unsafe { event_lean_masks(lean, base.add(position)) };
-            row.event ^= folded;
+    while position < stop {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`, and the
+        // tables are those of `ctx`.
+        let (length, guess, status) = unsafe {
+            event_row_lean_step::<MODE, INDEXED>(ctx, lean, window_length, buffer.as_ptr().add(position), out, &mut row)
+        };
+        if status == ROW_DECLINE {
+            position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+        } else if length != guess {
+            position = row_end_elsewhere(position, length);
+        } else {
             position += guess + 1;
-        }
-        std::hint::black_box(row.event);
-        return position;
-    }
-    // Two records, each row's first half in turn in one and in the other.
-    // Their address goes through `black_box` so that they stay in memory:
-    // the second half then takes its operands from there.
-    let mut records = [std::mem::MaybeUninit::<LeanFront>::uninit(); 2];
-    let record_a = std::hint::black_box(records.as_mut_ptr() as *mut LeanFront);
-    let record_b = record_a.wrapping_add(1);
-    if MODE == 3 {
-        // Diagnostic: first halves only.
-        while position < stop {
-            // SAFETY: as below.
-            unsafe {
-                event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a);
-                row.event ^= (*record_a).fold();
-                position += (*record_a).guess + 1;
-            }
-        }
-        std::hint::black_box(row.event);
-        return position;
-    }
-    'restart: while position < stop {
-        // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
-        // readable bytes after it; a first half reads at most 132 bytes from
-        // where it is run, which is `position` or at most 97 bytes past it.
-        // The sink is made anew after every use of `out`.
-        let sink = LeanSink::new::<INDEXED>(out);
-        unsafe { event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a) };
-        loop {
-            // One row with its record in `$current`, the next row's in `$next`.
-            macro_rules! row {
-                ($current:expr, $next:expr) => {{
-                    let p = unsafe { base.add(position) };
-                    let guess = unsafe { (*$current).guess };
-                    let (length, status) = unsafe {
-                        event_lean_front::<INDEXED>(ctx, lean, p.add(guess + 1), $next);
-                        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, $current, &sink, &mut row)
-                    };
-                    if status == ROW_DECLINE {
-                        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
-                        continue 'restart;
-                    }
-                    if length != guess {
-                        position = row_end_elsewhere(position, length);
-                        continue 'restart;
-                    }
-                    position += guess + 1;
-                    if position >= stop {
-                        break 'restart;
-                    }
-                }};
-            }
-            row!(record_a, record_b);
-            row!(record_b, record_a);
         }
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
