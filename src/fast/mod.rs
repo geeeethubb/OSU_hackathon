@@ -99,9 +99,9 @@ pub struct Ctx {
     /// `SS_EVENT_PART_BITS` / `SS_PERSON_PART_BITS`, override them.
     pub event_part_bits: u32,
     pub person_part_bits: u32,
-    /// The generator's scramble keys (see `keys`). Index mode is an
-    /// experiment: only `SS_STRUCT=1` looks for them. Without it they stay
-    /// unset and every dataset runs through the general path.
+    /// The generator's scramble keys (see `keys`), when the data has them:
+    /// the engine then runs in index mode (see `indexed`). Data without them,
+    /// and every run with `SS_STRUCT=0`, goes through the general path.
     pub keys: Option<keys::Keys>,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
@@ -357,8 +357,9 @@ enum Attempt {
 /// Runs the optimized engine. `Ok(false)` means nothing was written and the
 /// caller must use the reference pipeline for this input.
 pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> {
-    // Index mode is an experiment: only `SS_STRUCT=1` tries it.
-    let indexed = std::env::var_os("SS_STRUCT").is_some_and(|value| value == "1");
+    // Index mode is tried first unless `SS_STRUCT=0`; it only engages when
+    // the data has the generator's keys and layout.
+    let indexed = !std::env::var_os("SS_STRUCT").is_some_and(|value| value == "0");
     let mut attempt = run_once(data, output, threads, indexed)?;
     if matches!(attempt, Attempt::NotIndexed) {
         attempt = run_once(data, output, threads, false)?;

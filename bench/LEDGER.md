@@ -179,3 +179,23 @@ known so far is 1.38 s for `e4eef020`).
   yet (parser agent, in progress) and its click path converts a code back to a number per click (a new
   click-parser agent owns clicks); then the session kernel (half of the index pass; sessions agent).
 - **Next experiment:** index mode as the default once its parse gap is closed, in a candidate of its own.
+
+### 19:21 UTC
+
+- **Best verified candidate, and the commit to submit:** `2b2cccd1ba1cb12bc5a074a899ce54c868205b86` (unchanged).
+- **Measured since the last entry:** CI run 44939245591 on `fc97242` (EPYC 9V45): the default (general
+  path, lean kernel, index mode merged as an opt-in) is within noise of `2b2cccd1` (-10.8 / +5.4 / +0.0 ms),
+  and index mode with the OLD event kernel loses to the general path on the lean one by 28 to 31 ms
+  (parse 380 against 243 ms; later stages 184 against 292 ms). The lean kernel alone took event parsing
+  from 1,050 to 800 CPU-ms on that runner.
+- **In CI now (this commit), the candidate that makes index mode the default:** lean event kernel in
+  index mode too (parser agent, `f4be2dc`: 32.2 -> 25.2 ns per row on the laptop, general mode 22.1),
+  the layout check on the key samples, summary writes prefetched on the link builder thread (laptop
+  links_build in index mode 212 -> 145 ms). Variant SS_STRUCT=0 is the general path on the same image.
+  Laptop checks with SS_VERIFY=1: 37 unit tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH (default),
+  36/36, 43/43, dev and seed 2 MATCH (SS_STRUCT=0); 48 small generated datasets (1K to 200K events, 12 seeds)
+  MATCH the reference pipeline with index mode engaged in each; 60M output equals the general path's.
+- **Current limiting work:** parse in index mode (events about 3 ns per row behind the general kernel,
+  clicks converted from code to number per click), then the session kernel inside the index pass.
+- **Next experiment:** depends on this run: if index mode wins as the default, it becomes the commit
+  to submit; the click-parser agent and the parser agent then close the parse gap.

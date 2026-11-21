@@ -293,15 +293,10 @@ impl Summary {
     pub fn build(keys: &Keys, links: &LinkTable) -> Self {
         // Zeroed pages stay untouched for user indexes without links.
         let mut users = vec![[0u64; 2]; keys.user_bound as usize];
-        links.for_each_member(|member, name, complex| {
-            // An ID that is not a generated one makes its component complex:
-            // the generated members of that component say so themselves.
-            let Some(number) = keys.user_number_of_code(member) else {
-                return;
-            };
+        let note = |users: &mut [[u64; 2]], [number, name, complex]: [u64; 3]| {
             let entry = &mut users[(number >> 9) as usize];
             let alias = number & (ALIASES - 1);
-            if complex || alias >= 64 {
+            if complex != 0 || alias >= 64 {
                 entry[0] |= SLOW;
             } else if entry[0] & SIMPLE == 0 {
                 entry[0] |= SIMPLE | name;
@@ -311,7 +306,38 @@ impl Summary {
             } else {
                 entry[0] |= SLOW;
             }
+        };
+        // The members come in table order, so their users are all over the
+        // array: each one waits in a ring while its entry is on the way to
+        // the cache.
+        const AHEAD: usize = 32;
+        let mut ring = [[0u64; 3]; AHEAD];
+        let mut seen = 0usize;
+        links.for_each_member(|member, name, complex| {
+            // An ID that is not a generated one makes its component complex:
+            // the generated members of that component say so themselves.
+            let Some(number) = keys.user_number_of_code(member) else {
+                return;
+            };
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                // SAFETY: a prefetch reads nothing, whatever the address;
+                // the index is in range anyway (`user_number_of_code`).
+                unsafe { _mm_prefetch(users.as_ptr().wrapping_add((number >> 9) as usize) as *const i8, _MM_HINT_T0) };
+            }
+            let at = seen % AHEAD;
+            if seen >= AHEAD {
+                note(&mut users, ring[at]);
+            }
+            ring[at] = [number, name, u64::from(complex)];
+            seen += 1;
         });
+        // Order does not matter for the result: notes only set bits or
+        // compare names.
+        for waiting in &ring[..seen.min(AHEAD)] {
+            note(&mut users, *waiting);
+        }
         Self { users }
     }
 
