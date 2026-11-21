@@ -73,6 +73,9 @@ pub struct Ctx {
     pub campaign_ids: Vec<Box<[u8]>>,
     pub campaign_channels: Vec<Box<[u8]>>,
     pub campaign_index: FastMap<Box<[u8]>, u32>,
+    /// Campaign index by number for IDs written `c_<number>` with no leading
+    /// zero; `u32::MAX` where there is no such campaign.
+    pub campaign_by_number: Vec<u32>,
     pub organic: u32,
     pub event_ids: Interner,
     pub user_ids: Interner,
@@ -83,9 +86,11 @@ pub struct Ctx {
     pub fast_rows: bool,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
-    /// Diagnostic builds of the parse stage (`SS_DIAG`): 1 parses rows but
-    /// does not store them, 2 only walks row boundaries. Nothing is written
-    /// in either mode; they exist to see where parse time goes.
+    /// Diagnostic runs of the parse stage (`SS_DIAG`), to see where event
+    /// parse time goes. Each level stops a row earlier: 7 parses rows fully
+    /// but does not store them; 6 stops after both timestamps; 5 after the ID
+    /// codes; 4 after field bounds; 3 after quote validation and comma
+    /// positions; 2 after the row masks. Nothing is written in any of them.
     pub diag: u32,
     fallback: AtomicBool,
 }
@@ -142,6 +147,22 @@ impl Ctx {
                 campaign_channels.push(channel.into());
             }
         });
+        let mut campaign_by_number: Vec<u32> = Vec::new();
+        for (index, id) in campaign_ids.iter().enumerate() {
+            let digits = id.strip_prefix(b"c_").unwrap_or(&[]);
+            let canonical = (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+            if !canonical {
+                continue;
+            }
+            let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+            // Bigger numbers than this stay in the hash map only.
+            if number < (1 << 20) {
+                if campaign_by_number.len() <= number {
+                    campaign_by_number.resize(number + 1, u32::MAX);
+                }
+                campaign_by_number[number] = index as u32;
+            }
+        }
         let organic = campaign_ids.len() as u32;
         campaign_ids.push((&b"organic"[..]).into());
         campaign_channels.push((&b"organic"[..]).into());
@@ -163,12 +184,13 @@ impl Ctx {
             campaign_ids,
             campaign_channels,
             campaign_index,
+            campaign_by_number,
             organic,
             event_ids: Interner::default(),
             user_ids: Interner::default(),
             click_ids: Interner::default(),
             #[cfg(target_arch = "x86_64")]
-            ts_tables: simd::TsTables::new(window_start),
+            ts_tables: simd::TsTables::new(window_start, window_start.div_euclid(1_000) - 4 * 86_400),
             fast_rows: !std::env::var_os("SS_FAST").is_some_and(|value| value == "0"),
             verify: std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1"),
             diag: std::env::var("SS_DIAG").ok().and_then(|value| value.parse().ok()).unwrap_or(0),
@@ -362,9 +384,9 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     }
 
     // Pass B.
-    let parse_out = parse_out.into_inner();
+    let mut parse_out = parse_out.into_inner();
     let event_lists: Vec<Vec<PartList>> =
-        parse_out.iter().map(|out| out.events.iter().map(|writer| writer.list(EVENT_BLOCK)).collect()).collect();
+        parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let mut click_batches: Vec<&[ClickRecord]> = Vec::new();
     for out in &parse_out {
         click_batches.extend(out.clicks.chunks(CLICK_BATCH));
@@ -392,11 +414,11 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     timing.stage("dedup");
 
     // Pass C.
-    let b_out = b_out.into_inner();
+    let mut b_out = b_out.into_inner();
     let person_events: Vec<Vec<PartList>> =
-        b_out.iter().map(|out| out.events.iter().map(|writer| writer.list(PERSON_BLOCK)).collect()).collect();
+        b_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let person_clicks: Vec<Vec<PartList>> =
-        b_out.iter().map(|out| out.clicks.iter().map(|writer| writer.list(CLICK_BLOCK)).collect()).collect();
+        b_out.iter_mut().map(|out| out.clicks.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let click_exotic = ctx.click_ids.snapshot();
     let user_exotic = ctx.user_ids.snapshot();
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));

@@ -88,18 +88,37 @@ pub fn lines_from<'a>(buffer: &'a [u8], mut position: usize, end: usize, mut vis
     }
 }
 
+/// Stores one event record in the partition its event ID belongs to.
+#[inline(always)]
+pub fn emit_raw(
+    out: &mut ParseOut,
+    event: u64,
+    ts: u64,
+    valid: u64,
+    user: u64,
+    ingest: u64,
+    purchase: Option<(u32, u32)>,
+) {
+    let mixed = mix(event);
+    let part = (mixed >> LOCAL_BITS) as usize;
+    let word0 = ((mixed & LOCAL_MASK) << 32) | (ts << 1) | valid;
+    let word1 = (user << 22) | (ingest << 1) | u64::from(purchase.is_some());
+    // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
+    // number of writers; `reserve` returns room for the words written.
+    unsafe {
+        let writer = out.events.get_unchecked_mut(part);
+        let at = writer.reserve(&mut out.arena, EVENT_BLOCK, 2 + usize::from(purchase.is_some()));
+        *at = word0;
+        *at.add(1) = word1;
+        if let Some((price, category)) = purchase {
+            *at.add(2) = u64::from(price) | (u64::from(category) << 32);
+        }
+    }
+}
+
 #[inline(always)]
 pub fn emit_event(out: &mut ParseOut, row: &EventRow) {
-    let mixed = mix(row.event);
-    let part = (mixed >> LOCAL_BITS) as usize;
-    let word0 = ((mixed & LOCAL_MASK) << 32) | (u64::from(row.ts) << 1) | u64::from(row.valid);
-    let word1 = (row.user << 22) | (u64::from(row.ingest) << 1) | u64::from(row.purchase.is_some());
-    let writer = &mut out.events[part];
-    writer.push(&mut out.arena, EVENT_BLOCK, word0);
-    writer.push(&mut out.arena, EVENT_BLOCK, word1);
-    if let Some((price, category)) = row.purchase {
-        writer.push(&mut out.arena, EVENT_BLOCK, u64::from(price) | (u64::from(category) << 32));
-    }
+    emit_raw(out, row.event, u64::from(row.ts), u64::from(row.valid), row.user, u64::from(row.ingest), row.purchase);
 }
 
 /// One event line, exactly as rules.md reads it. `None` drops the line.
@@ -170,58 +189,79 @@ pub fn link_row_slow(ctx: &Ctx, line: &[u8]) -> Option<(u64, u64)> {
     Some((id_code(a, b'u', &ctx.user_ids), id_code(b, b'u', &ctx.user_ids)))
 }
 
+/// The fast loop over event rows, specialized for what happens to a parsed
+/// row (`simd::MODE_*`). Returns where the general parser must continue.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn events_fast_loop<const MODE: u32>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_row_fast, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+    let limit = end.min(buffer.len());
+    let safe = buffer.len().saturating_sub(ROW_PAD);
+    let mut row = EventRow::default();
+    while position < limit && position < safe {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`.
+        let (length, status) = unsafe { event_row_fast::<MODE>(ctx, buffer.as_ptr().add(position), out, &mut row) };
+        if status == ROW_DONE {
+            position += length + 1;
+            continue;
+        }
+        if status == ROW_LONG {
+            // No newline within the fast path's reach: the general parser takes this line.
+            let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
+            if let Some(row) = event_row_slow(ctx, &buffer[position..line_end]) {
+                emit_event(out, &row);
+            }
+            position = line_end + 1;
+            continue;
+        }
+        let line = &buffer[position..position + length];
+        let parsed = match status {
+            ROW_EMIT => Some(row),
+            ROW_DROP => None,
+            _ => event_row_slow(ctx, line),
+        };
+        if MODE == MODE_ROW && (status == ROW_EMIT || status == ROW_DROP) {
+            let slow = event_row_slow(ctx, line);
+            assert!(
+                slow == parsed,
+                "event row mismatch on {:?}: fast {:?}, slow {:?}",
+                String::from_utf8_lossy(line),
+                parsed,
+                slow
+            );
+        }
+        if let Some(row) = &parsed {
+            emit_event(out, row);
+        }
+        position += length + 1;
+    }
+    // Diagnostic modes fold their work into `row.event`; keep it alive.
+    std::hint::black_box(row.event);
+    position
+}
+
 pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
     if ctx.fast_rows {
-        use super::simd::{event_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
-        let limit = end.min(buffer.len());
-        let safe = buffer.len().saturating_sub(ROW_PAD);
-        let mut row = EventRow::default();
-        while position < limit && position < safe {
-            if ctx.diag == 2 {
-                // SAFETY: at least ROW_PAD readable bytes follow `position`.
-                let length = unsafe { super::simd::row_length(buffer.as_ptr().add(position)) };
-                position += length + 1;
-                continue;
-            }
-            // SAFETY: at least ROW_PAD readable bytes follow `position`.
-            let (length, status) = unsafe { event_row_fast(ctx, buffer.as_ptr().add(position), &mut row) };
-            if status == ROW_LONG {
-                // No newline within 128 bytes: the general parser takes this line.
-                let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
-                if let Some(row) = event_row_slow(ctx, &buffer[position..line_end]) {
-                    emit_event(out, &row);
-                }
-                position = line_end + 1;
-                continue;
-            }
-            let line = &buffer[position..position + length];
-            let fast = match status {
-                ROW_EMIT => Some(row),
-                ROW_DROP => None,
-                _ => event_row_slow(ctx, line),
-            };
-            if ctx.verify && (status == ROW_EMIT || status == ROW_DROP) {
-                let slow = event_row_slow(ctx, line);
-                assert!(
-                    slow == fast,
-                    "event row mismatch on {:?}: fast {:?}, slow {:?}",
-                    String::from_utf8_lossy(line),
-                    fast,
-                    slow
-                );
-            }
-            if let Some(row) = &fast {
-                if ctx.diag == 1 {
-                    std::hint::black_box(row);
-                } else {
-                    emit_event(out, row);
-                }
-            }
-            position += length + 1;
-        }
+        use super::simd::{MODE_ROW, MODE_STORE};
+        position = match (ctx.verify, ctx.diag) {
+            (true, _) => events_fast_loop::<MODE_ROW>(ctx, buffer, position, end, out),
+            (false, 0) => events_fast_loop::<MODE_STORE>(ctx, buffer, position, end, out),
+            (false, 2) => events_fast_loop::<2>(ctx, buffer, position, end, out),
+            (false, 3) => events_fast_loop::<3>(ctx, buffer, position, end, out),
+            (false, 4) => events_fast_loop::<4>(ctx, buffer, position, end, out),
+            (false, 5) => events_fast_loop::<5>(ctx, buffer, position, end, out),
+            (false, 6) => events_fast_loop::<6>(ctx, buffer, position, end, out),
+            (false, _) => events_fast_loop::<7>(ctx, buffer, position, end, out),
+        };
         // The last few lines of the file fall through to the general parser.
     }
     lines_from(buffer, position, end, |line| {
@@ -232,7 +272,53 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
 }
 
 pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
-    let position = first_line_start(buffer, start);
+    #[allow(unused_mut)]
+    let mut position = first_line_start(buffer, start);
+    #[cfg(target_arch = "x86_64")]
+    if ctx.fast_rows {
+        use super::simd::{click_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+        let limit = end.min(buffer.len());
+        let safe = buffer.len().saturating_sub(ROW_PAD);
+        let verify = ctx.verify;
+        let mut click = ClickRecord { user: 0, code_and_campaign: 0, ts: 0 };
+        while position < limit && position < safe {
+            // SAFETY: at least ROW_PAD readable bytes follow `position`.
+            let (length, status) = unsafe { click_row_fast(ctx, buffer.as_ptr().add(position), &mut click) };
+            if status == ROW_EMIT && !verify {
+                out.clicks.push(click);
+                position += length + 1;
+                continue;
+            }
+            if status == ROW_LONG {
+                let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
+                if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
+                    out.clicks.push(click);
+                }
+                position = line_end + 1;
+                continue;
+            }
+            let line = &buffer[position..position + length];
+            let fast = match status {
+                ROW_EMIT => Some(click),
+                ROW_DROP => None,
+                _ => click_row_slow(ctx, line),
+            };
+            if verify && (status == ROW_EMIT || status == ROW_DROP) {
+                let slow = click_row_slow(ctx, line);
+                assert!(
+                    slow == fast,
+                    "click row mismatch on {:?}: fast {:?}, slow {:?}",
+                    String::from_utf8_lossy(line),
+                    fast,
+                    slow
+                );
+            }
+            if let Some(click) = fast {
+                out.clicks.push(click);
+            }
+            position += length + 1;
+        }
+    }
     lines_from(buffer, position, end, |line| {
         if let Some(click) = click_row_slow(ctx, line) {
             out.clicks.push(click);
