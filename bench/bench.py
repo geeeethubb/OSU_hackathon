@@ -1310,6 +1310,21 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
             entry["prior_timing_run"] = timed(prior_image, "prior", "prior-timing", env={"SS_TIMING": "1"})
     with group(f"seed {seed}: one extra run for peak memory and disk use"):
         pipeline["memory_run"] = timed(args.image, "new", "new-memory", monitor=True)
+    # Diagnostic runs: this commit under extra environment plus SS_TIMING=1, each once. They are
+    # never ranked and never verified: a diagnostic mode may stop after a stage and exit non-zero
+    # by design. Only their SS_TIMING lines are of interest.
+    diag_sets = [dict(pair.split("=", 1) for pair in part.split() if "=" in pair)
+                 for part in (args.diag_envs or "").split(",") if part.strip()]
+    if diag_sets:
+        pipeline["diag_runs"] = []
+        for index, extra in enumerate(diag_sets, start=1):
+            with group(f"seed {seed}: diagnostic run {index} with {extra} (not ranked, not verified)"):
+                diag_out = work / "out-diag"
+                run = harness.run(args.image, f"s{seed}-diag-{index}", data, env=dict(extra, SS_TIMING="1"),
+                                  out_dir=diag_out)
+                run["diag_env"] = dict(extra)
+                remove_tree(diag_out)
+                pipeline["diag_runs"].append(run)
 
     with group(f"seed {seed} (iv): /reference on the same input, then both tables of every run against it"):
         reference_out = work / "out-reference"
@@ -1500,6 +1515,9 @@ def main():
                          help="time the paired runs may take per seed; slow pipelines get fewer pairs")
     bench20.add_argument("--variant-env", default="",
                          help='also compare this commit with itself under extra environment, e.g. "SS_FAST=0"')
+    bench20.add_argument("--diag-envs", default="",
+                         help='diagnostic runs, never ranked or verified: comma-separated environment sets, '
+                              'each run once with SS_TIMING=1, e.g. "SS_DIAG=7,SS_DIAG=8"')
     bench20.add_argument("--prior-image", default="")
     bench20.add_argument("--prior-sha", default="")
     bench20.add_argument("--prior-status", default="")
