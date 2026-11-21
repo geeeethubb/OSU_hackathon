@@ -3,7 +3,9 @@
 //!
 //! A partition is never sorted as a whole. Its events, purchases and clicks
 //! are grouped by person with a counting sort (a small hash table gives every
-//! person of the partition a dense index). Then, per person:
+//! person of the partition a dense index): through staging arrays in one
+//! pass over the lists, or for a huge partition in two passes without them.
+//! Then, per person:
 //!
 //! * Sessions. Up to 16 timestamps are sorted by a fixed network of
 //!   compare-exchanges. More are summarized per half-hour bucket (min, max,
@@ -12,7 +14,9 @@
 //!   order a new session starts exactly where
 //!   `bucket.min - previous_bucket.max` is over 30 minutes. The occupied
 //!   buckets are put in order by the same network when there are at most
-//!   16, and read back from flag bytes otherwise.
+//!   16, and read back from flag bytes otherwise. A caller that already has
+//!   a person's events in time order (`ScratchC::one_person_in_order`) gets
+//!   the sessions from one pass over them instead.
 //! * Purchases go to the session that holds their timestamp: the last one
 //!   that starts at or before it.
 //! * Clicks. A click at `t` can credit or assist exactly the sessions with
@@ -224,8 +228,9 @@ impl Params {
 /// output; the tests run them all.
 #[derive(Clone, Copy)]
 struct Tuning {
-    /// Sort up to `NETWORK_MAX` events with the fixed network (where the
-    /// target has one).
+    /// Use the fixed network (where the target has one): to sort up to
+    /// `NETWORK_MAX` events, and to order up to `NETWORK_MAX` buckets of a
+    /// bigger person.
     network: bool,
     /// A person with at most this many events that the network does not take
     /// is sorted by the standard library; a bigger one goes through the
@@ -2429,6 +2434,42 @@ mod tests {
             }
         }
         assert_eq!(sessions_of_case(MIDNIGHT, &events, &clicks), 168);
+    }
+
+    /// The in-order pass against the sort path, for short and long persons
+    /// and gaps on both sides of 30 minutes; and its refusal of anything
+    /// that is not ascending.
+    #[test]
+    fn in_order_pass_matches_the_sort() {
+        let params = Params::new(0, 0, 14, 3, 2, &[], TEST_PERSON_SHIFT);
+        let tuning = Tuning { sort_max: 4096, ..Tuning::DEFAULT };
+        let mut work = Work::new(&params, tuning);
+        let mut rng = Rng(11);
+        for round in 0..4000 {
+            let count = if round % 4 == 0 { rng.range(1, 400) } else { rng.range(1, 70) } as usize;
+            let mut ts = rng.below(1_000_000) as u32;
+            let mut events = Vec::with_capacity(count);
+            for _ in 0..count {
+                events.push(ts);
+                let step = rng.pick(&[0, 0, 1, 1000, 60_000, GAP - 1, GAP, GAP + 1, GAP + 2, 2 * GAP]);
+                ts = (ts + step).min(TS_MASK as u32);
+            }
+            let sessions = sessions_in_order(&events, &mut work).expect("ascending");
+            let got: Vec<(u32, u32)> = (0..sessions).map(|at| (work.start[at], work.count[at])).collect();
+            let mut sorted = events.clone();
+            let sessions = sessions_by_sort(&mut sorted, &mut work);
+            let want: Vec<(u32, u32)> = (0..sessions).map(|at| (work.start[at], work.count[at])).collect();
+            assert_eq!(got, want, "round {round}");
+            // One timestamp out of place anywhere must be noticed.
+            if count >= 2 {
+                let at = rng.range(1, count as u64 - 1) as usize;
+                let mut broken = events.clone();
+                if broken[at - 1] > 0 {
+                    broken[at] = broken[at - 1] - 1;
+                    assert!(sessions_in_order(&broken, &mut work).is_none(), "round {round}");
+                }
+            }
+        }
     }
 
     /// A network of compare-exchanges sorts every input if it sorts every
