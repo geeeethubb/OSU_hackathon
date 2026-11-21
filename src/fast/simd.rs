@@ -1381,7 +1381,10 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
 // two against each other on every line they have.
 //
 // Registers: rdi the row, rsi the tables, rdx the frame; rax and r15 are
-// scratch throughout. After `lean_head`: r9 and r10 where the texts of the
+// scratch throughout. The vector constants every row uses are in ymm5 to
+// ymm15 from before the first row on (`lean_asm!` loads them): comma, quote
+// and newline bytes, the tens, the low half-byte mask, the three base-36
+// weights, and the three tables that class an ID's characters. After `lean_head`: r9 and r10 where the texts of the
 // IDs start, rcx and r14 where they end, r12 where ts starts and r8 where
 // it ends (all as offsets), r13 ingest_ts and r11 the comma after it (as
 // addresses). After `lean_ids`: r9 the event index and r10 the user number,
@@ -1399,22 +1402,21 @@ macro_rules! lean_head {
             // Masks of the commas (r8) and quotes (r9) of bytes 0..64.
             "vmovdqu ymm0, ymmword ptr [rdi]\n",
             "vmovdqu ymm1, ymmword ptr [rdi + 32]\n",
-            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {comma}]\n",
-            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {comma}]\n",
+            "vpcmpeqb ymm2, ymm0, ymm5\n",
+            "vpcmpeqb ymm3, ymm1, ymm5\n",
             "vpmovmskb eax, ymm2\n",
             "vpmovmskb r8d, ymm3\n",
             "shl r8, 32\n",
             "or r8, rax\n",
-            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {quote}]\n",
-            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {quote}]\n",
+            "vpcmpeqb ymm2, ymm0, ymm6\n",
+            "vpcmpeqb ymm3, ymm1, ymm6\n",
             "vpmovmskb eax, ymm2\n",
             "vpmovmskb r9d, ymm3\n",
             "shl r9, 32\n",
             "or r9, rax\n",
             // Where the next row starts if this one's newline is the first
             // of bytes 64..96.
-            "vmovdqu ymm2, ymmword ptr [rdi + 64]\n",
-            "vpcmpeqb ymm2, ymm2, ymmword ptr [rsi + {newline}]\n",
+            "vpcmpeqb ymm2, ymm7, ymmword ptr [rdi + 64]\n",
             "vpmovmskb eax, ymm2\n",
             "tzcnt eax, eax\n",
             $next,
@@ -1487,7 +1489,7 @@ macro_rules! lean_ids {
             // and what makes its value of it (xmm15); by its low half, which
             // a byte over 127 has none of: the kinds it may be (xmm14).
             "vpsrlw xmm1, xmm0, 4\n",
-            "vpand xmm1, xmm1, xmmword ptr [rsi + {low_nibbles}]\n",
+            "vpand xmm1, xmm1, xmm9\n",
             "vpshufb xmm2, xmm13, xmm1\n",
             "vpshufb xmm3, xmm14, xmm0\n",
             "vpand xmm2, xmm2, xmm3\n",
@@ -1498,9 +1500,9 @@ macro_rules! lean_ids {
             "vpshufb xmm1, xmm15, xmm1\n",
             "vpaddb xmm1, xmm1, xmm0\n",
             // The two numbers the bytes spell.
-            "vpmaddubsw xmm1, xmm1, xmmword ptr [rsi + {id36_pairs}]\n",
-            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {id36_fours}]\n",
-            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {id36_eights}]\n",
+            "vpmaddubsw xmm1, xmm1, xmm10\n",
+            "vpmaddwd xmm1, xmm1, xmm11\n",
+            "vpmuludq xmm2, xmm1, xmm12\n",
             "vpsrlq xmm1, xmm1, 32\n",
             "vpaddq xmm1, xmm1, xmm2\n",
             // By both lengths: less the prefix's part, and in the range of
@@ -1554,7 +1556,7 @@ macro_rules! lean_times {
             "vpminub ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
             "vpcmpeqb ymm1, ymm1, ymm0\n",
             "vpshufb ymm0, ymm0, ymmword ptr [r14 + {f_shuffle}]\n",
-            "vpmaddubsw ymm0, ymm0, ymmword ptr [rsi + {tens}]\n",
+            "vpmaddubsw ymm0, ymm0, ymm8\n",
             "vpcmpgtw ymm2, ymm0, ymmword ptr [r14 + {f_ceilings}]\n",
             "vpandn ymm1, ymm2, ymm1\n",
             "vpmovmskb eax, ymm1\n",
@@ -1655,11 +1657,11 @@ macro_rules! lean_tail {
     ($next:literal, $reach:literal, $comma:literal, $opened:literal) => {
         concat!(
             "vmovdqu ymm0, ymmword ptr [r11]\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {newline}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm7\n",
             "vpmovmskb r8d, ymm1\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {comma}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm5\n",
             "vpmovmskb r13d, ymm1\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {quote}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm6\n",
             "vpmovmskb r14d, ymm1\n",
             "tzcnt r8d, r8d\n",
             "jc 2f\n",
@@ -1720,7 +1722,7 @@ macro_rules! lean_offset {
             "vpminub xmm1, xmm0, xmmword ptr [rsi + {offset_limit}]\n",
             "vpcmpeqb xmm1, xmm1, xmm0\n",
             "vpshufb xmm0, xmm0, xmmword ptr [rsi + {offset_shuffle}]\n",
-            "vpmaddubsw xmm0, xmm0, xmmword ptr [rsi + {tens}]\n",
+            "vpmaddubsw xmm0, xmm0, xmm8\n",
             "vpcmpgtw xmm2, xmm0, xmmword ptr [rsi + {offset_ceilings}]\n",
             "vpandn xmm1, xmm2, xmm1\n",
             "vpmovmskb r8d, xmm1\n",
@@ -1891,18 +1893,27 @@ macro_rules! lean_run {
     };
 }
 
-/// One `asm!` of the kernel: its pieces (after the three tables that class
-/// the characters of an ID, which stay in registers), its operands, and the
-/// places in the tables and in the frame that every use of it names.
+/// One `asm!` of the kernel: its pieces (after the vector constants every
+/// row uses, which stay in registers), its operands, and the places in the
+/// tables and in the frame that every use of it names.
 macro_rules! lean_asm {
     ([$($template:expr,)*] $($operands:tt)*) => {
         std::arch::asm!(
+            "vmovdqu ymm5, ymmword ptr [rsi + {comma}]",
+            "vmovdqu ymm6, ymmword ptr [rsi + {quote}]",
+            "vmovdqu ymm7, ymmword ptr [rsi + {newline}]",
+            "vmovdqu ymm8, ymmword ptr [rsi + {tens}]",
+            "vmovdqu xmm9, xmmword ptr [rsi + {low_nibbles}]",
+            "vmovdqu xmm10, xmmword ptr [rsi + {id36_pairs}]",
+            "vmovdqu xmm11, xmmword ptr [rsi + {id36_fours}]",
+            "vmovdqu xmm12, xmmword ptr [rsi + {id36_eights}]",
             "vmovdqu xmm13, xmmword ptr [rsi + {id_kind_high}]",
             "vmovdqu xmm14, xmmword ptr [rsi + {id_kind_low}]",
             "vmovdqu xmm15, xmmword ptr [rsi + {id_value}]",
             $($template,)*
             $($operands)*
-            out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            out("ymm5") _, out("ymm6") _, out("ymm7") _, out("ymm8") _, out("ymm9") _, out("ymm10") _,
+            out("ymm11") _, out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
             comma = const std::mem::offset_of!(LeanTables, comma),
             quote = const std::mem::offset_of!(LeanTables, quote),
             newline = const std::mem::offset_of!(LeanTables, newline),
