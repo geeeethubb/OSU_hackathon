@@ -36,6 +36,22 @@ impl LinkTable {
         }
     }
 
+    /// Starts loading the cache line `person(user)` reads first, so that a
+    /// lookup a few records later finds it in the cache. Changes no result.
+    #[inline(always)]
+    pub fn prefetch(&self, user: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let at = (user.wrapping_mul(HASH_MULTIPLIER) >> self.shift) as usize;
+            // SAFETY: `at` is inside the table (the same index `person` starts
+            // from), and a prefetch never faults or changes memory.
+            unsafe { _mm_prefetch(self.slots.as_ptr().add(at) as *const i8, _MM_HINT_T0) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = user;
+    }
+
     /// The name code of the person `user` belongs to. Codes are never 0.
     #[inline]
     pub fn person(&self, user: u64) -> u64 {
@@ -107,4 +123,28 @@ pub fn build(pairs: &[Vec<(u64, u64)>], users: &Interner) -> LinkTable {
         }
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fast::codes::pattern_code;
+
+    #[test]
+    fn prefetch_changes_no_result() {
+        let code = |id: &[u8]| pattern_code(id, b'u').unwrap();
+        let pairs = vec![vec![(code(b"u5"), code(b"u3")), (code(b"u3"), code(b"u9"))], vec![(code(b"u7"), code(b"u7"))]];
+        let table = build(&pairs, &Interner::default());
+        let expected = [(b"u3", b"u3"), (b"u5", b"u3"), (b"u9", b"u3"), (b"u7", b"u7"), (b"u1", b"u1")];
+        for (user, _) in expected {
+            table.prefetch(code(user));
+        }
+        for (user, person) in expected {
+            assert_eq!(table.person(code(user)), code(person));
+        }
+        // An empty table still has a line to prefetch.
+        let empty = build(&[], &Interner::default());
+        empty.prefetch(code(b"u1"));
+        assert_eq!(empty.person(code(b"u1")), code(b"u1"));
+    }
 }
