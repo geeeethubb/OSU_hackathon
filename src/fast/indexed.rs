@@ -32,7 +32,7 @@ use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::LinkTable;
 use super::parse::CLICK_USERS;
-use super::sessions::{PassCOut, ScratchC, EVENT_SPARE};
+use super::sessions::{PassCOut, ScratchC};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -806,15 +806,20 @@ impl Runner {
         self.run_kernel(shared, c_out, name);
     }
 
-    /// The session kernel on the person collected in `ts`, `purchases` and `clicks`.
+    /// The session kernel on the person collected in `ts`, `purchases` and
+    /// `clicks`. Events read in index order are in time order in generated
+    /// data, which the kernel uses when it holds and does not need: it
+    /// orders the events itself otherwise.
     #[inline(always)]
     fn run_kernel(&mut self, shared: &Shared, c_out: &mut PassCOut, name: u64) {
         let count = self.ts.len();
+        if count == 0 {
+            return;
+        }
         self.inline_persons += 1;
         self.inline_events += count as u64;
-        self.ts.resize(count + EVENT_SPARE, 0);
         let started = self.measure.then(std::time::Instant::now);
-        self.kernel.one_person(c_out, shared.click_exotic, name, &mut self.ts, count, &self.purchases, &self.clicks);
+        self.kernel.one_person_in_order(c_out, shared.click_exotic, name, &self.ts, &self.purchases, &self.clicks);
         if let Some(started) = started {
             self.kernel_nanos += started.elapsed().as_nanos() as u64;
         }
