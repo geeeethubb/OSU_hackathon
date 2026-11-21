@@ -778,7 +778,7 @@ const TYPE_PURCHASE_QUOTED: u64 = u64::from_le_bytes(*b",\"purcha");
 /// (stored), `ROW_EMIT` (in `row`), or `ROW_DECLINE`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn event_decode_lean<const MODE: u32>(
+unsafe fn event_decode_lean<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     p: *const u8,
     comma_low: u64,
@@ -819,10 +819,32 @@ unsafe fn event_decode_lean<const MODE: u32>(
     if (event_extra | user_extra) > 1 || *p.add(q0) != b'e' || *p.add(user_start) != b'u' {
         return ROW_DECLINE;
     }
-    let (event_code, user_code, known) = two_codes(read_u64(p.add(q0 + 1)), read_u64(p.add(user_start + 1)));
-    if known != (0x7F7F | ((event_extra as u32) << 7) | ((user_extra as u32) << 15)) {
-        return ROW_DECLINE;
-    }
+    let event_text = read_u64(p.add(q0 + 1));
+    let user_text = read_u64(p.add(user_start + 1));
+    let (event_code, user_code) = if INDEXED {
+        // Index mode: both IDs must be generated ones. Their numbers are read
+        // from the characters right-aligned, which drops the byte that ends
+        // a 7-character ID; then the same checks as in `event_row_fast`.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let (event_number, user_number, known) =
+            two_numbers36(event_text << ((event_extra ^ 1) * 8), user_text << ((user_extra ^ 1) * 8));
+        let index = unscramble(event_number, keys.event_key);
+        let number = unscramble(user_number, keys.user_key);
+        let generated = canonical36(7 + event_extra, event_text as u8, known, event_number)
+            & (index < keys.index_bound)
+            & canonical36(7 + user_extra, user_text as u8, known >> 8, user_number)
+            & ((number >> 9) < keys.user_bound);
+        if !generated {
+            return ROW_DECLINE;
+        }
+        (index, number)
+    } else {
+        let (event_code, user_code, known) = two_codes(event_text, user_text);
+        if known != (0x7F7F | ((event_extra as u32) << 7) | ((user_extra as u32) << 15)) {
+            return ROW_DECLINE;
+        }
+        (event_code, user_code)
+    };
 
     // Both timestamps. ingest_ts must be F1 on a table day, closed by its
     // quote if it has one (its comma is checked with the event type).
@@ -928,15 +950,30 @@ unsafe fn event_decode_lean<const MODE: u32>(
     }
     let ts = select_unpredictable(valid, ts, 0);
     let user_code = select_unpredictable(valid, user_code, 0);
+    // Index mode: the user of a valid row is its user number.
+    let user_is_number = INDEXED & valid;
     if MODE == MODE_STORE {
-        emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        if INDEXED {
+            emit_indexed(
+                out,
+                event_code,
+                ts,
+                u64::from(valid),
+                user_code,
+                u64::from(user_is_number),
+                ingest_seconds as u64,
+                purchase,
+            );
+        } else {
+            emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        }
         return ROW_DONE;
     }
     if MODE == MODE_ROW {
         *row = EventRow {
             event: event_code,
             user: user_code,
-            user_is_number: false,
+            user_is_number,
             ts: ts as u32,
             ingest: ingest_seconds as u32,
             valid,
@@ -977,9 +1014,6 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
     out: &mut ParseOut,
     row: &mut EventRow,
 ) -> (usize, u32) {
-    if INDEXED {
-        return event_row_fast::<MODE, INDEXED>(ctx, p, out, row);
-    }
     let newline = _mm256_set1_epi8(b'\n' as i8);
     let comma = _mm256_set1_epi8(b',' as i8);
     let quote = _mm256_set1_epi8(b'"' as i8);
@@ -1005,8 +1039,17 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
         row.event ^= comma_low ^ comma_high ^ quote_low ^ quote_high;
         return (length, ROW_DROP);
     }
-    let status =
-        event_decode_lean::<MODE>(ctx, p, comma_low, quote_low, comma_high, quote_high, high_length as usize, out, row);
+    let status = event_decode_lean::<MODE, INDEXED>(
+        ctx,
+        p,
+        comma_low,
+        quote_low,
+        comma_high,
+        quote_high,
+        high_length as usize,
+        out,
+        row,
+    );
     if status == ROW_DECLINE {
         return event_row_declined::<MODE, INDEXED>(ctx, p, out, row);
     }
