@@ -32,7 +32,7 @@ use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::{LinkTable, SIMPLE, SLOW};
 use super::parse::CLICK_USERS;
-use super::sessions::{PassCOut, ScratchC};
+use super::sessions::{PassCOut, Person, ScratchC, Sessions};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -45,27 +45,57 @@ const COMPLEX: u64 = 1 << 63;
 /// purchase word.
 pub type Record = [u64; 3];
 
+/// Slot word 0, from the bottom: the record's valid bit, its timestamp, the
+/// bit that says its user is a user number, and the tag of the partition
+/// that placed it.
+const VALID: u64 = 1;
+const NUMBERED: u64 = 1 << 32;
+const TAG_SHIFT: u32 = 33;
+const TAG_MAX: u64 = (1 << (64 - TAG_SHIFT)) - 1;
+/// The record's own bits of that word.
+const RECORD_BITS: u64 = (1 << TAG_SHIFT) - 1;
+/// What decides whether a slot holds a valid event of a generated user ID
+/// that the partition at hand placed: its tag and the two flags.
+const EVENT_BITS: u64 = !RECORD_BITS | NUMBERED | VALID;
+
 /// Where a partition's records are placed by index.
 pub struct ScratchI {
-    /// The winning record per index.
+    /// The winning record per index: its two words, with the partition's
+    /// tag where word 0 had the index.
     slots: Vec<[u64; 2]>,
     /// The purchase word of the winning record, for purchases.
     purchases: Vec<u64>,
-    /// One bit per slot: a record was placed there.
-    occupied: Vec<u64>,
+    /// The tag of the partition being read. A slot holds a record of this
+    /// partition exactly when it carries this tag: tags count up from 1, so
+    /// whatever an earlier partition left in a slot is never taken for a
+    /// record, and nothing is cleared between partitions.
+    tag: u64,
 }
 
 impl ScratchI {
-    /// For partitions of `1 << index_shift` indexes (at least 64).
+    /// For partitions of `1 << index_shift` indexes.
     pub fn new(index_shift: u32) -> Self {
         let slots = 1usize << index_shift;
-        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], occupied: vec![0; slots / 64] }
+        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0 }
+    }
+
+    /// Word 0 of a slot that holds a valid event of a generated user ID of
+    /// the partition being read, apart from its timestamp.
+    #[inline(always)]
+    fn event(&self) -> u64 {
+        self.tag << TAG_SHIFT | NUMBERED | VALID
     }
 }
 
 /// Places a partition's records by index. Returns whether there were any.
 fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
-    scratch.occupied.fill(0);
+    if scratch.tag == TAG_MAX {
+        // Out of tags (2^31 partitions on one thread): start over.
+        scratch.slots.fill([0; 2]);
+        scratch.tag = 0;
+    }
+    scratch.tag += 1;
+    let tag = scratch.tag;
     let mut any = false;
     for list in lists {
         for block in list.blocks() {
@@ -77,13 +107,12 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
                 let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
                 at += 2 + has_purchase;
                 let slot = (word0 >> 48) as usize & (scratch.slots.len() - 1);
-                let bit = 1u64 << (slot & 63);
+                let held = scratch.slots[slot];
                 // Step 2 of the rules: the copy with the smallest ingest_ts
                 // wins (the first seen among equal ones, which are identical).
-                let first = scratch.occupied[slot >> 6] & bit == 0;
-                if first || ((word1 >> 1) & INGEST_MASK) < ((scratch.slots[slot][1] >> 1) & INGEST_MASK) {
-                    scratch.occupied[slot >> 6] |= bit;
-                    scratch.slots[slot] = [word0, word1];
+                let first = held[0] >> TAG_SHIFT != tag;
+                if first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK) {
+                    scratch.slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
                     // Only a purchase writes its word: every reader looks at
                     // `purchases[slot]` only when the slot's winner has the
                     // purchase bit, and that winner wrote it here. What an
@@ -373,10 +402,22 @@ pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<Chain>> {
 /// the partitions set aside (index order).
 pub type Chain = (u64, Vec<Vec<Record>>);
 
+/// The main person of a run read straight from the slots, as the session
+/// kernel has it: in its batch, or on its own.
+#[derive(Clone, Copy)]
+enum Open {
+    Batch(Person),
+    Alone(Sessions),
+}
+
 /// One thread's state for the index pass.
 pub struct Runner {
     place: ScratchI,
     kernel: ScratchC,
+    /// Whether the main persons of direct runs go to the session kernel in
+    /// batches. `SS_BATCH=0` does them one at a time instead, for A/B runs:
+    /// the same rows either way.
+    batched: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
     aliases: Vec<[u64; 2]>,
@@ -414,6 +455,7 @@ impl Runner {
         Self {
             place: ScratchI::new(index_shift),
             kernel,
+            batched: !std::env::var_os("SS_BATCH").is_some_and(|value| value == "0"),
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
@@ -456,65 +498,190 @@ impl Runner {
         if !any {
             return;
         }
+        if self.batched {
+            self.read::<true>(shared, part, b_out, c_out);
+        } else {
+            self.read::<false>(shared, part, b_out, c_out);
+        }
+        if let Some(started) = started {
+            self.total_nanos += started.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// The runs of the partition whose records `place` has laid out: the
+    /// main persons of direct runs join the session kernel's batch
+    /// (`BATCHED`) or are done one at a time.
+    fn read<const BATCHED: bool>(
+        &mut self,
+        shared: &Shared,
+        part: usize,
+        b_out: &mut PassBOut,
+        c_out: &mut PassCOut,
+    ) {
         let mut current = u64::MAX;
         let mut edge = Edge { part, first_user: u64::MAX, first: Vec::new(), last_user: u64::MAX, last: Vec::new() };
         let mut records = std::mem::take(&mut self.records);
         records.clear();
         // Whether the current run is collected as records (the first run, and
-        // users the summary cannot describe) or read straight into `ts`.
+        // users the summary cannot describe) or read straight from the slots.
         let mut gathering = true;
         let mut run_start = 0usize;
-        for word_index in 0..self.place.occupied.len() {
-            let mut bits = self.place.occupied[word_index];
-            while bits != 0 {
-                let slot = word_index * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let [word0, word1] = self.place.slots[slot];
-                // The winner's own valid bit decides: an invalid winner drops the event.
-                if word0 & 1 == 0 {
-                    continue;
-                }
-                let is_purchase = word1 & 1;
-                if (word0 >> 32) & 1 == 0 {
-                    // Not a generated user ID: `word1` holds its code.
-                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
-                    forward(shared.links, b_out, word0, word1, purchase);
-                    self.general_events += 1;
-                    continue;
-                }
-                let user = word1 >> 31;
-                if user != current {
-                    if current != u64::MAX {
-                        self.violated |= user < current;
-                        if edge.first_user == u64::MAX {
-                            edge.first_user = current;
-                            edge.first = std::mem::take(&mut records);
-                        } else if gathering {
-                            self.process_run(shared, b_out, c_out, current, &[&records]);
-                            records.clear();
-                        } else {
-                            self.finish_direct(shared, c_out, current);
+        // A run read straight from the slots, once its main person has an
+        // event: that person's aliases (0 before that, and in every other
+        // kind of run) and the person as the session kernel has it, in its
+        // batch (`person`) or on its own (`alone`).
+        let mut main = 0u64;
+        let mut person = Person::default();
+        let mut alone = Sessions::default();
+        let event = self.place.event();
+        let slot_count = self.place.slots.len();
+        let mut slot = 0usize;
+        while slot < slot_count {
+            if main != 0 {
+                // The main person's next events, for as long as nothing else
+                // comes: its sessions grow as the slots are read, and its
+                // timestamps are never collected.
+                let (slots, bought) = (&self.place.slots[..], &self.place.purchases[..]);
+                // `number >> 6` of this user's IDs with an alias below 64.
+                let user_bits = current << 3;
+                // Timestamp and purchase bit of a slot that holds a valid
+                // event of a generated user ID that this partition placed,
+                // under one of the main person's aliases.
+                let event_at = |slot: usize| {
+                    let [word0, word1] = slots[slot];
+                    // The timestamp if the slot holds such an event; a value
+                    // above every timestamp if it holds anything else.
+                    let ts = (word0 ^ event).rotate_right(1);
+                    let number = word1 >> 22;
+                    let ours = ts <= TS_MASK && number >> 6 == user_bits && (main >> (number & 63)) & 1 != 0;
+                    ours.then_some((ts, word1 & 1))
+                };
+                if BATCHED {
+                    let sessions = self.kernel.batch_scratch().0;
+                    while slot < slots.len() {
+                        // A purchase is taken below, one slot at a time: the
+                        // loop then has nothing to call.
+                        let Some((ts, 0)) = event_at(slot) else {
+                            break;
+                        };
+                        if !person.add(sessions, ts as u32) {
+                            break;
                         }
-                        gathering = !self.begin_direct(shared, user);
-                    }
-                    current = user;
-                    run_start = slot;
-                }
-                if gathering {
-                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
-                    records.push([word0, word1, purchase]);
-                    continue;
-                }
-                let alias = (word1 >> 22) & (ALIASES - 1);
-                if alias < 64 && (self.main_mask >> alias) & 1 != 0 {
-                    let ts = (word0 >> 1) & TS_MASK;
-                    self.ts.push(ts as u32);
-                    if is_purchase == 1 {
-                        self.purchases.push([ts, self.place.purchases[slot]]);
+                        slot += 1;
                     }
                 } else {
-                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
-                    self.add_other(word0, word1, purchase);
+                    let (start, count) = self.kernel.session_scratch();
+                    while slot < slots.len() {
+                        let Some((ts, is_purchase)) = event_at(slot) else {
+                            break;
+                        };
+                        if !alone.add(start, count, ts as u32) {
+                            break;
+                        }
+                        if is_purchase == 1 {
+                            self.purchases.push([ts, bought[slot]]);
+                        }
+                        slot += 1;
+                    }
+                }
+                if slot == slot_count {
+                    break;
+                }
+            }
+            // Everything else, one slot at a time.
+            let this = slot;
+            slot += 1;
+            let [word0, word1] = self.place.slots[this];
+            // Nothing placed here by this partition, or a winner that is not
+            // valid: the winner's own valid bit decides, and an invalid
+            // winner drops the event.
+            if word0 >> TAG_SHIFT != self.place.tag || word0 & VALID == 0 {
+                continue;
+            }
+            // The record's own word 0 again.
+            let word0 = word0 & RECORD_BITS;
+            let is_purchase = word1 & 1;
+            let purchase = if is_purchase == 1 { self.place.purchases[this] } else { 0 };
+            if (word0 >> 32) & 1 == 0 {
+                // Not a generated user ID: `word1` holds its code.
+                forward(shared.links, b_out, word0, word1, purchase);
+                self.general_events += 1;
+                continue;
+            }
+            let user = word1 >> 31;
+            if user != current {
+                if current != u64::MAX {
+                    self.violated |= user < current;
+                    if edge.first_user == u64::MAX {
+                        edge.first_user = current;
+                        edge.first = std::mem::take(&mut records);
+                    } else if gathering {
+                        self.process_run(shared, b_out, c_out, current, &[&records]);
+                        records.clear();
+                    } else {
+                        let open = if BATCHED { Open::Batch(person) } else { Open::Alone(alone) };
+                        self.finish_direct(shared, c_out, current, main, open);
+                    }
+                    gathering = !self.begin_direct(shared, user);
+                    main = 0;
+                }
+                current = user;
+                run_start = this;
+            }
+            if gathering {
+                records.push([word0, word1, purchase]);
+                continue;
+            }
+            let number = word1 >> 22;
+            let alias = number & (ALIASES - 1);
+            let ts = (word0 >> 1) & TS_MASK;
+            if alias < 64 && self.main_mask == 0 {
+                // Without a simple component the first ID met becomes the main person.
+                self.main_mask = 1 << alias;
+                self.main_name = 0;
+                self.main_number = number;
+            }
+            if alias >= 64 || (self.main_mask >> alias) & 1 == 0 {
+                // An ID in no link component: a person of its own.
+                self.others.push([number, (ts << 1) | is_purchase, purchase]);
+                continue;
+            }
+            let in_order = if main == 0 {
+                if BATCHED {
+                    if self.kernel.batch_is_full() {
+                        self.finish_batch(shared, c_out);
+                    }
+                    person = self.kernel.begin_person(c_out, shared.click_exotic, ts as u32);
+                } else {
+                    alone = Sessions::begin(self.kernel.session_scratch().0, ts as u32);
+                }
+                main = self.main_mask;
+                true
+            } else if BATCHED {
+                person.add(self.kernel.batch_scratch().0, ts as u32)
+            } else {
+                let (start, count) = self.kernel.session_scratch();
+                alone.add(start, count, ts as u32)
+            };
+            if !in_order {
+                // The run is not in time order, so its main person cannot be
+                // done this way. Nothing of the run has left this runner or
+                // the batch: it is read again as records, and goes through
+                // `process_run` like the runs the summary cannot describe.
+                if BATCHED {
+                    self.kernel.abort_person(person);
+                }
+                self.regather(run_start, this, &mut records);
+                records.push([word0, word1, purchase]);
+                gathering = true;
+                main = 0;
+                continue;
+            }
+            if is_purchase == 1 {
+                if BATCHED {
+                    person.purchase(self.kernel.batch_scratch().1, purchase);
+                } else {
+                    self.purchases.push([ts, purchase]);
                 }
             }
         }
@@ -525,18 +692,12 @@ impl Runner {
             } else {
                 if !gathering {
                     // The last run was read straight from the slots, and
-                    // nothing of it has left this runner: read it again as records.
-                    self.ts.clear();
-                    self.purchases.clear();
-                    self.others.clear();
-                    for slot in run_start..self.place.slots.len() {
-                        let [word0, word1] = self.place.slots[slot];
-                        let occupied = (self.place.occupied[slot >> 6] >> (slot & 63)) & 1;
-                        if occupied & word0 & (word0 >> 32) & 1 == 1 {
-                            let purchase = if word1 & 1 == 1 { self.place.purchases[slot] } else { 0 };
-                            records.push([word0, word1, purchase]);
-                        }
+                    // nothing of it has left this runner or the batch: read
+                    // it again as records.
+                    if BATCHED && main != 0 {
+                        self.kernel.abort_person(person);
                     }
+                    self.regather(run_start, slot_count, &mut records);
                 }
                 edge.last_user = current;
                 edge.last = std::mem::take(&mut records);
@@ -544,13 +705,11 @@ impl Runner {
             self.edges.push(edge);
         }
         self.records = records;
+        self.finish_batch(shared, c_out);
         self.kernel.flush(c_out);
         if !c_out.names.is_empty() {
             // A thread handles about `parts / threads` partitions like this one.
             self.kernel.reserve_rows(c_out, c_out.names.len() * shared.parts / shared.threads * 3 / 2);
-        }
-        if let Some(started) = started {
-            self.total_nanos += started.elapsed().as_nanos() as u64;
         }
     }
 
@@ -572,43 +731,65 @@ impl Runner {
         true
     }
 
-    /// An event of a run read straight from the slots whose ID is not one of
-    /// the main person's: an ID in no link component, a person of its own.
+    /// The events of the run that began at slot `from`, up to slot `to`,
+    /// as records: a run that was being read straight from the slots and
+    /// has to go through `process_run` after all. Every valid event of a
+    /// generated user ID in that range belongs to the run. What the run had
+    /// collected so far is dropped.
     #[cold]
     #[inline(never)]
-    fn add_other(&mut self, word0: u64, word1: u64, purchase: u64) {
-        let number = word1 >> 22;
-        let alias = number & (ALIASES - 1);
-        let ts = (word0 >> 1) & TS_MASK;
-        let is_purchase = word1 & 1;
-        if self.main_mask == 0 && alias < 64 {
-            self.main_mask = 1 << alias;
-            self.main_name = 0;
-            self.main_number = number;
-            self.ts.push(ts as u32);
-            if is_purchase == 1 {
-                self.purchases.push([ts, purchase]);
+    fn regather(&mut self, from: usize, to: usize, records: &mut Vec<Record>) {
+        self.ts.clear();
+        self.purchases.clear();
+        self.others.clear();
+        let event = self.place.event();
+        for slot in from..to {
+            let [word0, word1] = self.place.slots[slot];
+            if word0 & EVENT_BITS == event {
+                let purchase = if word1 & 1 == 1 { self.place.purchases[slot] } else { 0 };
+                records.push([word0 & RECORD_BITS, word1, purchase]);
             }
-        } else {
-            self.others.push([number, (ts << 1) | is_purchase, purchase]);
         }
     }
 
-    /// Ends a run read straight from the slots: its main person, then the
-    /// persons of its other IDs.
-    fn finish_direct(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64) {
-        if !self.ts.is_empty() {
+    /// Rows and cells of the persons in the session kernel's batch.
+    fn finish_batch(&mut self, shared: &Shared, c_out: &mut PassCOut) {
+        let started = self.measure.then(std::time::Instant::now);
+        self.kernel.finish_batch(c_out, shared.click_exotic);
+        if let Some(started) = started {
+            self.kernel_nanos += started.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// Ends a run read straight from the slots: its main person (`main` are
+    /// its aliases, 0 if it has no event, and `open` is what the session
+    /// kernel has of it), then the persons of its other IDs.
+    fn finish_direct(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64, main: u64, open: Open) {
+        if main != 0 {
             let name =
                 if self.main_name != 0 { self.main_name } else { shared.keys.code_of_user_number(self.main_number) };
-            let mask = self.main_mask;
-            self.clicks.clear();
-            for click in shared.clicks.of(user) {
+            self.inline_persons += 1;
+            let clicks = shared.clicks.of(user).iter().filter_map(|click| {
                 let alias = click[0] >> 32;
-                if alias < 64 && (mask >> alias) & 1 != 0 {
-                    self.clicks.push([click[0] & 0xFFFF_FFFF, click[1]]);
+                (alias < 64 && (main >> alias) & 1 != 0).then_some([click[0] & 0xFFFF_FFFF, click[1]])
+            });
+            match open {
+                Open::Batch(person) => {
+                    self.inline_events += person.events();
+                    self.kernel.end_person(person, name, clicks);
+                }
+                Open::Alone(sessions) => {
+                    self.inline_events += u64::from(sessions.events());
+                    self.clicks.clear();
+                    self.clicks.extend(clicks);
+                    let started = self.measure.then(std::time::Instant::now);
+                    let (purchases, clicks) = (&self.purchases, &self.clicks);
+                    self.kernel.finish_sessions(sessions, c_out, shared.click_exotic, name, purchases, clicks);
+                    if let Some(started) = started {
+                        self.kernel_nanos += started.elapsed().as_nanos() as u64;
+                    }
                 }
             }
-            self.run_kernel(shared, c_out, name);
         }
         if !self.others.is_empty() {
             // Rare: IDs of one user that no link joins are separate persons.
@@ -796,41 +977,38 @@ pub fn stats(keys: &Keys, links: &LinkTable, indexed_lists: &[Vec<PartList>], pa
         if !place(&lists, &mut scratch) {
             continue;
         }
-        for word_index in 0..scratch.occupied.len() {
-            let mut bits = scratch.occupied[word_index];
-            while bits != 0 {
-                let slot = word_index * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                occupied += 1;
-                let [word0, word1] = scratch.slots[slot];
-                if word0 & 1 == 0 {
-                    continue;
-                }
-                valid += 1;
-                if (word0 >> 32) & 1 == 0 {
-                    other_user += 1;
-                    continue;
-                }
-                numbered += 1;
-                let user = word1 >> 31;
-                let ts = (word0 >> 1) & TS_MASK;
-                if user != previous_user {
-                    runs += 1;
-                    ts_back_runs += u64::from(run_ts_back);
-                    multi_name_runs += u64::from(names.len() > 1);
-                    run_ts_back = false;
-                    names.clear();
-                    user_back += u64::from(previous_user != u64::MAX && user < previous_user);
-                    previous_user = user;
-                    previous_ts = 0;
-                }
-                run_ts_back |= ts < previous_ts;
-                previous_ts = ts;
-                let (name, complex) = links.lookup(keys.code_of_user_number(word1 >> 22));
-                complex_events += u64::from(complex);
-                if !complex && !names.contains(&name) {
-                    names.push(name);
-                }
+        for &[word0, word1] in &scratch.slots {
+            if word0 >> TAG_SHIFT != scratch.tag {
+                continue;
+            }
+            occupied += 1;
+            if word0 & 1 == 0 {
+                continue;
+            }
+            valid += 1;
+            if (word0 >> 32) & 1 == 0 {
+                other_user += 1;
+                continue;
+            }
+            numbered += 1;
+            let user = word1 >> 31;
+            let ts = (word0 >> 1) & TS_MASK;
+            if user != previous_user {
+                runs += 1;
+                ts_back_runs += u64::from(run_ts_back);
+                multi_name_runs += u64::from(names.len() > 1);
+                run_ts_back = false;
+                names.clear();
+                user_back += u64::from(previous_user != u64::MAX && user < previous_user);
+                previous_user = user;
+                previous_ts = 0;
+            }
+            run_ts_back |= ts < previous_ts;
+            previous_ts = ts;
+            let (name, complex) = links.lookup(keys.code_of_user_number(word1 >> 22));
+            complex_events += u64::from(complex);
+            if !complex && !names.contains(&name) {
+                names.push(name);
             }
         }
     }
