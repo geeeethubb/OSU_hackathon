@@ -371,3 +371,15 @@ official_receipt_and_score: not yet submitted
 - **What the same numbers suggest instead:** in (a), writing the lists is 82 of the 104 ms: about 16 ns per
   record of thread time, mostly the read-for-ownership of fresh list memory. Next experiment in the same
   harness: write-combining buffers flushed with non-temporal stores for the partition lists.
+
+### 20:37 UTC
+
+- **Write-combining lists with non-temporal stores: rejected in the same harness.** A 64-byte buffer per
+  partition, flushed with non-temporal stores, against plain appends to the block lists. Linux runner
+  (run 44947126383, Xeon 6975P-C, 4 vCPU): 20M, 4 threads: 108 to 111 ms against 111 to 141 ms (steady
+  rounds 108 against 111 to 114: about 3%); 20M, 2 threads: 157 to 159 against 149 to 155 ms (worse);
+  60M, 4 threads: 402 to 465 against 415 to 451 ms (no difference). The direct scheme lost on this CPU as
+  well (199 to 222 ms at 20M, 755 to 777 ms at 60M). Decision: reject; the partition lists stay as they are.
+- **Read of both experiments:** the movement of event records (lists, placement, ordered read) is close
+  to its efficient form for records of this size; the remaining cost is computing the records (parsing)
+  and the per-person session work, plus the link builder thread once the parse gets shorter.
