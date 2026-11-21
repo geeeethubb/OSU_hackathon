@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::BuildHasherDefault;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use self::arena::{PartList, PartWriter};
@@ -570,7 +570,22 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let index_state = match &ctx.keys {
         Some(keys) => {
             // The clicks of generated user IDs, grouped by user index.
-            let (builder, target) = indexed::ClickIndexBuilder::new(&user_click_lists);
+            // Counting walks every block of every list: all threads share it.
+            let ranges = user_click_lists.first().map_or(0, Vec::len);
+            let counts: Vec<AtomicU32> = (0..ranges).map(|_| AtomicU32::new(0)).collect();
+            let next = AtomicUsize::new(0);
+            parallel(threads, |_| loop {
+                let from = next.fetch_add(64, Ordering::Relaxed);
+                if from >= ranges {
+                    break;
+                }
+                for range in from..(from + 64).min(ranges) {
+                    let lists = user_click_lists.iter().map(|per_thread| per_thread[range]);
+                    counts[range].store(indexed::ClickIndexBuilder::count(lists), Ordering::Relaxed);
+                }
+            });
+            let counts: Vec<u32> = counts.into_iter().map(AtomicU32::into_inner).collect();
+            let (builder, target) = indexed::ClickIndexBuilder::new(&counts);
             let ranges = builder.ranges();
             let next = AtomicUsize::new(0);
             parallel(threads, |_| {

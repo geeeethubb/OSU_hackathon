@@ -146,19 +146,23 @@ unsafe impl Send for ClickTarget {}
 unsafe impl Sync for ClickTarget {}
 
 impl ClickIndexBuilder {
-    /// `lists[thread][range]` are the click lists. Ranges after the last one
-    /// that has clicks are left out.
-    pub fn new(lists: &[Vec<PartList>]) -> (Self, ClickTarget) {
-        let ranges = lists.first().map_or(0, Vec::len);
+    /// How many clicks a range holds: `lists` are its click lists, one per thread.
+    pub fn count(lists: impl Iterator<Item = PartList>) -> u32 {
+        lists.map(|list| list.words() / 2).sum::<usize>() as u32
+    }
+
+    /// `counts[range]` is the number of clicks of each range (`count`).
+    /// Ranges after the last one that has clicks are left out.
+    pub fn new(counts: &[u32]) -> (Self, ClickTarget) {
+        let ranges = counts.len();
         let mut bases = Vec::with_capacity(ranges + 1);
         let (mut total, mut used) = (0usize, 0usize);
-        for range in 0..ranges {
+        for (range, &clicks) in counts.iter().enumerate() {
             bases.push(total as u32);
-            let clicks: usize = lists.iter().map(|per_thread| per_thread[range].words() / 2).sum();
             if clicks > 0 {
                 used = range + 1;
             }
-            total += clicks;
+            total += clicks as usize;
         }
         assert!(total <= u32::MAX as usize);
         bases.truncate(used);
@@ -221,9 +225,19 @@ impl ClickIndexBuilder {
 
 /// Winning events whose own ID is not a generated one (they went through the
 /// general dedup pass) but whose person is simple: they join their user's run.
-#[derive(Default)]
 pub struct Extras {
     by_user: HashMap<u64, (AtomicBool, Vec<Record>)>,
+    /// One bit per `user % FILTER_BITS` that has extras: almost every run
+    /// asks about a user without any, and this answers without hashing.
+    filter: Vec<u64>,
+}
+
+const FILTER_BITS: u64 = 1 << 14;
+
+impl Default for Extras {
+    fn default() -> Self {
+        Self { by_user: HashMap::new(), filter: vec![0; (FILTER_BITS / 64) as usize] }
+    }
 }
 
 impl Extras {
@@ -246,7 +260,9 @@ impl Extras {
                         let word0 = (1 << 32) | (key & (TS_MASK << 1)) | 1;
                         match (links.lookup(name), keys.user_number_of_code(name)) {
                             ((_, false), Some(number)) => {
-                                let entry = extras.by_user.entry(number >> 9).or_default();
+                                let user = number >> 9;
+                                extras.filter[((user % FILTER_BITS) / 64) as usize] |= 1 << (user % 64);
+                                let entry = extras.by_user.entry(user).or_default();
                                 entry.1.push([word0, (number << 22) | is_purchase, purchase]);
                             }
                             _ => forward_named(out, name, word0, is_purchase, purchase),
@@ -260,6 +276,15 @@ impl Extras {
 
     pub fn len(&self) -> usize {
         self.by_user.len()
+    }
+
+    /// The extras of `user`, if it has any.
+    #[inline(always)]
+    fn of(&self, user: u64) -> Option<&(AtomicBool, Vec<Record>)> {
+        if self.filter[((user % FILTER_BITS) / 64) as usize] & (1 << (user % 64)) == 0 {
+            return None;
+        }
+        self.by_user.get(&user)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -605,7 +630,7 @@ impl Runner {
     #[inline(always)]
     fn begin_direct(&mut self, shared: &Shared, user: u64) -> bool {
         let [head, mask] = shared.summary.of(user);
-        if head & SLOW != 0 || (!shared.extras.is_empty() && shared.extras.by_user.contains_key(&user)) {
+        if head & SLOW != 0 || shared.extras.of(user).is_some() {
             return false;
         }
         self.ts.clear();
@@ -707,12 +732,12 @@ impl Runner {
         pieces: &[&[Record]],
     ) {
         // The user's events whose own ID is not a generated one join the run.
-        let extra: &[Record] = match shared.extras.by_user.get(&user) {
-            Some((used, more)) if !shared.extras.is_empty() => {
+        let extra: &[Record] = match shared.extras.of(user) {
+            Some((used, more)) => {
                 used.store(true, Ordering::Relaxed);
                 more
             }
-            _ => &[],
+            None => &[],
         };
         self.run += 1;
         self.ts.clear();

@@ -219,7 +219,7 @@ CI gave 1,165 ms on a Xeon 8573C runner and about 620 ms on an EPYC 9V45 runner 
 ### 19:31 UTC
 
 ```text
-candidate_full_sha: 4567e9531dc58ed5eb43d0c3bcd7ebbf0c82f6ef  (index mode is the default)
+candidate_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (index mode is the default)
 baseline_full_sha: 2b2cccd1ba1cb12bc5a074a899ce54c868205b86  (official 0.71 s)
 default_command_and_env: /pipeline, no environment variable (SS_STRUCT=0 selects the general path)
 CPU_topology / limits / image_digest: GitHub runner, AMD EPYC 7763, 4 vCPU (2 cores x 2 threads), --cpus 4 --memory 13g; run 44940522202
@@ -265,3 +265,19 @@ official_receipt_and_score: not yet submitted
   seeds 2 and 3 MATCH; SS_STRUCT=0: 36/36, 43/43, dev and seed 2 MATCH; 24 small generated datasets MATCH.
 - **Expected by 20:05 UTC from the agents, for candidate B:** index-mode click path without the
   code-to-number round trip, a faster index-mode event kernel, a session kernel entry for events in time order.
+
+### 19:47 UTC
+
+- **Correction:** the previous entries and `bench/BEST_SHA` in commit `b32d77f` named the index-default
+  commit with a wrong full hash (typed from memory; the tail was invalid). The officially accepted
+  0.66 s commit is `4567e9532f4019fbfd0e92908fd01cc49f24f67d`; the ledger and `bench/BEST_SHA` now carry
+  it, and every 40-character hash in the ledger was checked against the repository. Because of the
+  invalid baseline, the CI run of `b32d77f` has no prior-versus-candidate pairs: this commit repeats
+  the comparison.
+- **Confirmation of `4567e953` on fresh seeds (run 44941343462, same SHA, seeds 7 and 11):** 51.9 and
+  59.0 ms faster than `2b2cccd1`, 12/12 pairs; 36/36, 43/43, dev MATCH, 29/29 runs MATCH per seed.
+- **In CI now (this commit), paired against the 0.66 s commit:** candidate A of the last entry plus two
+  small index-pass changes (click lists counted by all threads; "does this user have extra events"
+  answered by a bit test instead of a hash probe per run). Laptop checks with SS_VERIFY=1: 42 unit
+  tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH; 16 small generated datasets and three mutated
+  ones MATCH the reference pipeline.
