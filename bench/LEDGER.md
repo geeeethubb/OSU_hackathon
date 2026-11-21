@@ -574,3 +574,36 @@ official_receipt_and_score: not yet submitted
   packed summary of the sharded build; equality with the single build confirmed on 20M seed 3 and 60M),
   clicks (table-driven kernel), output (resumed: row groups drained during the index pass),
   correctness (mutation sets on the named candidates; 0 disagreements so far).
+
+### 22:14 UTC
+
+- **Sessions step 1, confirmed alone:** `9a2b760d31cfd42abe20b7b55d1fb9d5b82bcfb1` (a direct run's main
+  person gets its sessions while its slots are read; no timestamp vector) against candidate E, run
+  44953779232, EPYC 7763: **+18.8 / +13.2 / +17.9 ms, 18/18 pairs** (A/A medians -3.9 / +4.1 / -2.6).
+  Its base already holds the fast exit (about 4 ms), so the step itself is worth 10 to 15 ms. Instrumented
+  run, seed 2: index pass 229.4 -> 219.0 ms elapsed; summed worker time in the session kernel 450.8 ->
+  410.3 CPU-ms, placing unchanged (131.8 -> 129.9). Keep; it enters the next candidate.
+- **What the second hardware thread is worth (measured, 2-core runner):** run 44953815755, EPYC 9V45,
+  same image with `NCPU=2` against the default 4 threads: 158.0 / 162.4 ms slower, 12/12 pairs (medians
+  596.7 -> 759.5 and 625.7 -> 785.5). Two threads on two cores take about 27% longer than four threads on
+  the same two cores. Inference, not measured: the scorer's eight threads on four cores gain a similar
+  share from their second threads; nothing in this run says how the scorer's cores compare with these.
+- **Elapsed critical path, candidate E + fast exit** (run 44953815755, EPYC 9V45, 2 cores x 2 threads,
+  seed 2, one instrumented run): container 618.8 ms; process 524.7 = startup 2.1, link parse 14.5, parse
+  stage 319.3 (workers 299.4, click index 19.6), odd events 2.4, index pass 173.0, general remainder 3.8,
+  output about 13. Summed worker time for scale: event parse 1,034, click parse 161 CPU-ms.
+- **New measured item: the end of the process.** Container time minus the process's own total, minus
+  what a no-op container takes on the same runner: 94.2 - 60.2 = 34 ms (9V45), 73.2 - 56.5 = 17 ms and
+  77.7 - 53.4 = 24 ms (run 44953146558), 100.2 - 74.8 = 25 ms (EPYC 7763). So 17 to 34 ms pass outside the
+  stages the program times. Inferred cause, not yet demonstrated: the kernel takes the input mappings
+  apart when the process exits (1.9 GB = 464,000 page-table entries, one thread, before the exit is
+  reported). Experiment `9a9c467` on branch `exp-ci-release-1`: two helper threads drop those entries
+  (`MADV_DONTNEED`; the bytes stay readable) as soon as the parse workers are done; `SS_RELEASE=0` keeps
+  the old behaviour as the same-image variant. Success line set before the result: the variant at least
+  10 ms slower on every seed with 5 of 6 pairs; rejected below 5 ms or inside the A/A range.
+- **In CI, each alone against candidate E:** click agent's table-driven kernel `ff5feff` (branch
+  `exp-ci-clicks-1`, variant `SS_CLICK_KERNEL=lean`); sessions step 2, persons in batches, `093ad2e`
+  (`exp-ci-sessions-2`) and the same with its switch `2d58de3` (`exp-ci-sessions-2b`, variant
+  `SS_BATCH=0`).
+- **Startup edge cases (local, exact):** datasets with no link rows, no click rows, or neither, at 1, 4
+  and 8 threads: all MATCH `/reference`, index mode chosen each time.
