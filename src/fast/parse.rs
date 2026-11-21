@@ -415,20 +415,153 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, MODE_STORE};
-    match event_kernel() {
+    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
+    let kernel = event_kernel();
+    // The kernel in assembly is for index mode.
+    let assembly = INDEXED && kernel == KERNEL_LEAN;
+    match kernel {
         KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
         // Checked rows go one by one through the loop that compares them.
-        _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        _ if MODE == MODE_ROW && assembly => {
+            events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out)
+        }
+        _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN_PLAIN>(ctx, buffer, position, end, out),
         // Index mode has no diagnostic modes of its own: SS_DIAG=2 and 7 pick them here.
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
             events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
         }
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 && assembly => {
+            events_assembly_loop::<7>(ctx, buffer, position, end, out)
+        }
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
             events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
         }
+        _ if assembly => events_assembly_loop::<MODE>(ctx, buffer, position, end, out),
         _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
+}
+
+/// The loop of the lean kernel in assembly (index mode) when rows are
+/// stored (or, in a diagnostic mode, dropped). Nothing is called on its
+/// common path.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn events_assembly_loop<const MODE: u32>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_lean_asm, event_lean_common, lean_setup, LeanFrame, ROW_PAD};
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
+    let (lean, _) = lean_setup(ctx);
+    let mut row = EventRow::default();
+    // The assembly reads up to 16 bytes before a row.
+    while position < stop.min(16) {
+        position = event_row_plain::<MODE, true>(ctx, buffer, position, out, &mut row);
+    }
+    if position < stop {
+        let mut frame = LeanFrame::new(ctx);
+        let frame = &mut frame as *mut LeanFrame;
+        let base = buffer.as_ptr();
+        // SAFETY (all of this): a row that starts before `stop` has ROW_PAD
+        // readable bytes after it and, here, 16 before it; the tables and
+        // the frame are those of `ctx`.
+        let mut p = unsafe { base.add(position) };
+        let last = unsafe { base.add(stop) };
+        while p < last {
+            let read = unsafe { event_lean_asm(lean, p, frame) };
+            if read.status == 0 {
+                unsafe {
+                    event_lean_common::<MODE>(read, out, &mut row);
+                    p = (*frame).next;
+                }
+                continue;
+            }
+            let position = unsafe { p.offset_from(base) } as usize;
+            let next = event_row_rare::<MODE>(
+                ctx,
+                frame,
+                buffer,
+                position,
+                out,
+                &mut row,
+                read.status,
+                read.ts,
+                read.ingest_seconds,
+                read.index,
+                read.user_number,
+                read.keep,
+            );
+            p = unsafe { base.add(next) };
+        }
+        position = unsafe { p.offset_from(base) } as usize;
+    }
+    // Diagnostic modes fold their work into `row.event`; keep it alive.
+    std::hint::black_box(row.event);
+    position
+}
+
+/// A row the kernel in assembly did not finish by itself: a purchase it read
+/// up to the product and the price (`status` 2; the arguments after it are
+/// then what the assembly read), or a row it declined, which goes to the
+/// lean kernel as the compiler makes it. Returns where the next row starts.
+/// (What was read comes as separate arguments so that none of it is stored
+/// anywhere on the common path.)
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn event_row_rare<const MODE: u32>(
+    ctx: &Ctx,
+    frame: *const super::simd::LeanFrame,
+    buffer: &[u8],
+    position: usize,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+    status: u64,
+    ts: u64,
+    ingest_seconds: u64,
+    index: u64,
+    user_number: u64,
+    keep: u64,
+) -> usize {
+    if status == 2 {
+        let read = super::simd::LeanRow { status, ts, ingest_seconds, index, user_number, keep };
+        // SAFETY: the frame is the one the assembly just filled for this
+        // row, which ends right before `next`, inside the buffer.
+        unsafe {
+            super::simd::event_lean_purchase::<MODE>(ctx, &*frame, read, out, row);
+            return (*frame).next.offset_from(buffer.as_ptr()) as usize;
+        }
+    }
+    event_row_plain::<MODE, true>(ctx, buffer, position, out, row)
+}
+
+/// One row through the lean kernel as the compiler makes it and, if that
+/// declines it, through the general kernel and the general parser. Returns
+/// where the next row starts. `position` has ROW_PAD bytes after it.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn event_row_plain<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    position: usize,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> usize {
+    use super::simd::{event_row_lean_step, lean_setup, ROW_DECLINE};
+    let (lean, window_length) = lean_setup(ctx);
+    // SAFETY: at least ROW_PAD readable bytes follow `position`, and the
+    // tables are those of `ctx`.
+    let (length, _, status) = unsafe {
+        event_row_lean_step::<MODE, INDEXED>(ctx, lean, window_length, buffer.as_ptr().add(position), out, row)
+    };
+    if status == ROW_DECLINE {
+        return event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+    }
+    position + length + 1
 }
 
 /// The lean kernel's loop when rows are stored (or, in a diagnostic mode,
@@ -526,19 +659,26 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        event_row_fast, event_row_lean, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD,
+        event_row_fast, event_row_lean, event_row_lean_asm, LeanFrame, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, ROW_DONE,
+        ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD,
     };
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
     let mut row = EventRow::default();
+    // The kernel in assembly, where it is asked for: index mode only.
+    let mut frame = (INDEXED && KERNEL == KERNEL_LEAN).then(|| LeanFrame::new(ctx));
     while position < limit && position < safe {
-        // SAFETY: at least ROW_PAD readable bytes follow `position`.
+        // SAFETY: at least ROW_PAD readable bytes follow `position`, and
+        // where the assembly runs at least 16 come before it.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
             if KERNEL == KERNEL_GENERAL {
                 event_row_fast::<MODE, INDEXED>(ctx, p, out, &mut row)
             } else {
-                event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row)
+                match frame.as_mut() {
+                    Some(frame) if position >= 16 => event_row_lean_asm::<MODE>(ctx, frame, p, out, &mut row),
+                    _ => event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row),
+                }
             }
         };
         if status == ROW_DONE {

@@ -14,7 +14,7 @@ use std::arch::x86_64::*;
 use std::hint::select_unpredictable;
 
 use super::codes::id_code;
-use super::keys::{unscramble, MASK as NUMBER_MASK};
+use super::keys::{pre, unscramble, MASK as NUMBER_MASK};
 use super::parse::{emit_code_click, emit_indexed, emit_number_click, emit_raw, ClickRecord, EventRow, ParseOut};
 use super::Ctx;
 use crate::util::{civil_from_days, parse_price, parse_ts, DAY_MS, LATE_MS, WEEK_MS};
@@ -91,7 +91,7 @@ impl TsTables {
             base_ms: base_day * DAY_MS,
             ingest_adjust,
             date,
-            lean: LeanTables::new(base_day, ingest_adjust, text),
+            lean: LeanTables::new(base_day, ingest_adjust, window_start, text),
         }
     }
 }
@@ -667,13 +667,18 @@ pub const ROW_DECLINE: u32 = 6;
 /// The event kernels a fast loop can run.
 pub const KERNEL_GENERAL: u32 = 0;
 pub const KERNEL_LEAN: u32 = 1;
+/// The lean kernel as the compiler makes it, without the one in assembly.
+pub const KERNEL_LEAN_PLAIN: u32 = 2;
 
-/// The event kernel of this run: the lean one unless `SS_KERNEL=general`
-/// asks for `event_row_fast` alone (for A/B runs).
+/// The event kernel of this run: the lean one (in index mode with the
+/// assembly in front of it) unless `SS_KERNEL=plain` asks for the lean
+/// kernel without its assembly, or `SS_KERNEL=general` for `event_row_fast`
+/// alone (both for A/B runs).
 pub fn event_kernel() -> u32 {
     static KERNEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *KERNEL.get_or_init(|| match std::env::var("SS_KERNEL").as_deref() {
         Ok("general") => KERNEL_GENERAL,
+        Ok("plain") => KERNEL_LEAN_PLAIN,
         _ => KERNEL_LEAN,
     })
 }
@@ -695,6 +700,156 @@ pub struct LeanTables {
     type_step: [u8; 16],
     /// The two bytes that end ingest_ts: `Z,` or `",`.
     ingest_end: [u16; 2],
+    // From here on: what only the kernel in assembly reads.
+    /// The two bytes from the `Z` of ingest_ts on: `Z,`, or `Z"` in a quoted field.
+    ingest_close: [u16; 2],
+    /// `view` and `cart` with their commas and quotes: what to keep of the
+    /// eight bytes from the comma after ingest_ts, and the four texts.
+    type_masks: [u64; 4],
+    type_texts: [u64; 4],
+    /// The first eight bytes of `,purchase,` and of `,"purchase",`.
+    purchase: [u64; 2],
+    /// Added to a thousand times the ingest seconds, less ts since the
+    /// window's start: how late the row is, plus 2^62 so that an unsigned
+    /// compare does; and the first such number that is too late.
+    late_bias: i64,
+    late_limit: u64,
+    /// Ten times the first byte of a pair plus the second.
+    tens: [u8; 32],
+    /// Added to a byte: its distance from `0`, from `a`; and its base-36
+    /// value if it is a letter.
+    id_digit: [u8; 16],
+    nine: [u8; 16],
+    id_letter: [u8; 16],
+    twenty_five: [u8; 16],
+    id36_letter_value: [u8; 16],
+    /// Base 36, most significant character first: pairs, fours, eights.
+    id36_pairs: [u8; 16],
+    id36_fours: [u32; 4],
+    id36_eights: [u64; 2],
+    /// By the lengths of both IDs (event: 7 or 8 characters, then user the
+    /// same, as one index): for each ID the prefix's part of the number its
+    /// last eight bytes spell, then the smallest number a canonical text of
+    /// that length stands for and how many more there are, both with the
+    /// top bit flipped for a signed compare.
+    id_ranges: [[u64; 8]; 4],
+    /// The `+HH:MM` that ends an F2 timestamp, as `TimeForm` has it for the
+    /// other bytes.
+    offset_pattern: [u8; 16],
+    offset_limit: [u8; 16],
+    offset_shuffle: [u8; 16],
+    offset_ceilings: [i16; 8],
+    offset_weights: [i16; 8],
+    /// By the length of ts plus 64 (a length is -64 to 64 before it is
+    /// known to be one): where its form's constants are in these tables.
+    form_of_length: [u16; 129],
+    forms: TimeForms,
+}
+
+/// A shuffle index that gives zero, a limit every byte is within, a ceiling
+/// no number is over.
+const SKIP: u8 = 0x80;
+const FREE: u8 = 255;
+const NONE: i16 = i16::MAX;
+
+// F1, bytes 4..20: `-MM-DDTHH:MM:SSZ`. The numbers come out as hour,
+// minute, second, nothing, month, day, nothing, nothing; the first weights
+// make minutes of the day, the second, `month * 32 + day` and nothing of
+// them, the second weights the second of the day and the same again.
+const PLAIN_PATTERN: [u8; 16] = *b"-00-00T00:00:00Z";
+const PLAIN_LIMIT: [u8; 16] = [0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0];
+const PLAIN_SHUFFLE: [u8; 16] = [7, 8, 10, 11, 13, 14, SKIP, SKIP, 1, 2, 4, 5, SKIP, SKIP, SKIP, SKIP];
+const PLAIN_CEILINGS: [i16; 8] = [23, 59, 59, NONE, 12, 31, NONE, NONE];
+const PLAIN_FIRST: [i16; 8] = [60, 1, 1, 0, 32, 1, 0, 0];
+const PLAIN_SECOND: [i16; 8] = [60, 1, 1, 0, 0, 0, 0, 0];
+// Thirteen digits, in the sixteen bytes that end with them: the first digit
+// alone, nothing, then six pairs; four numbers of up to four digits; the
+// first five digits as one number and the last eight as another.
+const DIGITS_PATTERN: [u8; 16] = [0, 0, 0, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30];
+const DIGITS_LIMIT: [u8; 16] = [FREE, FREE, FREE, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+const DIGITS_SHUFFLE: [u8; 16] = [SKIP, 3, SKIP, SKIP, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const DIGITS_FIRST: [i16; 8] = [1, 0, 100, 1, 100, 1, 100, 1];
+const DIGITS_SECOND: [i16; 8] = [10_000, 1, 10_000, 1, 0, 0, 0, 0];
+
+/// The constants of one form of ts, for the kernel in assembly: what the
+/// sixteen bytes it takes of a timestamp are XORed with, the largest value
+/// each may then have, how they pair up into numbers, the numbers' ceilings,
+/// and the weights that add the numbers up in two steps. The low half of
+/// each is for ts in this form, the high half for ingest_ts, which is always
+/// F1. Then, for ts alone, what makes milliseconds since the window's start
+/// of the two sums `low` and `high`, with the form's day table (the real
+/// one, or a single entry of zeros):
+/// `(day[high & index_mask].seconds + low) * scale + (high & high_mask) - start`,
+/// and which bits of that day's year text ts must start with.
+#[repr(C, align(64))]
+struct TimeForm {
+    pattern: [u8; 32],
+    limit: [u8; 32],
+    shuffle: [u8; 32],
+    ceilings: [i16; 16],
+    first: [i16; 16],
+    second: [i16; 16],
+    index_mask: u32,
+    year_mask: u32,
+    high_mask: u64,
+    scale: i64,
+    start: i64,
+}
+
+impl TimeForm {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        pattern: [u8; 16],
+        limit: [u8; 16],
+        shuffle: [u8; 16],
+        ceilings: [i16; 8],
+        first: [i16; 8],
+        second: [i16; 8],
+        of_day: bool,
+        scale: i64,
+        start: i64,
+    ) -> Self {
+        let bytes = |low: [u8; 16], high: [u8; 16]| {
+            let mut both = [0u8; 32];
+            both[..16].copy_from_slice(&low);
+            both[16..].copy_from_slice(&high);
+            both
+        };
+        let words = |low: [i16; 8], high: [i16; 8]| {
+            let mut both = [0i16; 16];
+            both[..8].copy_from_slice(&low);
+            both[8..].copy_from_slice(&high);
+            both
+        };
+        Self {
+            pattern: bytes(pattern, PLAIN_PATTERN),
+            limit: bytes(limit, PLAIN_LIMIT),
+            shuffle: bytes(shuffle, PLAIN_SHUFFLE),
+            ceilings: words(ceilings, PLAIN_CEILINGS),
+            first: words(first, PLAIN_FIRST),
+            second: words(second, PLAIN_SECOND),
+            index_mask: if of_day { 511 } else { 0 },
+            year_mask: if of_day { u32::MAX } else { 0 },
+            high_mask: if of_day { 0 } else { u64::MAX },
+            scale,
+            start,
+        }
+    }
+}
+
+/// The forms of ts and the day table, at fixed distances from one another:
+/// the assembly reaches a form's day table from the form's own constants,
+/// and that is the real table for F1 and one entry of zeros for 13 digits.
+#[repr(C, align(64))]
+struct TimeForms {
+    digits: TimeForm,
+    plain: TimeForm,
+    /// Every other length: nothing passes.
+    bad: TimeForm,
+    /// F2: as F1 up to the seconds, any byte after them.
+    offset: TimeForm,
+    zero_day: [u32; 2],
+    gap: [u8; 248],
     /// By `month * 32 + day`: the year text of the table day with that month
     /// and day, and the compact ingest seconds of its midnight (a signed
     /// number). Where there is no such day: a year no text has in a row the
@@ -702,8 +857,19 @@ pub struct LeanTables {
     day: [[u32; 2]; 512],
 }
 
+/// From a form's constants to its day table.
+const FORM_DAY: usize = std::mem::offset_of!(TimeForms, day) - std::mem::offset_of!(TimeForms, plain);
+const _: () = {
+    assert!(std::mem::size_of::<TimeForm>() == 256);
+    assert!(std::mem::offset_of!(TimeForms, zero_day) - std::mem::offset_of!(TimeForms, digits) == FORM_DAY);
+    // The form no length should have looks its day up inside the table.
+    assert!(std::mem::offset_of!(TimeForms, bad) + FORM_DAY >= std::mem::offset_of!(TimeForms, day));
+    assert!(std::mem::offset_of!(TimeForms, bad) + FORM_DAY + 8 <= std::mem::size_of::<TimeForms>());
+    assert!(std::mem::size_of::<LeanTables>() < 1 << 16);
+};
+
 impl LeanTables {
-    fn new(base_day: i64, ingest_adjust: i64, text: impl Fn(i64) -> u32) -> Self {
+    fn new(base_day: i64, ingest_adjust: i64, window_start: i64, text: impl Fn(i64) -> u32) -> Self {
         // A missing day's year is four 0xFF bytes: a timestamp with them is
         // bad whatever the rest is, and the seconds below put it far outside
         // every window, so the row comes out invalid, as it must.
@@ -719,14 +885,102 @@ impl LeanTables {
         type_step[2] = 5;
         type_step[4] = 7;
         type_step[8] = 7;
+        let base_ms = (base_day * 86_400 - ingest_adjust) * 1_000;
+        let mut tens = [1u8; 32];
+        for pair in 0..16 {
+            tens[2 * pair] = 10;
+        }
+        let flip = 1u64 << 63;
+        let mut id_ranges = [[0u64; 8]; 4];
+        for (lengths, entry) in id_ranges.iter_mut().enumerate() {
+            for (id, prefix) in [14u64, 30].into_iter().enumerate() {
+                let eight = (lengths >> id) & 1 == 1;
+                entry[id] = if eight { 0 } else { prefix * POWER36_7 };
+                entry[2 + id] = CANONICAL36[usize::from(eight)][0] ^ flip;
+                entry[4 + id] = CANONICAL36[usize::from(eight)][1] ^ flip;
+            }
+        }
+        let mut offset_pattern = [0u8; 16];
+        offset_pattern[..6].copy_from_slice(b"+00:00");
+        let mut offset_limit = [FREE; 16];
+        offset_limit[1..6].copy_from_slice(&[9, 9, 0, 9, 9]);
+        let mut offset_shuffle = [SKIP; 16];
+        offset_shuffle[..4].copy_from_slice(&[1, 2, 4, 5]);
+        let forms = std::mem::offset_of!(LeanTables, forms);
+        let mut form_of_length = [(forms + std::mem::offset_of!(TimeForms, bad)) as u16; 129];
+        form_of_length[64 + 13] = (forms + std::mem::offset_of!(TimeForms, digits)) as u16;
+        form_of_length[64 + 20] = (forms + std::mem::offset_of!(TimeForms, plain)) as u16;
+        let mut offset_tail = PLAIN_LIMIT;
+        offset_tail[15] = FREE;
         Self {
             newline: [b'\n'; 32],
             comma: [b','; 32],
             quote: [b'"'; 32],
-            base_ms: (base_day * 86_400 - ingest_adjust) * 1_000,
+            base_ms,
             type_step,
             ingest_end: [u16::from_le_bytes(*b"Z,"), u16::from_le_bytes(*b"\",")],
-            day,
+            ingest_close: [u16::from_le_bytes(*b"Z,"), u16::from_le_bytes(*b"Z\"")],
+            type_masks: [TYPE_SHORT, TYPE_SHORT, u64::MAX, u64::MAX],
+            type_texts: [TYPE_VIEW, TYPE_CART, TYPE_VIEW_QUOTED, TYPE_CART_QUOTED],
+            purchase: [TYPE_PURCHASE, TYPE_PURCHASE_QUOTED],
+            late_bias: base_ms - window_start + (1 << 62),
+            late_limit: LATE_MS as u64 + (1 << 62) + 1,
+            tens,
+            id_digit: [0u8.wrapping_sub(b'0'); 16],
+            nine: [9; 16],
+            id_letter: [0u8.wrapping_sub(b'a'); 16],
+            twenty_five: [25; 16],
+            id36_letter_value: [10u8.wrapping_sub(b'a'); 16],
+            id36_pairs: [36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1],
+            id36_fours: [0x0001_0510; 4],
+            id36_eights: [1_679_616; 2],
+            id_ranges,
+            offset_pattern,
+            offset_limit,
+            offset_shuffle,
+            offset_ceilings: [23, 59, NONE, NONE, NONE, NONE, NONE, NONE],
+            offset_weights: [3_600, 60, 0, 0, 0, 0, 0, 0],
+            form_of_length,
+            forms: TimeForms {
+                digits: TimeForm::new(
+                    DIGITS_PATTERN,
+                    DIGITS_LIMIT,
+                    DIGITS_SHUFFLE,
+                    [NONE; 8],
+                    DIGITS_FIRST,
+                    DIGITS_SECOND,
+                    false,
+                    100_000_000,
+                    window_start,
+                ),
+                plain: TimeForm::new(
+                    PLAIN_PATTERN,
+                    PLAIN_LIMIT,
+                    PLAIN_SHUFFLE,
+                    PLAIN_CEILINGS,
+                    PLAIN_FIRST,
+                    PLAIN_SECOND,
+                    true,
+                    1_000,
+                    window_start - base_ms,
+                ),
+                // Every number is over a ceiling of -1.
+                bad: TimeForm::new([0; 16], [0; 16], [SKIP; 16], [-1; 8], [0; 8], [0; 8], false, 0, 0),
+                offset: TimeForm::new(
+                    PLAIN_PATTERN,
+                    offset_tail,
+                    PLAIN_SHUFFLE,
+                    PLAIN_CEILINGS,
+                    PLAIN_FIRST,
+                    PLAIN_SECOND,
+                    true,
+                    1_000,
+                    window_start - base_ms,
+                ),
+                zero_day: [0; 2],
+                gap: [0; 248],
+                day,
+            },
         }
     }
 }
@@ -925,7 +1179,7 @@ unsafe fn event_lean<const MODE: u32, const INDEXED: bool>(
     let ingest_at = p.add(c2 + q3 + 1);
     let type_at = ingest_at.add(20 + q3);
     let (ts_packed, ingest_packed, good) = iso_tails(ts_at, ingest_at);
-    let days = std::ptr::addr_of!((*lean).day) as *const [u32; 2];
+    let days = std::ptr::addr_of!((*lean).forms.day) as *const [u32; 2];
     let ingest_day = *days.add((ingest_packed & 511) as usize);
     if good < 0xFFFF_0000 {
         return DECLINE;
@@ -1105,6 +1359,679 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
     ROW_DROP
 }
 
+// ---------------------------------------------------------------------------
+// The lean kernel in assembly, for index mode: `event_lean` again, as one
+// piece of code in which every value stays in its register from where it is
+// made to where it is used. What the compiler makes of `event_lean` is about
+// a third longer: it moves values between registers and the stack, turns
+// each check into a flag and tests the flags later, and reads ts twice (as
+// F1 and as 13 digits). Here:
+//   - a check is a compare and a branch that is never taken;
+//   - ts goes once through the same vector steps as ingest_ts, with the
+//     constants of its form (found by its length) as their operands, and the
+//     two sums come out as milliseconds by that form's scale and day table;
+//   - an F2 timestamp (one row in ten) and a purchase (3 in 100) leave the
+//     straight line for a piece of their own.
+// It takes exactly the rows `event_lean` takes that end where the early look
+// for the newline said, and reads the same from them; the tests hold the
+// two against each other on every line they have.
+//
+// Registers: rdi the row, rsi the tables, rdx the frame; rax and r15 are
+// scratch throughout. After `lean_head`: r9 and r10 where the texts of the
+// IDs start, rcx and r14 where they end, r12 where ts starts and r8 where
+// it ends (all as offsets), r13 ingest_ts and r11 the comma after it (as
+// addresses). After `lean_ids`: r9 the event index and r10 the user number,
+// each in the top 40 bits. After the timestamps: rax ts in milliseconds
+// since the window's start, rcx the compact ingest seconds, r12 all ones
+// for a valid row. Labels: 2 declines, 3 is a purchase, 4 an F2 timestamp,
+// 5 where it comes back, 8 the end.
+// ---------------------------------------------------------------------------
+
+/// Masks, the early look for the newline, where the first four fields are.
+macro_rules! lean_head {
+    () => {
+        concat!(
+            // Masks of the commas (r8) and quotes (r9) of bytes 0..64.
+            "vmovdqu ymm0, ymmword ptr [rdi]\n",
+            "vmovdqu ymm1, ymmword ptr [rdi + 32]\n",
+            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {comma}]\n",
+            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {comma}]\n",
+            "vpmovmskb eax, ymm2\n",
+            "vpmovmskb r8d, ymm3\n",
+            "shl r8, 32\n",
+            "or r8, rax\n",
+            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {quote}]\n",
+            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {quote}]\n",
+            "vpmovmskb eax, ymm2\n",
+            "vpmovmskb r9d, ymm3\n",
+            "shl r9, 32\n",
+            "or r9, rax\n",
+            // Where the next row starts if this one's newline is the first
+            // of bytes 64..96.
+            "vmovdqu ymm2, ymmword ptr [rdi + 64]\n",
+            "vpcmpeqb ymm2, ymm2, ymmword ptr [rsi + {newline}]\n",
+            "vpmovmskb eax, ymm2\n",
+            "tzcnt eax, eax\n",
+            "lea rax, [rdi + rax + 65]\n",
+            "mov qword ptr [rdx + {next}], rax\n",
+            // Quotes at the starts (r10) of the first four fields and before
+            // the first three commas: both or neither. r11 is q3.
+            "lea r10, [r8 + r8 + 1]\n",
+            "pext r11, r9, r10\n",
+            "lea rax, [r9 + r9]\n",
+            "pext rax, rax, r8\n",
+            "xor rax, r11\n",
+            "test al, 7\n",
+            "jnz 2f\n",
+            "shr r11d, 3\n",
+            "and r11d, 1\n",
+            // Text starts (rcx) and text ends (r8) as bits.
+            "mov rcx, r10\n",
+            "and rcx, r9\n",
+            "add rcx, r10\n",
+            "rorx r10, r8, 1\n",
+            "and r10, r9\n",
+            "sub r8, r10\n",
+            // s0 r9, s1 r10, s2 r12, s3 r13, e0 rcx, e1 r14, e2 r8.
+            "tzcnt r9, rcx\n",
+            "blsr rcx, rcx\n",
+            "tzcnt r10, rcx\n",
+            "blsr rcx, rcx\n",
+            "tzcnt r12, rcx\n",
+            "blsr rcx, rcx\n",
+            "tzcnt r13, rcx\n",
+            "tzcnt rcx, r8\n",
+            "blsr r8, r8\n",
+            "tzcnt r14, r8\n",
+            "blsr r8, r8\n",
+            "tzcnt r8, r8\n",
+            // ingest_ts (r13): its `Z` (which the timestamps' step checks
+            // again) and then the comma, or the quote that closes it (the
+            // comma after that is the event type's to check). r11 becomes
+            // that comma.
+            "add r13, rdi\n",
+            "movzx eax, word ptr [r13 + 19]\n",
+            "cmp ax, word ptr [rsi + r11*2 + {ingest_close}]\n",
+            "jne 2f\n",
+            "lea r11, [r13 + r11 + 20]\n",
+        )
+    };
+}
+
+/// Both IDs as generated ones: the event's index and the user's number.
+macro_rules! lean_ids {
+    () => {
+        concat!(
+            // The eight bytes that end each ID.
+            "vmovq xmm0, qword ptr [rdi + rcx - 8]\n",
+            "vpinsrq xmm0, xmm0, qword ptr [rdi + r14 - 8], 1\n",
+            // Each text is its prefix and 7 or 8 characters.
+            "sub rcx, r9\n",
+            "sub r14, r10\n",
+            "lea rax, [rcx - 8]\n",
+            "lea r15, [r14 - 8]\n",
+            "or rax, r15\n",
+            "cmp rax, 1\n",
+            "ja 2f\n",
+            "cmp byte ptr [rdi + r9], 101\n",
+            "jne 2f\n",
+            "cmp byte ptr [rdi + r10], 117\n",
+            "jne 2f\n",
+            // Base-36 values of the sixteen bytes; all must be characters
+            // (of 7 characters, the first byte is the prefix, a letter).
+            "vpaddb xmm1, xmm0, xmmword ptr [rsi + {id_digit}]\n",
+            "vpminub xmm2, xmm1, xmmword ptr [rsi + {nine}]\n",
+            "vpcmpeqb xmm2, xmm2, xmm1\n",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id_letter}]\n",
+            "vpminub xmm4, xmm3, xmmword ptr [rsi + {twenty_five}]\n",
+            "vpcmpeqb xmm4, xmm4, xmm3\n",
+            "vpand xmm1, xmm1, xmm2\n",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id36_letter_value}]\n",
+            "vpand xmm3, xmm3, xmm4\n",
+            "vpor xmm1, xmm1, xmm3\n",
+            "vpor xmm2, xmm2, xmm4\n",
+            "vpmovmskb eax, xmm2\n",
+            "cmp eax, 0xFFFF\n",
+            "jne 2f\n",
+            // The two numbers the bytes spell.
+            "vpmaddubsw xmm1, xmm1, xmmword ptr [rsi + {id36_pairs}]\n",
+            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {id36_fours}]\n",
+            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {id36_eights}]\n",
+            "vpsrlq xmm1, xmm1, 32\n",
+            "vpaddq xmm1, xmm1, xmm2\n",
+            // By both lengths: less the prefix's part, and in the range of
+            // the canonical texts of that length.
+            "lea eax, [rcx + r14*2 - 24]\n",
+            "shl eax, 6\n",
+            "vpsubq xmm1, xmm1, xmmword ptr [rsi + rax + {id_ranges}]\n",
+            "vpsubq xmm2, xmm1, xmmword ptr [rsi + rax + {id_ranges} + 16]\n",
+            "vpcmpgtq xmm2, xmm2, xmmword ptr [rsi + rax + {id_ranges} + 32]\n",
+            "vmovmskpd eax, xmm2\n",
+            "test eax, eax\n",
+            "jnz 2f\n",
+            "vmovq r9, xmm1\n",
+            "vpextrq r10, xmm1, 1\n",
+            // `unscramble` with the number in the top 40 bits, where the
+            // multiplications drop what overflows by themselves: times the
+            // first inverse, the two shifts (the rotation brings in zeros,
+            // the low 24 bits being zero), the key, then down and times the
+            // second inverse; and below its bound.
+            "imul r9, qword ptr [rdx + {inverse_b}]\n",
+            "rorx rax, r9, 17\n",
+            "xor r9, rax\n",
+            "shr rax, 17\n",
+            "xor r9, rax\n",
+            "xor r9, qword ptr [rdx + {event_key}]\n",
+            "shr r9, 24\n",
+            "imul r9, qword ptr [rdx + {inverse_a}]\n",
+            "cmp r9, qword ptr [rdx + {index_limit}]\n",
+            "jae 2f\n",
+            "imul r10, qword ptr [rdx + {inverse_b}]\n",
+            "rorx rax, r10, 17\n",
+            "xor r10, rax\n",
+            "shr rax, 17\n",
+            "xor r10, rax\n",
+            "xor r10, qword ptr [rdx + {user_key}]\n",
+            "shr r10, 24\n",
+            "imul r10, qword ptr [rdx + {inverse_a}]\n",
+            "cmp r10, qword ptr [rdx + {user_limit}]\n",
+            "jae 2f\n",
+        )
+    };
+}
+
+/// Both timestamps through the vector units, with the constants at r14: the
+/// two sums of ts in rax and of ingest_ts in rcx.
+macro_rules! lean_times {
+    () => {
+        concat!(
+            "vpxor ymm0, ymm0, ymmword ptr [r14 + {f_pattern}]\n",
+            "vpminub ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
+            "vpcmpeqb ymm1, ymm1, ymm0\n",
+            "vpshufb ymm0, ymm0, ymmword ptr [r14 + {f_shuffle}]\n",
+            "vpmaddubsw ymm0, ymm0, ymmword ptr [rsi + {tens}]\n",
+            "vpcmpgtw ymm2, ymm0, ymmword ptr [r14 + {f_ceilings}]\n",
+            "vpandn ymm1, ymm2, ymm1\n",
+            "vpmovmskb eax, ymm1\n",
+            "cmp eax, -1\n",
+            "jne 2f\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_first}]\n",
+            "vpackusdw ymm0, ymm0, ymm0\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_second}]\n",
+            "vmovq rax, xmm0\n",
+            "vextracti128 xmm0, ymm0, 1\n",
+            "vmovq rcx, xmm0\n",
+        )
+    };
+}
+
+/// ts in F1 or as 13 digits, by its form's constants.
+macro_rules! lean_ts {
+    () => {
+        concat!(
+            // The length of ts picks the form; F2 goes its own way.
+            "mov rax, r8\n",
+            "sub rax, r12\n",
+            "cmp eax, 25\n",
+            "je 4f\n",
+            "movzx r14d, word ptr [rsi + rax*2 + {form_mid}]\n",
+            "add r14, rsi\n",
+            // The sixteen bytes that end ts, and bytes 4..20 of ingest_ts.
+            "vmovdqu xmm0, xmmword ptr [rdi + r8 - 16]\n",
+            "vinserti128 ymm0, ymm0, xmmword ptr [r13 + 4], 1\n",
+            lean_times!(),
+            // The two sums of ts (rax low, r8 high) as milliseconds since
+            // the window's start, and the year text of its day.
+            "mov r8, rax\n",
+            "shr r8, 32\n",
+            "mov eax, eax\n",
+            "mov r15d, r8d\n",
+            "and r15d, dword ptr [r14 + {f_index_mask}]\n",
+            "and r8, qword ptr [r14 + {f_high_mask}]\n",
+            "mov r12d, dword ptr [rdi + r12]\n",
+            "xor r12d, dword ptr [r14 + r15*8 + {f_day}]\n",
+            "and r12d, dword ptr [r14 + {f_year_mask}]\n",
+            "jnz 2f\n",
+            "movsxd r15, dword ptr [r14 + r15*8 + {f_day} + 4]\n",
+            "add rax, r15\n",
+            "imul rax, qword ptr [r14 + {f_scale}]\n",
+            "add rax, r8\n",
+            "sub rax, qword ptr [r14 + {f_start}]\n",
+            "5:\n",
+        )
+    };
+}
+
+/// ingest_ts on a table day and in range (rcx), and whether the row is valid (r12).
+macro_rules! lean_ingest {
+    () => {
+        concat!(
+            "mov r8, rcx\n",
+            "shr r8, 32\n",
+            "mov ecx, ecx\n",
+            "mov r12d, dword ptr [r13]\n",
+            "cmp r12d, dword ptr [rsi + r8*8 + {day}]\n",
+            "jne 2f\n",
+            "movsxd r8, dword ptr [rsi + r8*8 + {day} + 4]\n",
+            "add rcx, r8\n",
+            "cmp rcx, 0x1FFFFF\n",
+            "ja 2f\n",
+            // In the window (r12) and not late (r8).
+            "imul r8, rcx, 1000\n",
+            "add r8, qword ptr [rsi + {late_bias}]\n",
+            "sub r8, rax\n",
+            "cmp rax, qword ptr [rdx + {window_length}]\n",
+            "sbb r12, r12\n",
+            "cmp r8, qword ptr [rsi + {late_limit}]\n",
+            "sbb r8, r8\n",
+            "and r12, r8\n",
+        )
+    };
+}
+
+/// `view` or `cart` with its commas and quotes: r11 becomes the comma after it.
+macro_rules! lean_type {
+    () => {
+        concat!(
+            "vpbroadcastq ymm0, qword ptr [r11]\n",
+            "vpand ymm0, ymm0, ymmword ptr [rsi + {type_masks}]\n",
+            "vpcmpeqq ymm0, ymm0, ymmword ptr [rsi + {type_texts}]\n",
+            "vmovmskpd r8d, ymm0\n",
+            "movzx r8d, byte ptr [rsi + r8 + {type_step}]\n",
+            "test r8d, r8d\n",
+            "jz 3f\n",
+            "add r11, r8\n",
+        )
+    };
+}
+
+/// The 32 bytes from the comma after the type (r11): the product, one comma,
+/// the price and the newline, which must be where the next row was taken to
+/// start. Leaves the flags of the last check: zero for a row that is
+/// regular, and then r15 is zero too. The three arguments are what a
+/// purchase stores on the way: after the newline is found (r8d), after the
+/// comma is (r13d, as a bit), after the fields' opening quotes are (r8d).
+macro_rules! lean_tail {
+    ($reach:literal, $comma:literal, $opened:literal) => {
+        concat!(
+            "vmovdqu ymm0, ymmword ptr [r11]\n",
+            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {newline}]\n",
+            "vpmovmskb r8d, ymm1\n",
+            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {comma}]\n",
+            "vpmovmskb r13d, ymm1\n",
+            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {quote}]\n",
+            "vpmovmskb r14d, ymm1\n",
+            "tzcnt r8d, r8d\n",
+            "jc 2f\n",
+            $reach,
+            "lea r15, [r11 + r8 + 1]\n",
+            "cmp r15, qword ptr [rdx + {next}]\n",
+            "jne 2f\n",
+            // Without the type's comma (bit 0): exactly one comma.
+            "bzhi r13d, r13d, r8d\n",
+            "blsr r13d, r13d\n",
+            "jz 2f\n",
+            "blsr r15d, r13d\n",
+            "jnz 2f\n",
+            $comma,
+            // The separators (r13d: that comma, the newline), where the two
+            // fields start (r15d) and finish (r13d). A quote is at a start or
+            // at a finish, never at both, and a field has both or neither.
+            "bzhi r14d, r14d, r8d\n",
+            "bts r13d, r8d\n",
+            "lea r15d, [r13 + r13 + 2]\n",
+            "shr r13d, 1\n",
+            "pext r8d, r14d, r15d\n",
+            $opened,
+            "xor r15d, r13d\n",
+            "andn r15d, r15d, r14d\n",
+            "jnz 2f\n",
+            "pext r14d, r14d, r13d\n",
+            "cmp r8d, r14d\n",
+            "jne 2f\n",
+            // An empty product (its field finishes right where its text
+            // starts: at 0, or at 2 after a quote) is the general kernel's.
+            "and r8d, 1\n",
+            "lea r8d, [r8 + r8*2 + 1]\n",
+            "test r13d, r8d\n",
+        )
+    };
+}
+
+/// ts in F2: F1 up to the seconds through the same steps, then the offset.
+macro_rules! lean_offset {
+    () => {
+        concat!(
+            "4:\n",
+            "lea r14, [rsi + {offset_form}]\n",
+            "vmovdqu xmm0, xmmword ptr [rdi + r12 + 4]\n",
+            "vinserti128 ymm0, ymm0, xmmword ptr [r13 + 4], 1\n",
+            lean_times!(),
+            // Local seconds on a table day (rax).
+            "mov r8, rax\n",
+            "shr r8, 32\n",
+            "mov eax, eax\n",
+            "mov r15d, dword ptr [rdi + r12]\n",
+            "cmp r15d, dword ptr [rsi + r8*8 + {day}]\n",
+            "jne 2f\n",
+            "movsxd r15, dword ptr [rsi + r8*8 + {day} + 4]\n",
+            "add rax, r15\n",
+            // `+HH:MM` or `-HH:MM`: hours to 23, minutes to 59, as seconds (r8).
+            "vmovq xmm0, qword ptr [rdi + r12 + 19]\n",
+            "vpxor xmm0, xmm0, xmmword ptr [rsi + {offset_pattern}]\n",
+            "vpminub xmm1, xmm0, xmmword ptr [rsi + {offset_limit}]\n",
+            "vpcmpeqb xmm1, xmm1, xmm0\n",
+            "vpshufb xmm0, xmm0, xmmword ptr [rsi + {offset_shuffle}]\n",
+            "vpmaddubsw xmm0, xmm0, xmmword ptr [rsi + {tens}]\n",
+            "vpcmpgtw xmm2, xmm0, xmmword ptr [rsi + {offset_ceilings}]\n",
+            "vpandn xmm1, xmm2, xmm1\n",
+            "vpmovmskb r8d, xmm1\n",
+            "cmp r8d, 0xFFFF\n",
+            "jne 2f\n",
+            "vpmaddwd xmm0, xmm0, xmmword ptr [rsi + {offset_weights}]\n",
+            "vmovd r8d, xmm0\n",
+            // The sign: -1 for `+` (the offset comes off), 1 for `-`.
+            "movzx r15d, byte ptr [rdi + r12 + 19]\n",
+            "sub r15, 44\n",
+            "lea r14, [r15 + 1]\n",
+            "test r14, -3\n",
+            "jnz 2f\n",
+            "imul r8, r15\n",
+            "add rax, r8\n",
+            "imul rax, rax, 1000\n",
+            "sub rax, qword ptr [rsi + {plain_start}]\n",
+            "jmp 5b\n",
+        )
+    };
+}
+
+/// A purchase: `,purchase,` or `,"purchase",`, then the same 32 bytes, of
+/// which the frame gets what the caller needs to read product and price.
+macro_rules! lean_purchase {
+    () => {
+        concat!(
+            "3:\n",
+            "mov r8, qword ptr [r11]\n",
+            "cmp r8, qword ptr [rsi + {purchase}]\n",
+            "jne 6f\n",
+            "movzx r8d, word ptr [r11 + 8]\n",
+            "cmp r8d, 0x2C65\n",
+            "jne 2f\n",
+            "add r11, 9\n",
+            "jmp 7f\n",
+            "6:\n",
+            "cmp r8, qword ptr [rsi + {purchase} + 8]\n",
+            "jne 2f\n",
+            "cmp dword ptr [r11 + 8], 0x2C226573\n",
+            "jne 2f\n",
+            "add r11, 11\n",
+            "7:\n",
+            "mov qword ptr [rdx + {region}], r11\n",
+            lean_tail!(
+                "mov dword ptr [rdx + {reach}], r8d\n",
+                "mov dword ptr [rdx + {last_comma}], r13d\n",
+                "mov dword ptr [rdx + {opened}], r8d\n"
+            ),
+            "jnz 2f\n",
+            "mov r15d, 2\n",
+            "jmp 8f\n",
+        )
+    };
+}
+
+/// The whole row. r15 at the end: 0 for a `view` or `cart` that is read, 2
+/// for a purchase that is read up to its product and price, 1 for a row the
+/// kernel declines.
+macro_rules! lean_row {
+    () => {
+        concat!(
+            lean_head!(),
+            lean_ids!(),
+            lean_ts!(),
+            lean_ingest!(),
+            lean_type!(),
+            lean_tail!("", "", ""),
+            "jz 8f\n",
+            "jmp 2f\n",
+            lean_offset!(),
+            lean_purchase!(),
+            "2:\n",
+            "mov r15d, 1\n",
+            "8:\n",
+        )
+    };
+}
+
+/// What the kernel in assembly needs besides the tables, and where it leaves
+/// what does not come back in registers.
+#[repr(C)]
+pub struct LeanFrame {
+    /// Where the next row starts if this one ends where the early look for
+    /// its newline said. The kernel takes no row that ends elsewhere.
+    pub next: *const u8,
+    window_length: u64,
+    // `unscramble` with numbers in the top 40 bits: its two inverses, both
+    // keys and both bounds, moved up by 24 bits.
+    inverse_b: u64,
+    inverse_a: u64,
+    event_key: u64,
+    user_key: u64,
+    index_limit: u64,
+    user_limit: u64,
+    // A purchase: the comma after its type, and from there the newline, the
+    // comma between product and price (as a bit) and which of the two open
+    // with a quote.
+    region: *const u8,
+    reach: u32,
+    last_comma: u32,
+    opened: u32,
+}
+
+impl LeanFrame {
+    /// The frame of a chunk in index mode (`ctx.keys` is set).
+    pub fn new(ctx: &Ctx) -> Self {
+        let keys = ctx.keys.as_ref().expect("the kernel in assembly is for index mode");
+        // `unscramble` is `(pre(s) ^ key) * A' & MASK` and `pre(s)` is
+        // `f ^ f >> 17 ^ f >> 34` with `f = s * B' & MASK`: so A' is
+        // `unscramble(0, 1)`, and B' is `pre(1)` with its shifts undone.
+        let inverse_a = unscramble(0, 1);
+        let folded = pre(1);
+        let inverse_b = folded ^ (folded >> 17);
+        // A bound past every 40-bit number: nothing is at or above it.
+        let limit = |bound: u64| if bound > NUMBER_MASK { u64::MAX } else { bound << 24 };
+        Self {
+            next: std::ptr::null(),
+            window_length: (ctx.window_end - ctx.window_start) as u64,
+            inverse_b: inverse_b << 24,
+            inverse_a: inverse_a << 24,
+            event_key: (keys.event_key & NUMBER_MASK) << 24,
+            user_key: (keys.user_key & NUMBER_MASK) << 24,
+            index_limit: limit(keys.index_bound),
+            // A user number is its index times 512 plus an alias.
+            user_limit: limit(keys.user_bound.saturating_mul(512)),
+            region: std::ptr::null(),
+            reach: 0,
+            last_comma: 0,
+            opened: 0,
+        }
+    }
+}
+
+/// What the kernel in assembly read of a row.
+#[derive(Clone, Copy)]
+pub struct LeanRow {
+    /// 0: a `view` or `cart`, read. 2: a purchase, read up to its product
+    /// and price (`event_lean_purchase` reads those). 1: declined, and the
+    /// rest means nothing.
+    pub status: u64,
+    /// Milliseconds since the window's start, whatever the row's validity.
+    pub ts: u64,
+    pub ingest_seconds: u64,
+    pub index: u64,
+    pub user_number: u64,
+    /// All ones for a valid row (ts in the window, the row not late), else zero.
+    pub keep: u64,
+}
+
+/// The lean kernel in assembly on the row at `p`, in index mode.
+///
+/// # Safety
+/// `p` must have `ROW_PAD` readable bytes after it and 16 before it; `lean`
+/// comes from `lean_setup` and `frame` from `LeanFrame::new` with the same
+/// `ctx`.
+#[inline(always)]
+pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut LeanFrame) -> LeanRow {
+    use std::mem::offset_of;
+    let (status, ts, ingest_seconds, index, user_number, keep): (u64, u64, u64, u64, u64, u64);
+    std::arch::asm!(
+        lean_row!(),
+        // The numbers come back at the bottom of their words.
+        "shr r9, 24",
+        "shr r10, 24",
+        in("rdi") p,
+        in("rsi") lean,
+        in("rdx") frame,
+        lateout("r15") status,
+        lateout("rax") ts,
+        lateout("rcx") ingest_seconds,
+        lateout("r9") index,
+        lateout("r10") user_number,
+        lateout("r12") keep,
+        out("r8") _, out("r11") _, out("r13") _, out("r14") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+        comma = const offset_of!(LeanTables, comma),
+        quote = const offset_of!(LeanTables, quote),
+        newline = const offset_of!(LeanTables, newline),
+        ingest_close = const offset_of!(LeanTables, ingest_close),
+        type_masks = const offset_of!(LeanTables, type_masks),
+        type_texts = const offset_of!(LeanTables, type_texts),
+        type_step = const offset_of!(LeanTables, type_step),
+        purchase = const offset_of!(LeanTables, purchase),
+        late_bias = const offset_of!(LeanTables, late_bias),
+        late_limit = const offset_of!(LeanTables, late_limit),
+        tens = const offset_of!(LeanTables, tens),
+        id_digit = const offset_of!(LeanTables, id_digit),
+        nine = const offset_of!(LeanTables, nine),
+        id_letter = const offset_of!(LeanTables, id_letter),
+        twenty_five = const offset_of!(LeanTables, twenty_five),
+        id36_letter_value = const offset_of!(LeanTables, id36_letter_value),
+        id36_pairs = const offset_of!(LeanTables, id36_pairs),
+        id36_fours = const offset_of!(LeanTables, id36_fours),
+        id36_eights = const offset_of!(LeanTables, id36_eights),
+        id_ranges = const offset_of!(LeanTables, id_ranges),
+        offset_pattern = const offset_of!(LeanTables, offset_pattern),
+        offset_limit = const offset_of!(LeanTables, offset_limit),
+        offset_shuffle = const offset_of!(LeanTables, offset_shuffle),
+        offset_ceilings = const offset_of!(LeanTables, offset_ceilings),
+        offset_weights = const offset_of!(LeanTables, offset_weights),
+        form_mid = const offset_of!(LeanTables, form_of_length) + 128,
+        offset_form = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, offset),
+        plain_start = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, plain) + offset_of!(TimeForm, start),
+        day = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, day),
+        f_pattern = const offset_of!(TimeForm, pattern),
+        f_limit = const offset_of!(TimeForm, limit),
+        f_shuffle = const offset_of!(TimeForm, shuffle),
+        f_ceilings = const offset_of!(TimeForm, ceilings),
+        f_first = const offset_of!(TimeForm, first),
+        f_second = const offset_of!(TimeForm, second),
+        f_index_mask = const offset_of!(TimeForm, index_mask),
+        f_year_mask = const offset_of!(TimeForm, year_mask),
+        f_high_mask = const offset_of!(TimeForm, high_mask),
+        f_scale = const offset_of!(TimeForm, scale),
+        f_start = const offset_of!(TimeForm, start),
+        f_day = const FORM_DAY,
+        next = const offset_of!(LeanFrame, next),
+        window_length = const offset_of!(LeanFrame, window_length),
+        inverse_b = const offset_of!(LeanFrame, inverse_b),
+        inverse_a = const offset_of!(LeanFrame, inverse_a),
+        event_key = const offset_of!(LeanFrame, event_key),
+        user_key = const offset_of!(LeanFrame, user_key),
+        index_limit = const offset_of!(LeanFrame, index_limit),
+        user_limit = const offset_of!(LeanFrame, user_limit),
+        region = const offset_of!(LeanFrame, region),
+        reach = const offset_of!(LeanFrame, reach),
+        last_comma = const offset_of!(LeanFrame, last_comma),
+        opened = const offset_of!(LeanFrame, opened),
+        options(nostack),
+    );
+    LeanRow { status, ts, ingest_seconds, index, user_number, keep }
+}
+
+/// The end of a purchase `event_lean_asm` read (status 2): its price and its
+/// product's category, as `event_lean` reads them, and then the row is
+/// stored or handed back like any other.
+///
+/// # Safety
+/// `frame` is the one `event_lean_asm` just filled for this row.
+#[inline(always)]
+pub unsafe fn event_lean_purchase<const MODE: u32>(
+    ctx: &Ctx,
+    frame: &LeanFrame,
+    read: LeanRow,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> u32 {
+    let mut valid = read.keep != 0;
+    let mut purchase = None;
+    if valid {
+        let region_at = frame.region;
+        let reach = frame.reach as usize;
+        let r5 = frame.last_comma.trailing_zeros() as usize;
+        let q5 = (frame.opened & 1) as usize;
+        let q6 = ((frame.opened >> 1) & 1) as usize;
+        let price = std::slice::from_raw_parts(region_at.add(r5 + 1 + q6), reach - r5 - 1 - 2 * q6);
+        match parse_price(price) {
+            Some(price) => purchase = Some((price, product_category(ctx, region_at.add(1 + q5), r5 - 1 - 2 * q5))),
+            None => valid = false,
+        }
+    }
+    event_lean_finish::<MODE, true>(
+        out,
+        row,
+        read.index,
+        read.user_number,
+        read.ts,
+        valid,
+        read.ingest_seconds as i64,
+        purchase,
+    )
+}
+
+/// The end of a `view` or `cart` `event_lean_asm` read (status 0).
+///
+/// # Safety
+/// As `event_lean_finish`.
+#[inline(always)]
+pub unsafe fn event_lean_common<const MODE: u32>(read: LeanRow, out: &mut ParseOut, row: &mut EventRow) -> u32 {
+    if MODE == MODE_STORE {
+        // What `event_lean_finish` stores, with the row's validity as the
+        // mask it comes as: an invalid row keeps neither its time nor its
+        // user, and a valid one's user is its number.
+        let valid = read.keep & 1;
+        emit_indexed(
+            out,
+            read.index,
+            read.ts & read.keep,
+            valid,
+            read.user_number & read.keep,
+            valid,
+            read.ingest_seconds,
+            None,
+        );
+        return ROW_DONE;
+    }
+    event_lean_finish::<MODE, true>(
+        out,
+        row,
+        read.index,
+        read.user_number,
+        read.ts,
+        read.keep != 0,
+        read.ingest_seconds as i64,
+        None,
+    )
+}
+
 /// The tables of the lean kernel and the window's length, for `event_lean`.
 #[inline(always)]
 pub fn lean_setup(ctx: &Ctx) -> (*const LeanTables, u64) {
@@ -1151,6 +2078,61 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
         return event_row_fast::<MODE, INDEXED>(ctx, p, out, row);
     }
     (length, status)
+}
+
+/// As `event_row_lean` in index mode, with the kernel in assembly in front
+/// of that: the same answers again. `frame` is the chunk's.
+///
+/// # Safety
+/// As `event_row_lean`, and 16 bytes before `p` must be readable too.
+#[inline(always)]
+pub unsafe fn event_row_lean_asm<const MODE: u32>(
+    ctx: &Ctx,
+    frame: &mut LeanFrame,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, u32) {
+    let (lean, _window_length) = lean_setup(ctx);
+    let read = event_lean_asm(lean, p, frame);
+    #[cfg(test)]
+    if MODE == MODE_ROW {
+        // The assembly must take exactly the rows `event_lean` takes that
+        // end where the early look said, and read the same from them.
+        let mut twin = EventRow::default();
+        let (length, guess, status) = event_lean::<MODE, true>(ctx, lean, _window_length, p, out, &mut twin);
+        let taken = status == ROW_EMIT && length == guess;
+        assert_eq!(read.status != 1, taken, "the assembly and the lean kernel take different rows");
+        if taken {
+            assert_eq!(frame.next, p.add(length + 1), "the assembly ends the row elsewhere");
+            assert_eq!(read.status == 2, purchase_text(p, length), "a purchase or not");
+            let mut mine = EventRow::default();
+            let finished = if read.status == 2 {
+                event_lean_purchase::<MODE>(ctx, frame, read, out, &mut mine)
+            } else {
+                event_lean_common::<MODE>(read, out, &mut mine)
+            };
+            assert!(finished == ROW_EMIT && mine == twin, "the assembly reads {mine:?}, the lean kernel {twin:?}");
+        }
+    }
+    if read.status == 0 {
+        let length = frame.next.offset_from(p) as usize - 1;
+        return (length, event_lean_common::<MODE>(read, out, row));
+    }
+    if read.status == 2 {
+        let length = frame.next.offset_from(p) as usize - 1;
+        return (length, event_lean_purchase::<MODE>(ctx, frame, read, out, row));
+    }
+    event_row_lean::<MODE, true>(ctx, p, out, row)
+}
+
+/// Whether the row at `p` has `purchase` as its fifth field (in a test: the
+/// row is one the lean kernel took).
+#[cfg(test)]
+unsafe fn purchase_text(p: *const u8, length: usize) -> bool {
+    let line = std::slice::from_raw_parts(p, length);
+    let field = line.split(|&byte| byte == b',').nth(4).unwrap_or(b"");
+    field == b"purchase" || field == b"\"purchase\""
 }
 
 /// The number written as 1 to 7 ASCII digits with no leading zero at `p`;
@@ -1895,6 +2877,8 @@ mod tests {
         lean_clicks: [usize; 2],
         /// The lean click kernels' view of the window.
         frame: ClickFrame,
+        /// The frame of the event kernel in assembly.
+        lean_frame: LeanFrame,
         /// Clicks whose user the indexed form turns into a number.
         numbered: usize,
         /// Generated IDs and good times, for the probes to build rows from.
@@ -1924,6 +2908,7 @@ mod tests {
             ctx.keys = Some(keys);
             let out = ParseOut::new(&ctx);
             let frame = ClickFrame::new(&ctx);
+            let lean_frame = LeanFrame::new(&ctx);
             // Generated IDs of 8 characters.
             let event_id = (1_000..).map(|index| base36(scramble(index, keys.event_key))).find(|id| id.len() == 8);
             let user_id = (700..).map(|user| base36(scramble(user << 9 | 3, keys.user_key))).find(|id| id.len() == 8);
@@ -1939,6 +2924,7 @@ mod tests {
                 answered: [0; 8],
                 lean_clicks: [0; 2],
                 frame,
+                lean_frame,
                 numbered: 0,
                 event_id: format!("e{}", event_id.unwrap()),
                 user_id: format!("u{}", user_id.unwrap()),
@@ -1948,17 +2934,19 @@ mod tests {
             }
         }
 
-        /// `line`, then a newline, then enough of a tail, with a newline in front.
+        /// `line`, then a newline, then enough of a tail, with the end of
+        /// a row in front (the event kernel in assembly reads 16 bytes back).
         fn load(&mut self, line: &[u8], tail: &[u8]) -> *const u8 {
+            const BEFORE: &[u8; 16] = b"e,u,1,2,view,p,\n";
             self.buffer.clear();
-            self.buffer.push(b'\n');
+            self.buffer.extend_from_slice(BEFORE);
             self.buffer.extend_from_slice(line);
             self.buffer.push(b'\n');
             while self.buffer.len() < line.len() + 2 * ROW_PAD {
                 self.buffer.extend_from_slice(tail);
             }
-            // SAFETY: the buffer is longer than one byte.
-            unsafe { self.buffer.as_ptr().add(1) }
+            // SAFETY: the buffer is longer than that.
+            unsafe { self.buffer.as_ptr().add(BEFORE.len()) }
         }
 
         fn event_with(&mut self, line: &[u8], tail: &[u8]) {
@@ -1974,7 +2962,9 @@ mod tests {
                         0 => event_row_fast::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
                         1 => event_row_lean::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
                         2 => event_row_fast::<MODE_ROW, true>(&self.ctx, p, &mut self.out, &mut row),
-                        _ => event_row_lean::<MODE_ROW, true>(&self.ctx, p, &mut self.out, &mut row),
+                        // With the assembly in front, which checks itself
+                        // against the lean kernel on every row.
+                        _ => event_row_lean_asm::<MODE_ROW>(&self.ctx, &mut self.lean_frame, p, &mut self.out, &mut row),
                     }
                 };
                 if status != ROW_LONG {
