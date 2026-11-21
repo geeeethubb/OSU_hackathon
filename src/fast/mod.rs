@@ -579,7 +579,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     Ok(true)
 }
 
-/// Rows per row group of the output files: small enough that a row group is
+/// Rows per row group of user_daily: small enough that a row group is
 /// encoded in a buffer that stays in the cache, large enough that page
 /// headers and the footer stay negligible.
 const GROUP_ROWS: usize = parquet::MAX_GROUP_ROWS;
