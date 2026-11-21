@@ -70,13 +70,16 @@ pub struct ScratchI {
     /// whatever an earlier partition left in a slot is never taken for a
     /// record, and nothing is cleared between partitions.
     tag: u64,
+    /// How the lists are read (`PLACE_PLAIN` and the others).
+    mode: u8,
 }
 
 impl ScratchI {
     /// For partitions of `1 << index_shift` indexes.
     pub fn new(index_shift: u32) -> Self {
         let slots = 1usize << index_shift;
-        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0 }
+        let mode = std::env::var("SS_PLACE").ok().and_then(|value| value.parse().ok()).unwrap_or(PLACE_PLAIN);
+        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0, mode }
     }
 
     /// Word 0 of a slot that holds a valid event of a generated user ID of
@@ -87,8 +90,128 @@ impl ScratchI {
     }
 }
 
+/// One record into the slot of its index, if it is the first copy the
+/// partition has there or one with a smaller ingest_ts. Returns whether it
+/// was written.
+#[inline(always)]
+fn put(slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64, word0: u64, word1: u64, purchase: u64) -> bool {
+    let slot = (word0 >> 48) as usize & (slots.len() - 1);
+    let held = slots[slot];
+    // Step 2 of the rules: the copy with the smallest ingest_ts wins (the
+    // first seen among equal ones, which are identical).
+    let first = held[0] >> TAG_SHIFT != tag;
+    let wins = first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK);
+    if wins {
+        slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
+        // Only a purchase writes its word: every reader looks at
+        // `purchases[slot]` only when the slot's winner has the purchase
+        // bit, and that winner wrote it here. What an earlier winner or
+        // partition left is never read.
+        if word1 & 1 == 1 {
+            purchases[slot] = purchase;
+        }
+    }
+    wins
+}
+
+/// The records of one block into their slots. Returns whether any was written.
+#[inline(always)]
+fn place_block(block: &[u64], slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64) -> bool {
+    let mut any = false;
+    let mut at = 0;
+    while at < block.len() {
+        // Blocks hold whole records: two words, plus one for a purchase.
+        let (word0, word1) = (block[at], block[at + 1]);
+        let has_purchase = (word1 & 1) as usize;
+        let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
+        at += 2 + has_purchase;
+        any |= put(slots, purchases, tag, word0, word1, purchase);
+    }
+    any
+}
+
+/// `place_block` with the slots asked for a window of records ahead of the
+/// writes: the slot table does not stay in the nearest cache while two
+/// threads share a core.
+#[inline(always)]
+fn place_block_ahead(block: &[u64], slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64) -> bool {
+    const WINDOW: usize = 32;
+    let mut starts = [0usize; WINDOW];
+    let mut any = false;
+    let mut at = 0;
+    while at < block.len() {
+        let mut count = 0;
+        while count < WINDOW && at < block.len() {
+            let slot = (block[at] >> 48) as usize & (slots.len() - 1);
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                // SAFETY: a prefetch reads nothing; the address is inside the table.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(slots.as_ptr().add(slot) as *const i8) };
+            }
+            let _ = slot;
+            starts[count] = at;
+            count += 1;
+            at += 2 + (block[at + 1] & 1) as usize;
+        }
+        for &start in &starts[..count] {
+            let (word0, word1) = (block[start], block[start + 1]);
+            let purchase = if word1 & 1 == 1 { block[start + 2] } else { 0 };
+            any |= put(slots, purchases, tag, word0, word1, purchase);
+        }
+    }
+    any
+}
+
+/// Asks for every cache line of a block: the lists were written long ago by
+/// other threads, and a block is too short for the hardware prefetcher to
+/// get ahead of the reader.
+#[inline(always)]
+fn prefetch(block: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut at = 0;
+        while at < block.len() {
+            // SAFETY: a prefetch reads nothing; the address is inside the block.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(block.as_ptr().add(at) as *const i8) };
+            at += 8;
+        }
+        if let Some(last) = block.last() {
+            // SAFETY: as above.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(last as *const u64 as *const i8) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = block;
+}
+
+/// How `place` reads the lists (`SS_PLACE`, for A/B runs; the slot table
+/// is the same whichever it is).
+pub const PLACE_PLAIN: u8 = 0;
+/// The next block of a list is asked for while the current one is read.
+pub const PLACE_NEXT_BLOCK: u8 = 1;
+/// The lists are read a block at a time in turn, each list's next block
+/// asked for a whole round before it is read.
+pub const PLACE_IN_TURN: u8 = 2;
+/// `PLACE_NEXT_BLOCK`, and the slots are asked for a window of records
+/// before they are written.
+pub const PLACE_SLOTS_AHEAD: u8 = 3;
+
 /// Places a partition's records by index. Returns whether there were any.
 fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
+    match scratch.mode {
+        PLACE_NEXT_BLOCK => place_as::<PLACE_NEXT_BLOCK>(lists, scratch),
+        PLACE_IN_TURN => place_as::<PLACE_IN_TURN>(lists, scratch),
+        PLACE_SLOTS_AHEAD => place_as::<PLACE_SLOTS_AHEAD>(lists, scratch),
+        _ => place_as::<PLACE_PLAIN>(lists, scratch),
+    }
+}
+
+/// `place`, reading the lists the way `MODE` says. The order in which the
+/// records are read does not matter: copies of one event with equal
+/// ingest_ts are identical.
+fn place_as<const MODE: u8>(lists: &[PartList], scratch: &mut ScratchI) -> bool {
     if scratch.tag == TAG_MAX {
         // Out of tags (2^31 partitions on one thread): start over.
         scratch.slots.fill([0; 2]);
@@ -96,33 +219,51 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
     }
     scratch.tag += 1;
     let tag = scratch.tag;
+    let (slots, purchases) = (&mut scratch.slots[..], &mut scratch.purchases[..]);
     let mut any = false;
-    for list in lists {
-        for block in list.blocks() {
-            let mut at = 0;
-            while at < block.len() {
-                // Blocks hold whole records: two words, plus one for a purchase.
-                let (word0, word1) = (block[at], block[at + 1]);
-                let has_purchase = (word1 & 1) as usize;
-                let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
-                at += 2 + has_purchase;
-                let slot = (word0 >> 48) as usize & (scratch.slots.len() - 1);
-                let held = scratch.slots[slot];
-                // Step 2 of the rules: the copy with the smallest ingest_ts
-                // wins (the first seen among equal ones, which are identical).
-                let first = held[0] >> TAG_SHIFT != tag;
-                if first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK) {
-                    scratch.slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
-                    // Only a purchase writes its word: every reader looks at
-                    // `purchases[slot]` only when the slot's winner has the
-                    // purchase bit, and that winner wrote it here. What an
-                    // earlier winner or partition left is never read.
-                    if has_purchase == 1 {
-                        scratch.purchases[slot] = purchase;
-                    }
-                    any = true;
+    if MODE == PLACE_IN_TURN {
+        let mut readers: Vec<_> = lists.iter().map(PartList::blocks).collect();
+        let mut ahead: Vec<Option<&[u64]>> = readers.iter_mut().map(Iterator::next).collect();
+        for block in ahead.iter().flatten() {
+            prefetch(block);
+        }
+        let mut left = true;
+        while left {
+            left = false;
+            for (reader, next) in readers.iter_mut().zip(ahead.iter_mut()) {
+                let Some(block) = next.take() else {
+                    continue;
+                };
+                *next = reader.next();
+                if let Some(following) = *next {
+                    prefetch(following);
+                    left = true;
                 }
+                any |= place_block(block, slots, purchases, tag);
             }
+        }
+        return any;
+    }
+    for list in lists {
+        if MODE == PLACE_PLAIN {
+            for block in list.blocks() {
+                any |= place_block(block, slots, purchases, tag);
+            }
+            continue;
+        }
+        let mut blocks = list.blocks();
+        let mut following = blocks.next();
+        while let Some(block) = following {
+            // The block after this one arrives while this one is read.
+            following = blocks.next();
+            if let Some(next) = following {
+                prefetch(next);
+            }
+            any |= if MODE == PLACE_SLOTS_AHEAD {
+                place_block_ahead(block, slots, purchases, tag)
+            } else {
+                place_block(block, slots, purchases, tag)
+            };
         }
     }
     any
@@ -306,6 +447,11 @@ impl Extras {
                 }
             }
         }
+        // In time order: merged into its user's run that way, an extra does
+        // not put the run's events out of order.
+        for (_, records) in extras.by_user.values_mut() {
+            records.sort_by_key(|record| (record[0] >> 1) & TS_MASK);
+        }
         extras
     }
 
@@ -415,9 +561,18 @@ pub struct Runner {
     place: ScratchI,
     kernel: ScratchC,
     /// Whether the main persons of direct runs go to the session kernel in
-    /// batches. `SS_BATCH=0` does them one at a time instead, for A/B runs:
-    /// the same rows either way.
+    /// batches. `SS_BATCH=0` does them one at a time instead and
+    /// `SS_BATCH=<n>` sets how many persons a batch holds, for A/B runs: the
+    /// same rows either way.
     batched: bool,
+    /// Whether the assists of a partition are kept in the session kernel's
+    /// small table until `flush` instead of going to the output partition
+    /// by partition (`SS_ASSISTS=1`), and whether the sessions a batch
+    /// credits to campaigns are kept the same way (`SS_ASSISTS=2`; the
+    /// runner still has to tell the kernel). For A/B runs: the same cells
+    /// either way.
+    hold_assists: bool,
+    hold_sessions: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
     aliases: Vec<[u64; 2]>,
@@ -443,19 +598,28 @@ pub struct Runner {
     pub inline_persons: u64,
     pub inline_events: u64,
     pub general_events: u64,
-    /// With `measure`: nanoseconds spent placing records and inside the session kernel.
+    /// With `measure`: nanoseconds spent placing records, inside the session
+    /// kernel, and on the assists at the end of a partition.
     pub measure: bool,
     pub place_nanos: u64,
     pub kernel_nanos: u64,
+    pub flush_nanos: u64,
     pub total_nanos: u64,
 }
 
 impl Runner {
-    pub fn new(kernel: ScratchC, index_shift: u32) -> Self {
+    pub fn new(mut kernel: ScratchC, index_shift: u32) -> Self {
+        let batch = std::env::var("SS_BATCH").ok().and_then(|value| value.parse::<usize>().ok());
+        if let Some(persons) = batch.filter(|&persons| persons > 0) {
+            kernel.set_batch_persons(persons);
+        }
+        let hold = std::env::var("SS_ASSISTS").ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
         Self {
             place: ScratchI::new(index_shift),
             kernel,
-            batched: !std::env::var_os("SS_BATCH").is_some_and(|value| value == "0"),
+            batched: batch != Some(0),
+            hold_assists: hold >= 1,
+            hold_sessions: hold >= 2,
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
@@ -474,6 +638,7 @@ impl Runner {
             measure: false,
             place_nanos: 0,
             kernel_nanos: 0,
+            flush_nanos: 0,
             total_nanos: 0,
         }
     }
@@ -497,6 +662,11 @@ impl Runner {
         }
         if !any {
             return;
+        }
+        if self.hold_sessions {
+            // Once: the kernel's table is as long as the output's.
+            self.hold_sessions = false;
+            self.kernel.hold_sessions(c_out.campaign_days.len());
         }
         if self.batched {
             self.read::<true>(shared, part, b_out, c_out);
@@ -706,7 +876,15 @@ impl Runner {
         }
         self.records = records;
         self.finish_batch(shared, c_out);
-        self.kernel.flush(c_out);
+        let started = self.measure.then(std::time::Instant::now);
+        if self.hold_assists {
+            self.kernel.hold_assists(c_out);
+        } else {
+            self.kernel.flush(c_out);
+        }
+        if let Some(started) = started {
+            self.flush_nanos += started.elapsed().as_nanos() as u64;
+        }
         if !c_out.names.is_empty() {
             // A thread handles about `parts / threads` partitions like this one.
             self.kernel.reserve_rows(c_out, c_out.names.len() * shared.parts / shared.threads * 3 / 2);
@@ -793,8 +971,9 @@ impl Runner {
         }
         if !self.others.is_empty() {
             // Rare: IDs of one user that no link joins are separate persons.
+            // The sort keeps each one's events in the order they came.
             let mut others = std::mem::take(&mut self.others);
-            others.sort_unstable_by_key(|other| other[0]);
+            others.sort_by_key(|other| other[0]);
             let mut from = 0;
             while from < others.len() {
                 let number = others[from][0];
@@ -820,13 +999,17 @@ impl Runner {
         }
     }
 
-    /// Adds the assists still pending after runs processed outside `partition`.
+    /// Adds the assists still pending after runs processed outside
+    /// `partition`, and the ones the partitions have held back
+    /// (`SS_ASSISTS=1`). Must be called after the runner's last partition
+    /// and run, with the output it has been writing to.
     pub fn flush(&mut self, c_out: &mut PassCOut) {
         self.kernel.flush(c_out);
     }
 
     /// Hands the session kernel back, for the general pass that follows.
     pub fn into_kernel(self) -> ScratchC {
+        assert!(!self.kernel.holds_assists(), "Runner::flush was not called after the runner's last partition");
         self.kernel
     }
 
@@ -834,6 +1017,11 @@ impl Runner {
     /// them), given in pieces and in any order, each ID resolved through the
     /// link table: each simple person in it goes to the session kernel,
     /// events of complex components go to their persons' partitions.
+    ///
+    /// The user's extras are merged in by time. In generated data the
+    /// pieces are in time order, so every person's events then reach the
+    /// kernel in order and it does not have to order them; a whale with a
+    /// few odd-ID events used to cost a second pass over all its events.
     pub fn process_run(
         &mut self,
         shared: &Shared,
@@ -856,33 +1044,32 @@ impl Runner {
         self.others.clear();
         // The first simple person met; codes are never 0.
         let mut first = 0u64;
-        for &[word0, word1, purchase] in pieces.iter().copied().chain(std::iter::once(extra)).flatten() {
-            let name = resolve(&mut self.aliases, self.run, shared, word1 >> 22);
-            let ts = (word0 >> 1) & TS_MASK;
-            let is_purchase = word1 & 1;
-            if name & COMPLEX != 0 {
-                forward_named(b_out, name & CODE_MASK, word0, is_purchase, purchase);
-                self.general_events += 1;
-                continue;
-            }
-            if first == 0 {
-                first = name;
-            }
-            if name == first {
-                self.ts.push(ts as u32);
-                if is_purchase == 1 {
-                    self.purchases.push([ts, purchase]);
+        // The extras not merged in yet; they are in time order.
+        let mut waiting = extra;
+        for piece in pieces {
+            for &record in *piece {
+                let ts = (record[0] >> 1) & TS_MASK;
+                while let Some((&early, rest)) = waiting.split_first() {
+                    if (early[0] >> 1) & TS_MASK >= ts {
+                        break;
+                    }
+                    self.sort_out(shared, b_out, &mut first, early);
+                    waiting = rest;
                 }
-            } else {
-                self.others.push([name, (ts << 1) | is_purchase, purchase]);
+                self.sort_out(shared, b_out, &mut first, record);
             }
+        }
+        for &late in waiting {
+            self.sort_out(shared, b_out, &mut first, late);
         }
         if first != 0 {
             self.person(shared, c_out, user, first);
             if !self.others.is_empty() {
-                // Rare: IDs of one user that no link joins are separate persons.
+                // Rare: IDs of one user that no link joins are separate
+                // persons. The sort keeps each one's events in the order
+                // they came, which is time order when the run's was.
                 let mut others = std::mem::take(&mut self.others);
-                others.sort_unstable_by_key(|other| other[0]);
+                others.sort_by_key(|other| other[0]);
                 let mut from = 0;
                 while from < others.len() {
                     let name = others[from][0];
@@ -900,6 +1087,33 @@ impl Runner {
                 }
                 self.others = others;
             }
+        }
+    }
+
+    /// One event of the run `process_run` is reading: on to its person's
+    /// partition if its ID belongs to a complex component, to the events of
+    /// the first simple person met (`first`), or to the others'.
+    #[inline(always)]
+    fn sort_out(&mut self, shared: &Shared, b_out: &mut PassBOut, first: &mut u64, record: Record) {
+        let [word0, word1, purchase] = record;
+        let name = resolve(&mut self.aliases, self.run, shared, word1 >> 22);
+        let ts = (word0 >> 1) & TS_MASK;
+        let is_purchase = word1 & 1;
+        if name & COMPLEX != 0 {
+            forward_named(b_out, name & CODE_MASK, word0, is_purchase, purchase);
+            self.general_events += 1;
+            return;
+        }
+        if *first == 0 {
+            *first = name;
+        }
+        if name == *first {
+            self.ts.push(ts as u32);
+            if is_purchase == 1 {
+                self.purchases.push([ts, purchase]);
+            }
+        } else {
+            self.others.push([name, (ts << 1) | is_purchase, purchase]);
         }
     }
 

@@ -813,6 +813,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             let sum = |count: fn(&indexed::Runner) -> u64| runners.iter().map(count).sum::<u64>();
             timing.detail("cpu_index_place", sum(|runner| runner.place_nanos) as f64 / 1e6);
             timing.detail("cpu_index_kernel", sum(|runner| runner.kernel_nanos) as f64 / 1e6);
+            timing.detail("cpu_index_flush", sum(|runner| runner.flush_nanos) as f64 / 1e6);
             timing.detail("cpu_index_partitions", sum(|runner| runner.total_nanos) as f64 / 1e6);
             eprintln!(
                 "SS_TIMING note=index inline_persons={} inline_events={} general_events={} chains={} extras={} click_index={}",
