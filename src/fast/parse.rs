@@ -785,12 +785,12 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        click_row_fast, click_row_lean, ClickFrame, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG,
-        ROW_PAD,
+        click_row_fast, click_row_lean, click_row_shapes, ClickFrame, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, ROW_DONE,
+        ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD,
     };
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
-    // The lean kernel's view of the window: a local, so that the kernel's
+    // The lean kernels' view of the window: a local, so that a kernel's
     // loads from it are known not to change under the loop's stores.
     let frame = ClickFrame::new(ctx);
     let mut click = ClickRecord::default();
@@ -798,10 +798,10 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
-            if KERNEL == KERNEL_GENERAL {
-                click_row_fast::<INDEXED>(ctx, p, &mut click)
-            } else {
-                click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click)
+            match KERNEL {
+                KERNEL_GENERAL => click_row_fast::<INDEXED>(ctx, p, &mut click),
+                KERNEL_LEAN => click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click),
+                _ => click_row_shapes::<MODE, INDEXED>(ctx, &frame, p, out, &mut click),
             }
         };
         if status == ROW_DONE {
@@ -850,7 +850,7 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     position
 }
 
-/// `clicks_rows_loop` with the click kernel of this run.
+/// `clicks_rows_loop` with one of the click kernels (`simd::KERNEL_*`).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn clicks_fast_loop<const MODE: u32, const INDEXED: bool>(
@@ -859,25 +859,45 @@ fn clicks_fast_loop<const MODE: u32, const INDEXED: bool>(
     position: usize,
     end: usize,
     out: &mut ParseOut,
+    kernel: u32,
 ) -> usize {
-    use super::simd::{click_kernel, KERNEL_GENERAL, KERNEL_LEAN};
-    match click_kernel() {
+    use super::simd::{KERNEL_GENERAL, KERNEL_LEAN, KERNEL_SHAPES};
+    match kernel {
         KERNEL_GENERAL => clicks_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
-        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        KERNEL_LEAN => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_SHAPES>(ctx, buffer, position, end, out),
     }
 }
 
 pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
+    #[cfg(target_arch = "x86_64")]
+    let kernel = super::simd::click_kernel();
+    #[cfg(not(target_arch = "x86_64"))]
+    let kernel = 0;
+    parse_clicks_chunk_with(ctx, buffer, start, end, out, kernel);
+}
+
+/// `parse_clicks_chunk` with the click kernel named (`simd::KERNEL_*`), so
+/// that one process can run both.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+pub fn parse_clicks_chunk_with(
+    ctx: &Ctx,
+    buffer: &[u8],
+    start: usize,
+    end: usize,
+    out: &mut ParseOut,
+    kernel: u32,
+) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
     if ctx.fast_rows {
         use super::simd::{MODE_ROW, MODE_STORE};
         position = match (ctx.keys.is_some(), ctx.verify) {
-            (true, true) => clicks_fast_loop::<MODE_ROW, true>(ctx, buffer, position, end, out),
-            (true, false) => clicks_fast_loop::<MODE_STORE, true>(ctx, buffer, position, end, out),
-            (false, true) => clicks_fast_loop::<MODE_ROW, false>(ctx, buffer, position, end, out),
-            (false, false) => clicks_fast_loop::<MODE_STORE, false>(ctx, buffer, position, end, out),
+            (true, true) => clicks_fast_loop::<MODE_ROW, true>(ctx, buffer, position, end, out, kernel),
+            (true, false) => clicks_fast_loop::<MODE_STORE, true>(ctx, buffer, position, end, out, kernel),
+            (false, true) => clicks_fast_loop::<MODE_ROW, false>(ctx, buffer, position, end, out, kernel),
+            (false, false) => clicks_fast_loop::<MODE_STORE, false>(ctx, buffer, position, end, out, kernel),
         };
     }
     lines_from(buffer, position, end, |line| {
