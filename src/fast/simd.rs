@@ -56,7 +56,17 @@ pub struct TsTables {
     /// `[year index << 12 | month << 5 | day]` -> day offset, or 0xFF for
     /// every date that is invalid or outside the table's range.
     date: [u8; 2 << 12],
+    /// The same days for the lean kernels, in a table small enough to stay
+    /// in the cache whatever a row holds: slot `(month & 3) << 5 | day` has
+    /// the one table day that lands there, as `year text | (month * 32 +
+    /// day) << 32`; `u64::MAX` (which no row can produce) where there is none.
+    day_key: [u64; DAY_SLOTS],
+    /// Seconds from day offset 0 to the start of the slot's day.
+    day_seconds: [u32; DAY_SLOTS],
 }
+
+/// 62 days in a row touch at most four months, which differ in `month & 3`.
+const DAY_SLOTS: usize = 128;
 
 impl TsTables {
     pub fn new(window_start: i64, ingest_base_seconds: i64) -> Self {
@@ -65,15 +75,6 @@ impl TsTables {
         // records can hold.
         let base_day = window_start.div_euclid(DAY_MS) - 9;
         let (year0, _, _) = civil_from_days(base_day);
-        let mut date = [0xFFu8; 2 << 12];
-        for offset in 0..62 {
-            let (year, month, day) = civil_from_days(base_day + offset);
-            let year_index = (year - year0) as usize;
-            // A year past 9999 has no four-digit text, so its days stay out.
-            if year_index <= 1 && year <= 9999 {
-                date[(year_index << 12) | ((month as usize) << 5) | day as usize] = offset as u8;
-            }
-        }
         let text = |year: i64| {
             let digits = [
                 b'0' + (year / 1000 % 10) as u8,
@@ -83,11 +84,32 @@ impl TsTables {
             ];
             u32::from_le_bytes(digits)
         };
+        let mut date = [0xFFu8; 2 << 12];
+        let mut day_key = [u64::MAX; DAY_SLOTS];
+        let mut day_seconds = [0u32; DAY_SLOTS];
+        for offset in 0..62 {
+            let (year, month, day) = civil_from_days(base_day + offset);
+            // A year past 9999 has no four-digit text, so its days stay out.
+            if year > 9999 {
+                continue;
+            }
+            let year_index = (year - year0) as usize;
+            if year_index <= 1 {
+                date[(year_index << 12) | ((month as usize) << 5) | day as usize] = offset as u8;
+            }
+            // The key holds the whole date, so a slot can only ever answer
+            // for the day stored in it.
+            let slot = (((month & 3) << 5) | day) as usize;
+            day_key[slot] = u64::from(text(year)) | (((month * 32 + day) as u64) << 32);
+            day_seconds[slot] = (offset * 86_400) as u32;
+        }
         Self {
             year_text: [text(year0), text(year0 + 1)],
             base_ms: base_day * DAY_MS,
             ingest_adjust: base_day * 86_400 - ingest_base_seconds,
             date,
+            day_key,
+            day_seconds,
         }
     }
 }
@@ -616,6 +638,371 @@ pub unsafe fn event_row_fast<const MODE: u32, const INDEXED: bool>(
         purchase,
     };
     (length, ROW_EMIT)
+}
+
+// ---------------------------------------------------------------------------
+// The lean event kernel.
+//
+// It takes only rows of the generator's regular shape and declines every
+// other row, which then goes through `event_row_fast` above (and from there,
+// if need be, through the general parser). A row it takes has been checked
+// byte for byte: every byte of the row is either a comma, a quote or the
+// newline at a position the row's shape fixes, or part of a field whose
+// whole text was compared or classified. So a row the lean kernel stores is
+// well formed, and nothing about it is left to chance.
+//
+// The regular shape:
+//   event_id   `e` and 7 or 8 characters of [0-9a-z]
+//   user_id    `u` and 7 or 8 characters of [0-9a-z]
+//   ts         13 digits, or F1 or F2 on a day of the date table
+//   ingest_ts  F1 on a day of the date table
+//   event_type `view`, `cart` or `purchase`
+//   product_id not empty
+//   any field in quotes or not, 64 to 95 bytes in all.
+// What varies from row to row at random (the quotes, the three timestamp
+// forms, the ID lengths) is handled without branches; the branches left are
+// the checks that almost never fail, the 10% of F2 timestamps and the 3% of
+// purchases.
+// ---------------------------------------------------------------------------
+
+/// The lean kernel declines the row.
+const ROW_DECLINE: u32 = 6;
+
+/// The event kernels a fast loop can run.
+pub const KERNEL_GENERAL: u32 = 0;
+pub const KERNEL_LEAN: u32 = 1;
+
+/// The event kernel of this run: the lean one unless `SS_KERNEL=general`
+/// asks for `event_row_fast` alone (for A/B runs).
+pub fn event_kernel() -> u32 {
+    static KERNEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| match std::env::var("SS_KERNEL").as_deref() {
+        Ok("general") => KERNEL_GENERAL,
+        _ => KERNEL_LEAN,
+    })
+}
+
+/// Bytes 4..20 of an F1 timestamp, `-MM-DDTHH:MM:SSZ`, with `0` where a
+/// digit belongs, so XOR leaves digit values and zeros.
+#[inline(always)]
+unsafe fn tail_pattern() -> __m128i {
+    _mm_setr_epi8(
+        b'-' as i8, b'0' as i8, b'0' as i8, b'-' as i8, b'0' as i8, b'0' as i8, b'T' as i8, b'0' as i8, b'0' as i8,
+        b':' as i8, b'0' as i8, b'0' as i8, b':' as i8, b'0' as i8, b'0' as i8, b'Z' as i8,
+    )
+}
+
+/// Largest allowed value after the XOR: 9 for a digit, 0 for the rest.
+#[inline(always)]
+unsafe fn tail_limit() -> __m128i {
+    _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0)
+}
+
+/// Month, day, hour, minute, second digit pairs.
+#[inline(always)]
+unsafe fn tail_shuffle() -> __m128i {
+    _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, Z, Z, Z, Z, Z, Z)
+}
+
+/// Bytes 4..20 of two timestamps at once. For each: `month * 32 + day` in
+/// the low half and the second of the day in the high half of a word, and 16
+/// bits of a mask (the first timestamp's in the low half): bit `i` is set
+/// when byte `4 + i` is what F1 has there (a digit, or that very separator,
+/// or the `Z`) and belongs to no number over its bound (month 12, day 31,
+/// hour 23, minute 59, second 59). All 16 set: the 16 bytes are the end of
+/// an F1 timestamp, up to whether that day exists. Bits 0..15 set: the same
+/// up to the byte after the seconds.
+#[inline(always)]
+unsafe fn iso_tails(a: *const u8, b: *const u8) -> (u64, u64, u32) {
+    let text = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(a.add(4) as *const __m128i)),
+        _mm_loadu_si128(b.add(4) as *const __m128i),
+        1,
+    );
+    let twice = |lane: __m128i| _mm256_broadcastsi128_si256(lane);
+    let values = _mm256_xor_si256(text, twice(tail_pattern()));
+    let shaped = _mm256_cmpeq_epi8(_mm256_min_epu8(values, twice(tail_limit())), values);
+    let numbers = _mm256_maddubs_epi16(_mm256_shuffle_epi8(values, twice(tail_shuffle())), _mm256_set1_epi16(0x010A));
+    let over = _mm256_cmpgt_epi16(numbers, twice(iso_ceilings()));
+    let good = _mm256_movemask_epi8(_mm256_andnot_si256(over, shaped)) as u32;
+    let sums = _mm256_madd_epi16(numbers, twice(iso_weights()));
+    // Dword 1 gains the second (dword 2); dword 0 gains dword 3, which is zero.
+    let folded = _mm256_add_epi32(sums, _mm256_shuffle_epi32(sums, 0b11_11_10_11));
+    let low = _mm_cvtsi128_si64(_mm256_castsi256_si128(folded)) as u64;
+    let high = _mm_cvtsi128_si64(_mm256_extracti128_si256(folded, 1)) as u64;
+    (low, high, good)
+}
+
+/// The table day of a timestamp that starts at `start`, given its word from
+/// `iso_tails`: seconds from the tables' base to that second of that day,
+/// and whether the year, month and day are a day of the table at all (the
+/// seconds mean nothing if not). Month and day must be within their bounds
+/// (the mask of `iso_tails`) for the answer to hold.
+#[inline(always)]
+unsafe fn day_lookup(tables: &TsTables, start: *const u8, packed: u64) -> (i64, bool) {
+    let year = u64::from((start as *const u32).read_unaligned());
+    let slot = (packed & (DAY_SLOTS as u64 - 1)) as usize;
+    let known = *tables.day_key.get_unchecked(slot) == (year | (packed << 32));
+    (i64::from(*tables.day_seconds.get_unchecked(slot)) + (packed >> 32) as i64, known)
+}
+
+/// The number written as the 13 bytes at `p` (3 bytes before them must be
+/// readable), and whether all 13 are ASCII digits.
+#[inline(always)]
+unsafe fn digits13(p: *const u8) -> (i64, bool) {
+    let text = _mm_loadu_si128(p.sub(3) as *const __m128i);
+    let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let values = _mm_and_si128(_mm_xor_si128(text, _mm_set1_epi8(0x30)), keep);
+    let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(values, _mm_set1_epi8(9)), values)) == 0xFFFF;
+    let twos = _mm_maddubs_epi16(values, _mm_set1_epi16(0x010A));
+    let fours = _mm_madd_epi16(twos, _mm_set1_epi32(0x0001_0064));
+    let packed = _mm_packus_epi32(fours, fours);
+    let eights = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
+    let both = _mm_cvtsi128_si64(eights) as u64;
+    (((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32)) as i64, ok)
+}
+
+// What follows the ingest_ts of a regular row, from its comma on.
+const TYPE_VIEW: u64 = u64::from_le_bytes(*b",view,\0\0");
+const TYPE_CART: u64 = u64::from_le_bytes(*b",cart,\0\0");
+const TYPE_VIEW_QUOTED: u64 = u64::from_le_bytes(*b",\"view\",");
+const TYPE_CART_QUOTED: u64 = u64::from_le_bytes(*b",\"cart\",");
+/// The six bytes of the unquoted forms.
+const TYPE_SHORT: u64 = 0x0000_FFFF_FFFF_FFFF;
+const TYPE_PURCHASE: u64 = u64::from_le_bytes(*b",purchas");
+const TYPE_PURCHASE_QUOTED: u64 = u64::from_le_bytes(*b",\"purcha");
+
+/// The lean kernel's work on one row of 64 to 95 bytes, given the row's
+/// comma and quote masks: `*_low` for bytes 0..64, `*_high` for bytes 64..
+/// up to the newline, which is byte `64 + high_length`. Returns `ROW_DONE`
+/// (stored), `ROW_EMIT` (in `row`), or `ROW_DECLINE`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_decode_lean<const MODE: u32>(
+    ctx: &Ctx,
+    p: *const u8,
+    comma_low: u64,
+    quote_low: u64,
+    comma_high: u64,
+    quote_high: u64,
+    high_length: usize,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> u32 {
+    // The first three commas, and the quotes next to them: bit `i` of
+    // `after` is a quote right after comma `i`, of `before` right before it.
+    let c0 = comma_low.trailing_zeros() as usize;
+    let rest = comma_low & comma_low.wrapping_sub(1);
+    let c1 = rest.trailing_zeros() as usize;
+    let rest = rest & rest.wrapping_sub(1);
+    let c2 = rest.trailing_zeros() as usize;
+    if rest == 0 {
+        return ROW_DECLINE;
+    }
+    let after = _pext_u64(quote_low >> 1, comma_low);
+    let before = _pext_u64(quote_low << 1, comma_low);
+    let q0 = (quote_low & 1) as usize;
+    // Fields 0 to 2 open with a quote exactly when they close with one.
+    if (((after << 1) | q0 as u64) ^ before) & 7 != 0 {
+        return ROW_DECLINE;
+    }
+    let q1 = (after & 1) as usize;
+    let q2 = ((after >> 1) & 1) as usize;
+    let q3 = ((after >> 2) & 1) as usize;
+
+    // Both IDs: the prefix and 7 or 8 characters. The eight bytes after the
+    // prefix are the characters, or seven of them and the quote or comma
+    // that ends the field, which counts as no character.
+    let user_start = c0 + 1 + q1;
+    let event_extra = c0.wrapping_sub(2 * q0 + 8);
+    let user_extra = c1.wrapping_sub(c0 + 2 * q1 + 9);
+    if (event_extra | user_extra) > 1 || *p.add(q0) != b'e' || *p.add(user_start) != b'u' {
+        return ROW_DECLINE;
+    }
+    let (event_code, user_code, known) = two_codes(read_u64(p.add(q0 + 1)), read_u64(p.add(user_start + 1)));
+    if known != (0x7F7F | ((event_extra as u32) << 7) | ((user_extra as u32) << 15)) {
+        return ROW_DECLINE;
+    }
+
+    // Both timestamps. ingest_ts must be F1 on a table day, closed by its
+    // quote if it has one (its comma is checked with the event type).
+    let tables = &ctx.ts_tables;
+    let ts_start = c1 + 1 + q2;
+    let ts_length = c2.wrapping_sub(c1 + 1 + 2 * q2);
+    let ingest_start = c2 + 1 + q3;
+    let c3 = ingest_start + 20 + q3;
+    let (ts_packed, ingest_packed, good) = iso_tails(p.add(ts_start), p.add(ingest_start));
+    let (ts_seconds, ts_day) = day_lookup(tables, p.add(ts_start), ts_packed);
+    let (ingest_iso, ingest_day) = day_lookup(tables, p.add(ingest_start), ingest_packed);
+    let ingest_seconds = ingest_iso + tables.ingest_adjust;
+    if (good >> 16) != 0xFFFF
+        || !ingest_day
+        || (*p.add(c3 - 1) == b'"') != (q3 == 1)
+        || !(0..(1 << 21)).contains(&ingest_seconds)
+    {
+        return ROW_DECLINE;
+    }
+    let ingest_ms = tables.base_ms + ingest_iso * 1_000;
+
+    // ts: which of the three forms a row has is close to random, so both
+    // candidates are computed and one is picked without a branch.
+    let (digits, digits_ok) = digits13(p.add(ts_start));
+    let is_digits = ts_length == 13;
+    let iso_ms = tables.base_ms + ts_seconds * 1_000;
+    let good = good & 0xFFFF;
+    let mut ts_ms = select_unpredictable(is_digits, digits, iso_ms);
+    let mut ts_ok = select_unpredictable(is_digits, digits_ok, (ts_length == 20) & (good == 0xFFFF) & ts_day);
+    if ts_length == 25 {
+        // F2: the same 19 bytes, then the offset.
+        let offset = iso_offset(p.add(ts_start + 19));
+        ts_ok = (good & 0x7FFF == 0x7FFF) & ts_day & (offset != NOT_FAST);
+        ts_ms = iso_ms.wrapping_sub(offset.wrapping_mul(1_000));
+    }
+    if !ts_ok {
+        return ROW_DECLINE;
+    }
+    let ts = ts_ms.wrapping_sub(ctx.window_start) as u64;
+    let in_window = ts < (ctx.window_end - ctx.window_start) as u64;
+    let late = ingest_ms.wrapping_sub(ts_ms) > LATE_MS;
+
+    // The event type with its commas and quotes, as one of four texts.
+    let lanes = _mm256_set1_epi64x(read_u64(p.add(c3)) as i64);
+    let masks = _mm256_setr_epi64x(TYPE_SHORT as i64, TYPE_SHORT as i64, -1, -1);
+    let texts = _mm256_setr_epi64x(
+        TYPE_VIEW as i64,
+        TYPE_CART as i64,
+        TYPE_VIEW_QUOTED as i64,
+        TYPE_CART_QUOTED as i64,
+    );
+    let hits = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(lanes, masks), texts)))
+        as usize;
+    let is_purchase = hits == 0;
+    let c4 = if is_purchase {
+        let head = read_u64(p.add(c3));
+        let plain = (head == TYPE_PURCHASE) & ((p.add(c3 + 8) as *const u16).read_unaligned() == 0x2C65);
+        let quoted =
+            (head == TYPE_PURCHASE_QUOTED) & ((p.add(c3 + 8) as *const u32).read_unaligned() == 0x2C22_6573);
+        if !(plain | quoted) {
+            return ROW_DECLINE;
+        }
+        c3 + 9 + 2 * usize::from(quoted)
+    } else {
+        // Bits 2 and 3 are the quoted forms.
+        c3 + 5 + 2 * ((hits + 12) >> 4)
+    };
+
+    // The rest of the row, in a word whose bit 0 is the type's comma: the
+    // product, one more comma, the price, the newline at bit `reach`.
+    let at = c4 - high_length;
+    let up = (64 - high_length) as u32;
+    let region_commas = ((comma_low >> high_length) | comma_high.wrapping_shl(up)) >> at;
+    let region_quotes = ((quote_low >> high_length) | quote_high.wrapping_shl(up)) >> at;
+    let last = region_commas & region_commas.wrapping_sub(1);
+    if last == 0 || last & last.wrapping_sub(1) != 0 {
+        return ROW_DECLINE;
+    }
+    let r5 = last.trailing_zeros() as usize;
+    let reach = 64 - at;
+    let separators = last | (1u64 << reach);
+    let starts = (separators << 1) | 2;
+    let ends = separators >> 1;
+    // A quote must be at the start or the end of a field, never at both (a
+    // field that is one quote), and a field has both or neither.
+    let opened = _pext_u64(region_quotes, starts);
+    let closed = _pext_u64(region_quotes, ends);
+    let q5 = (opened & 1) as usize;
+    let product_length = r5.wrapping_sub(1 + 2 * q5);
+    if (region_quotes & !(starts ^ ends)) != 0 || opened != closed || product_length == 0 {
+        return ROW_DECLINE;
+    }
+
+    let mut valid = in_window & !late;
+    let mut purchase = None;
+    if is_purchase && valid {
+        let q6 = (opened >> 1) as usize;
+        let price = std::slice::from_raw_parts(p.add(c4 + r5 + 1 + q6), reach - r5 - 1 - 2 * q6);
+        match parse_price(price) {
+            Some(price) => purchase = Some((price, product_category(ctx, p.add(c4 + 1 + q5), product_length))),
+            None => valid = false,
+        }
+    }
+    let ts = select_unpredictable(valid, ts, 0);
+    let user_code = select_unpredictable(valid, user_code, 0);
+    if MODE == MODE_STORE {
+        emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        return ROW_DONE;
+    }
+    if MODE == MODE_ROW {
+        *row = EventRow {
+            event: event_code,
+            user: user_code,
+            user_is_number: false,
+            ts: ts as u32,
+            ingest: ingest_seconds as u32,
+            valid,
+            purchase,
+        };
+        return ROW_EMIT;
+    }
+    // Diagnostic: parsed, not stored.
+    row.event ^= event_code ^ user_code ^ ts ^ (ingest_seconds as u64);
+    ROW_DROP
+}
+
+/// `event_row_fast`, out of line: the lean kernel's way out.
+#[inline(never)]
+unsafe fn event_row_declined<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, u32) {
+    event_row_fast::<MODE, INDEXED>(ctx, p, out, row)
+}
+
+/// As `event_row_fast`, with the lean kernel in front of it: the same
+/// arguments, the same answers.
+#[inline(always)]
+pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, u32) {
+    if INDEXED {
+        return event_row_fast::<MODE, INDEXED>(ctx, p, out, row);
+    }
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let block0 = _mm256_loadu_si256(p as *const __m256i);
+    let block1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let block2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+    let early = _mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_cmpeq_epi8(block0, newline),
+        _mm256_cmpeq_epi8(block1, newline),
+    ));
+    let newline_high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block2, newline)) as u32;
+    if early != 0 || newline_high == 0 {
+        // Shorter than 64 bytes or longer than 95.
+        return event_row_declined::<MODE, INDEXED>(ctx, p, out, row);
+    }
+    let high_length = newline_high.trailing_zeros();
+    let comma_low = mask(block0, comma) | (mask(block1, comma) << 32);
+    let quote_low = mask(block0, quote) | (mask(block1, quote) << 32);
+    let comma_high = _bzhi_u64(mask(block2, comma), high_length);
+    let quote_high = _bzhi_u64(mask(block2, quote), high_length);
+    let length = 64 + high_length as usize;
+    if MODE == 2 {
+        row.event ^= comma_low ^ comma_high ^ quote_low ^ quote_high;
+        return (length, ROW_DROP);
+    }
+    let status =
+        event_decode_lean::<MODE>(ctx, p, comma_low, quote_low, comma_high, quote_high, high_length as usize, out, row);
+    if status == ROW_DECLINE {
+        return event_row_declined::<MODE, INDEXED>(ctx, p, out, row);
+    }
+    (length, status)
 }
 
 /// The number written as 1 to 7 ASCII digits with no leading zero at `p`;

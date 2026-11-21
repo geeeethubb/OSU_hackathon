@@ -333,18 +333,43 @@ pub fn link_row_slow(ctx: &Ctx, line: &[u8]) -> Option<(u64, u64)> {
 fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     buffer: &[u8],
+    position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN};
+    match event_kernel() {
+        KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
+        _ => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+    }
+}
+
+/// `events_fast_loop` with one of the event kernels (`simd::KERNEL_*`).
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
+    ctx: &Ctx,
+    buffer: &[u8],
     mut position: usize,
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_row_fast, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+    use super::simd::{
+        event_row_fast, event_row_lean, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD,
+    };
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
     let mut row = EventRow::default();
     while position < limit && position < safe {
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
-        let (length, status) =
-            unsafe { event_row_fast::<MODE, INDEXED>(ctx, buffer.as_ptr().add(position), out, &mut row) };
+        let (length, status) = unsafe {
+            let p = buffer.as_ptr().add(position);
+            if KERNEL == KERNEL_GENERAL {
+                event_row_fast::<MODE, INDEXED>(ctx, p, out, &mut row)
+            } else {
+                event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row)
+            }
+        };
         if status == ROW_DONE {
             position += length + 1;
             continue;
