@@ -49,7 +49,7 @@ pub struct ParseOut {
     pub events: Vec<PartWriter>,
     /// `mixed code >> event_shift` is an event's partition.
     pub event_shift: u32,
-    /// Index mode: one list per run of `INDEX_SLOTS` event indexes. Same
+    /// Index mode: one list per run of `1 << index_shift` event indexes. Same
     /// record as `events`, except word 0 = index within the run (16) |
     /// unused (15) | user is a user number (1) | ts (31) | valid (1).
     pub indexed: Vec<PartWriter>,
@@ -69,6 +69,8 @@ pub struct ParseOut {
     pub user_clicks: Vec<PartWriter>,
     /// The keys of index mode, for `emit_click`.
     pub keys: Option<Keys>,
+    /// `Keys::index_shift`, for `emit_indexed`.
+    pub index_shift: u32,
     pub links: Vec<(u64, u64)>,
 }
 
@@ -87,6 +89,7 @@ impl ParseOut {
             clicks: PartWriter::EMPTY,
             user_clicks: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| click_parts(&keys))],
             keys: ctx.keys,
+            index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
         }
     }
@@ -184,13 +187,9 @@ pub fn emit_raw(
     }
 }
 
-/// Event indexes per index partition, as a shift.
-pub const INDEX_SHIFT: u32 = 14;
-pub const INDEX_SLOTS: usize = 1 << INDEX_SHIFT;
-
 /// How many index partitions cover every index below the keys' bound.
 pub fn index_parts(keys: &Keys) -> usize {
-    (keys.index_bound >> INDEX_SHIFT) as usize + 1
+    (keys.index_bound >> keys.index_shift) as usize + 1
 }
 
 /// Index mode: stores one event record in the partition its index belongs to.
@@ -206,8 +205,8 @@ pub fn emit_indexed(
     ingest: u64,
     purchase: Option<(u32, u32)>,
 ) {
-    let part = (index >> INDEX_SHIFT) as usize;
-    let word0 = ((index & (INDEX_SLOTS as u64 - 1)) << 48) | (user_is_number << 32) | (ts << 1) | valid;
+    let part = (index >> out.index_shift) as usize;
+    let word0 = ((index & ((1u64 << out.index_shift) - 1)) << 48) | (user_is_number << 32) | (ts << 1) | valid;
     let word1 = (user << 22) | (ingest << 1) | u64::from(purchase.is_some());
     // SAFETY: indexes are below the keys' bound, which sized `indexed`;
     // `reserve` returns room for the words written.

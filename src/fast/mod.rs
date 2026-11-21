@@ -618,7 +618,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             threads,
         };
         let runners: Slots<indexed::Runner> = Slots::new(threads, || {
-            let mut runner = indexed::Runner::new(ScratchC::new(&ctx));
+            let mut runner = indexed::Runner::new(ScratchC::new(&ctx), keys.index_shift);
             runner.measure = measure;
             runner
         });

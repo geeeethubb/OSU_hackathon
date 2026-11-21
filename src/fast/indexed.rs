@@ -31,7 +31,7 @@ use super::codes::{unmix, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::LinkTable;
-use super::parse::{CLICK_USERS, INDEX_SLOTS};
+use super::parse::CLICK_USERS;
 use super::sessions::{PassCOut, ScratchC, EVENT_SPARE};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
@@ -56,14 +56,10 @@ pub struct ScratchI {
 }
 
 impl ScratchI {
-    pub fn new() -> Self {
-        Self { slots: vec![[0; 2]; INDEX_SLOTS], purchases: vec![0; INDEX_SLOTS], occupied: vec![0; INDEX_SLOTS / 64] }
-    }
-}
-
-impl Default for ScratchI {
-    fn default() -> Self {
-        Self::new()
+    /// For partitions of `1 << index_shift` indexes (at least 64).
+    pub fn new(index_shift: u32) -> Self {
+        let slots = 1usize << index_shift;
+        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], occupied: vec![0; slots / 64] }
     }
 }
 
@@ -80,7 +76,7 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
                 let has_purchase = (word1 & 1) as usize;
                 let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
                 at += 2 + has_purchase;
-                let slot = (word0 >> 48) as usize & (INDEX_SLOTS - 1);
+                let slot = (word0 >> 48) as usize & (scratch.slots.len() - 1);
                 let bit = 1u64 << (slot & 63);
                 // Step 2 of the rules: the copy with the smallest ingest_ts
                 // wins (the first seen among equal ones, which are identical).
@@ -460,9 +456,9 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(kernel: ScratchC) -> Self {
+    pub fn new(kernel: ScratchC, index_shift: u32) -> Self {
         Self {
-            place: ScratchI::new(),
+            place: ScratchI::new(index_shift),
             kernel,
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
@@ -579,7 +575,7 @@ impl Runner {
                     self.ts.clear();
                     self.purchases.clear();
                     self.others.clear();
-                    for slot in run_start..INDEX_SLOTS {
+                    for slot in run_start..self.place.slots.len() {
                         let [word0, word1] = self.place.slots[slot];
                         let occupied = (self.place.occupied[slot >> 6] >> (slot & 63)) & 1;
                         if occupied & word0 & (word0 >> 32) & 1 == 1 {
@@ -825,7 +821,7 @@ pub fn leftover_extras(shared: &Shared, runner: &mut Runner, b_out: &mut PassBOu
 
 /// Diagnostic (`SS_STATS=1`): how well the data fits index mode's assumptions.
 pub fn stats(keys: &Keys, links: &LinkTable, indexed_lists: &[Vec<PartList>], parts: usize) {
-    let mut scratch = ScratchI::new();
+    let mut scratch = ScratchI::new(keys.index_shift);
     let mut lists: Vec<PartList> = Vec::new();
     let (mut occupied, mut valid, mut numbered, mut other_user) = (0u64, 0u64, 0u64, 0u64);
     let (mut user_back, mut runs, mut ts_back_runs) = (0u64, 0u64, 0u64);
