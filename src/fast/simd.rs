@@ -15,10 +15,7 @@ use std::hint::select_unpredictable;
 
 use super::codes::id_code;
 use super::keys::{unscramble, MASK as NUMBER_MASK};
-use super::arena::{Arena, PartWriter};
-use super::codes::mix;
 use super::parse::{emit_indexed, emit_raw, ClickRecord, EventRow, ParseOut};
-use super::EVENT_BLOCK;
 use super::Ctx;
 use crate::util::{civil_from_days, parse_price, parse_ts, DAY_MS, LATE_MS, WEEK_MS};
 
@@ -698,13 +695,6 @@ pub struct LeanTables {
     type_step: [u8; 16],
     /// The two bytes that end ingest_ts: `Z,` or `",`.
     ingest_end: [u16; 2],
-    /// Index mode reads the eight bytes that end an ID as a base-36 number.
-    /// For an ID of 7 characters the first of them is the prefix: its part
-    /// of that number, for `e` (7 and 8 characters) and for `u`.
-    lead36: [u64; 4],
-    /// The numbers of canonical texts (no leading zero, below 2^40) of 7 and
-    /// of 8 characters: the smallest, and how many more there are.
-    canonical36: [[u64; 2]; 2],
     /// By `month * 32 + day`: the year text of the table day with that month
     /// and day, and the compact ingest seconds of its midnight (a signed
     /// number). Where there is no such day: a year no text has in a row the
@@ -736,8 +726,6 @@ impl LeanTables {
             base_ms: (base_day * 86_400 - ingest_adjust) * 1_000,
             type_step,
             ingest_end: [u16::from_le_bytes(*b"Z,"), u16::from_le_bytes(*b"\",")],
-            lead36: [14 * POWER36_7, 0, 30 * POWER36_7, 0],
-            canonical36: [[POWER36_6, POWER36_7 - 1 - POWER36_6], [POWER36_7, NUMBER_MASK - POWER36_7]],
             day,
         }
     }
@@ -823,78 +811,30 @@ const TYPE_PURCHASE_QUOTED: u64 = u64::from_le_bytes(*b",\"purcha");
 /// 36^6 and 36^7: the smallest numbers written with 7 and with 8 characters.
 const POWER36_6: u64 = 2_176_782_336;
 const POWER36_7: u64 = 78_364_164_096;
-/// `value`, unknown to the optimizer from here on. No instruction: the value
-/// just has to sit in a register. Used where a test must stay one test.
+/// Index mode reads the eight bytes that end an ID as a base-36 number. For
+/// an ID of 7 characters the first of them is the prefix: its part of the
+/// number, by prefix and by whether the ID has 8 characters.
+static LEAD36: [[u64; 2]; 2] = [[14 * POWER36_7, 0], [30 * POWER36_7, 0]];
+/// The numbers of canonical texts (no leading zero, below 2^40) of 7 and of
+/// 8 characters: the smallest, and how many more there are.
+static CANONICAL36: [[u64; 2]; 2] = [[POWER36_6, POWER36_7 - 1 - POWER36_6], [POWER36_7, NUMBER_MASK - POWER36_7]];
+
+/// The lean kernel on the row at `p`: `(length, guess, status)`. The status
+/// is `ROW_DONE` (stored), `ROW_EMIT` (in `row`), `ROW_DROP` (a diagnostic
+/// mode: parsed, not stored) or `ROW_DECLINE` (nothing was done and the
+/// lengths mean nothing). `length` is the row's length; `guess` is 64 plus
+/// where bytes 64..96 have their first newline, known long before `length`
+/// is and nearly always equal to it.
 #[inline(always)]
-fn opaque(mut value: u64) -> u64 {
-    // SAFETY: an empty block that claims only to read and write one register.
-    unsafe {
-        std::arch::asm!("/* {0} */", inout(reg) value, options(pure, nomem, nostack, preserves_flags));
-    }
-    value
-}
-
-/// What the first half of the lean kernel leaves for the second half.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct LeanFront {
-    /// Nonzero: the row is not regular (found by the first half's own checks).
-    bad: u64,
-    /// 64 plus where bytes 64..96 have their first newline: the row's
-    /// length, nearly always, and known long before the true length is.
-    pub guess: usize,
-    /// The event's code; in index mode its index.
-    event: u64,
-    /// The user's code; in index mode the user number.
-    user: u64,
-    /// Both timestamps as `iso_tails` returns them.
-    ts_packed: u64,
-    ingest_packed: u64,
-    good: u32,
-    /// ts as 13 digits, and whether it is that (`digits13`).
-    digit_mask: u32,
-    digits: i64,
-    ts_length: u32,
-    /// Masks of the 32 bytes from the comma after `view` or `cart`.
-    region_newlines: u32,
-    region_commas: u32,
-    region_quotes: u32,
-    /// From the comma before the type to the one after it; 0 for no `view` or `cart`.
-    step: usize,
-    ts_at: *const u8,
-    ingest_at: *const u8,
-    /// The comma after ingest_ts.
-    type_at: *const u8,
-}
-
-impl LeanFront {
-    /// Diagnostic: everything the first half computed, folded into a word.
-    #[inline(always)]
-    pub fn fold(&self) -> u64 {
-        self.bad
-            ^ self.event
-            ^ self.user
-            ^ self.ts_packed
-            ^ self.ingest_packed
-            ^ u64::from(self.good)
-            ^ u64::from(self.digit_mask)
-            ^ self.digits as u64
-            ^ u64::from(self.ts_length)
-            ^ u64::from(self.region_newlines)
-            ^ u64::from(self.region_commas)
-            ^ u64::from(self.region_quotes)
-            ^ self.step as u64
-    }
-}
-
-/// The first half of the lean kernel on the row at `p`: everything that
-/// takes long to arrive (the row's masks, the bytes of its fields through
-/// the vector units), with no branch and no lookup that depends on the
-/// window. It reads up to 132 bytes from `p` whatever is there, so it may run
-/// on a place that turns out not to be a row's start; its result is then
-/// simply not used.
-#[inline(always)]
-pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const LeanTables, p: *const u8, front: *mut LeanFront) {
+unsafe fn event_lean<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    lean: *const LeanTables,
+    window_length: u64,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, usize, u32) {
+    const DECLINE: (usize, usize, u32) = (0, 0, ROW_DECLINE);
     let comma = _mm256_load_si256(std::ptr::addr_of!((*lean).comma) as *const __m256i);
     let quote = _mm256_load_si256(std::ptr::addr_of!((*lean).quote) as *const __m256i);
     let newline = _mm256_load_si256(std::ptr::addr_of!((*lean).newline) as *const __m256i);
@@ -904,13 +844,19 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
     let quote_low = mask(block0, quote) | (mask(block1, quote) << 32);
     // 32 when there is no newline there, which is right for a row of 96 bytes.
     let guess = 64 + (mask(_mm256_loadu_si256(p.add(64) as *const __m256i), newline) as u32).trailing_zeros() as usize;
+    if MODE == 2 {
+        row.event ^= comma_low ^ quote_low;
+        return (guess, guess, ROW_DROP);
+    }
 
     // Which of the first four fields open with a quote (bit `i`: field `i`),
     // and which of the first three have one right before their comma. Fields
     // 0 to 2 are quoted at both ends or at neither.
     let opened = _pext_u64(quote_low, (comma_low << 1) | 1);
     let before = _pext_u64(quote_low << 1, comma_low);
-    let mut bad = (opened ^ before) & 7;
+    if (opened ^ before) & 7 != 0 {
+        return DECLINE;
+    }
     // The first three commas. If the first 64 bytes have fewer, a position
     // is 64, and the lengths below are not those of a regular row.
     let c0 = comma_low.trailing_zeros() as usize;
@@ -926,59 +872,105 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
     let event_extra = c0.wrapping_sub(2 * q0 + 8);
     let user_extra = c1.wrapping_sub(c0 + 2 * q1 + 9);
     let user_at = p.add(c0 + q1 + 1);
-    bad |= ((event_extra | user_extra) >> 1) as u64;
-    bad |= u64::from(*p.add(q0) ^ b'e') | u64::from(*user_at ^ b'u');
-    let (event, user) = if INDEXED {
+    if (event_extra | user_extra) > 1 {
+        return DECLINE;
+    }
+    if *p.add(q0) != b'e' {
+        return DECLINE;
+    }
+    if *user_at != b'u' {
+        return DECLINE;
+    }
+    let (event_code, user_code) = if INDEXED {
         // Index mode: both IDs must be generated ones. The eight bytes that
         // end an ID are its 8 characters, or its prefix and 7 characters
         // (the prefix is a letter, so all eight are characters either way).
         // Read as one base-36 number, less the prefix's part, they give the
         // ID's number; the text is canonical (no leading zero, below 2^40)
-        // exactly when the number is in the range of its length. (Where the
-        // lengths are not regular, `bad` is set already; the bytes read are
-        // then kept inside the row's first 64.)
+        // exactly when the number is in the range of its length.
         let keys = ctx.keys.as_ref().unwrap_unchecked();
-        let event_end = c0.wrapping_sub(q0 + 8);
-        let user_end = c1.wrapping_sub(q1 + 8);
-        let (event_number, user_number, known) = two_numbers36(
-            read_u64(p.add(select_unpredictable(event_end > 56, 0, event_end))),
-            read_u64(p.add(select_unpredictable(user_end > 56, 0, user_end))),
-        );
-        bad |= u64::from(known ^ 0xFFFF);
-        let (event_extra, user_extra) = (event_extra & 1, user_extra & 1);
-        let event_number = event_number.wrapping_sub(*(*lean).lead36.get_unchecked(event_extra));
-        let user_number = user_number.wrapping_sub(*(*lean).lead36.get_unchecked(2 + user_extra));
-        let canonical = std::ptr::addr_of!((*lean).canonical36) as *const [u64; 2];
-        let event_range = *canonical.add(event_extra);
-        let user_range = *canonical.add(user_extra);
-        bad |= u64::from(event_number.wrapping_sub(event_range[0]) > event_range[1]);
-        bad |= u64::from(user_number.wrapping_sub(user_range[0]) > user_range[1]);
+        let (event_number, user_number, known) =
+            two_numbers36(read_u64(p.add(c0 - q0).sub(8)), read_u64(p.add(c1 - q1).sub(8)));
+        if known != 0xFFFF {
+            return DECLINE;
+        }
+        let event_number = event_number.wrapping_sub(LEAD36[0][event_extra]);
+        let user_number = user_number.wrapping_sub(LEAD36[1][user_extra]);
+        if event_number.wrapping_sub(CANONICAL36[event_extra][0]) > CANONICAL36[event_extra][1]
+            || user_number.wrapping_sub(CANONICAL36[user_extra][0]) > CANONICAL36[user_extra][1]
+        {
+            return DECLINE;
+        }
         let index = unscramble(event_number, keys.event_key);
         let number = unscramble(user_number, keys.user_key);
-        bad |= u64::from(index >= keys.index_bound) | u64::from((number >> 9) >= keys.user_bound);
+        if index >= keys.index_bound || (number >> 9) >= keys.user_bound {
+            return DECLINE;
+        }
         (index, number)
     } else {
         // The eight bytes after the prefix are the characters, or seven of
         // them and the quote or comma that ends the field, which counts as
         // no character.
         let (event_code, user_code, known) = two_codes(read_u64(p.add(q0 + 1)), read_u64(user_at.add(1)));
-        let need = 0x7F7F | ((event_extra as u32 & 1) << 7) | ((user_extra as u32 & 1) << 15);
-        bad |= u64::from(known ^ need);
+        if known != (0x7F7F | ((event_extra as u32) << 7) | ((user_extra as u32) << 15)) {
+            return DECLINE;
+        }
         (event_code, user_code)
     };
 
-    // Both timestamps; ingest_ts must end with `Z,`, or with `",` when it
-    // opened with a quote.
+    // Both timestamps. ingest_ts must be F1 on a table day, ended by `Z,` or
+    // by `",` when it opened with a quote.
     let ts_at = p.add(c1 + q2 + 1);
     let ts_length = c2.wrapping_sub(c1 + 2 * q2 + 1) as u32;
     let ingest_at = p.add(c2 + q3 + 1);
     let type_at = ingest_at.add(20 + q3);
     let (ts_packed, ingest_packed, good) = iso_tails(ts_at, ingest_at);
-    let (digits, digit_mask) = digits13(ts_at);
-    bad |= u64::from((type_at.sub(1) as *const u16).read_unaligned() ^ *(*lean).ingest_end.get_unchecked(q3));
+    let days = std::ptr::addr_of!((*lean).day) as *const [u32; 2];
+    let ingest_day = *days.add((ingest_packed & 511) as usize);
+    if good < 0xFFFF_0000 {
+        return DECLINE;
+    }
+    if ingest_day[0] != (ingest_at as *const u32).read_unaligned() {
+        return DECLINE;
+    }
+    if (type_at.sub(1) as *const u16).read_unaligned() != *(*lean).ingest_end.get_unchecked(q3) {
+        return DECLINE;
+    }
+    let ingest_seconds = i64::from(ingest_day[1] as i32) + (ingest_packed >> 32) as i64;
+    if ingest_seconds as u64 >= 1 << 21 {
+        return DECLINE;
+    }
+    let base_ms = (*lean).base_ms;
+    let ingest_ms = base_ms + ingest_seconds * 1_000;
 
-    // The event type with its commas and quotes, as one of four texts, and
-    // the masks of the 32 bytes from its last comma on.
+    // ts: which of the three forms a row has is close to random, so the
+    // 13-digit and the F1 reading are both made and one is picked without a
+    // branch; the one in ten that is F2 takes a branch.
+    let ts_day = *days.add((ts_packed & 511) as usize);
+    let ts_year = (ts_at as *const u32).read_unaligned();
+    let iso_ms = base_ms + (i64::from(ts_day[1] as i32) + (ts_packed >> 32) as i64) * 1_000;
+    let ts_ms = if ts_length == 25 {
+        // F2: the same 19 bytes, then the offset.
+        let offset = iso_offset(ts_at.add(19));
+        if good & 0x7FFF != 0x7FFF || ts_day[0] != ts_year || offset == NOT_FAST {
+            return DECLINE;
+        }
+        iso_ms.wrapping_sub(offset.wrapping_mul(1_000))
+    } else {
+        let (digits, digit_mask) = digits13(ts_at);
+        // Zero when the field is 13 digits; zero when it is F1 on a table day.
+        let not_digits = (digit_mask ^ 0xFFFF) | (ts_length ^ 13);
+        let not_plain = ((good & 0xFFFF) ^ 0xFFFF) | (ts_length ^ 20) | (ts_day[0] ^ ts_year);
+        if u64::from(not_digits) * u64::from(not_plain) != 0 {
+            return DECLINE;
+        }
+        select_unpredictable(not_digits == 0, digits, iso_ms)
+    };
+    let ts = ts_ms.wrapping_sub(ctx.window_start) as u64;
+    let valid = (ts < window_length) & (ingest_ms.wrapping_sub(ts_ms) <= LATE_MS);
+
+    // The event type with its commas and quotes, as one of four texts; a
+    // purchase is the rare other case.
     let lanes = _mm256_set1_epi64x(read_u64(type_at) as i64);
     let masks = _mm256_setr_epi64x(TYPE_SHORT as i64, TYPE_SHORT as i64, -1, -1);
     let texts = _mm256_setr_epi64x(
@@ -989,130 +981,33 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
     );
     let hits = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(lanes, masks), texts)))
         as usize;
-    let step = usize::from(*(*lean).type_step.get_unchecked(hits));
-    let region = _mm256_loadu_si256(type_at.add(step) as *const __m256i);
-    front.write(LeanFront {
-        bad,
-        guess,
-        event,
-        user,
-        ts_packed,
-        ingest_packed,
-        good,
-        digit_mask,
-        digits,
-        ts_length,
-        region_newlines: mask(region, newline) as u32,
-        region_commas: mask(region, comma) as u32,
-        region_quotes: mask(region, quote) as u32,
-        step,
-        ts_at,
-        ingest_at,
-        type_at,
-    });
-}
-
-/// The second half of the lean kernel: the row at `p`, whose first half is
-/// `front`. Returns the row's length and `ROW_DONE` (stored), `ROW_EMIT` (in
-/// `row`), `ROW_DROP` (a diagnostic mode: parsed, not stored) or
-/// `ROW_DECLINE` (nothing was done; the length means nothing).
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
-    ctx: &Ctx,
-    lean: *const LeanTables,
-    window_length: u64,
-    p: *const u8,
-    front: *const LeanFront,
-    sink: &LeanSink,
-    row: &mut EventRow,
-) -> (usize, u32) {
-    const DECLINE: (usize, u32) = (0, ROW_DECLINE);
-    let front = &*front;
-    if front.bad != 0 {
-        return DECLINE;
-    }
-    // ingest_ts must be F1 on a table day.
-    let days = std::ptr::addr_of!((*lean).day) as *const [u32; 2];
-    let ingest_day = *days.add((front.ingest_packed & 511) as usize);
-    if front.good < 0xFFFF_0000 {
-        return DECLINE;
-    }
-    if ingest_day[0] != (front.ingest_at as *const u32).read_unaligned() {
-        return DECLINE;
-    }
-    let ingest_seconds = i64::from(ingest_day[1] as i32) + (front.ingest_packed >> 32) as i64;
-    if ingest_seconds as u64 >= 1 << 21 {
-        return DECLINE;
-    }
-    let base_ms = (*lean).base_ms;
-    let ingest_ms = base_ms + ingest_seconds * 1_000;
-
-    // ts: which of the three forms a row has is close to random, so the
-    // 13-digit and the F1 reading are both there and one is picked without a
-    // branch; the one in ten that is F2 takes a branch.
-    let ts_at = front.ts_at;
-    let ts_length = front.ts_length;
-    let good = front.good;
-    let ts_day = *days.add((front.ts_packed & 511) as usize);
-    let ts_year = (ts_at as *const u32).read_unaligned();
-    let iso_ms = base_ms + (i64::from(ts_day[1] as i32) + (front.ts_packed >> 32) as i64) * 1_000;
-    let ts_ms = if ts_length == 25 {
-        // F2: the same 19 bytes, then the offset.
-        let offset = iso_offset(ts_at.add(19));
-        if good & 0x7FFF != 0x7FFF || ts_day[0] != ts_year || offset == NOT_FAST {
-            return DECLINE;
-        }
-        iso_ms.wrapping_sub(offset.wrapping_mul(1_000))
-    } else {
-        // Zero when the field is 13 digits; zero when it is F1 on a table day.
-        let not_digits = (front.digit_mask ^ 0xFFFF) | (ts_length ^ 13);
-        let not_plain = ((good & 0xFFFF) ^ 0xFFFF) | (ts_length ^ 20) | (ts_day[0] ^ ts_year);
-        // One test for "neither". The value goes through `opaque` so that
-        // the compiler cannot turn it into two branches, the first of which
-        // would be on which of the two forms the row has.
-        if opaque(u64::from(select_unpredictable(not_digits == 0, 0, not_plain))) != 0 {
-            return DECLINE;
-        }
-        select_unpredictable(not_digits == 0, front.digits, iso_ms)
-    };
-    let ts = ts_ms.wrapping_sub(ctx.window_start) as u64;
-    let mut valid = (ts < window_length) & (ingest_ms.wrapping_sub(ts_ms) <= LATE_MS);
-
-    // After `view` or `cart` the first half has the masks of the rest of the
-    // row; a purchase is the rare other case and gets them here.
-    let type_at = front.type_at;
-    let mut step = front.step;
-    let mut newlines = front.region_newlines;
-    let mut commas = front.region_commas;
-    let mut quotes = front.region_quotes;
+    let mut step = usize::from(*(*lean).type_step.get_unchecked(hits));
     let is_purchase = step == 0;
     if is_purchase {
-        // `,purchase,` or `,"purchase",`.
-        let head = read_u64(type_at);
-        let plain = (head == TYPE_PURCHASE) & ((type_at.add(8) as *const u16).read_unaligned() == 0x2C65);
-        let quoted =
-            (head == TYPE_PURCHASE_QUOTED) & ((type_at.add(8) as *const u32).read_unaligned() == 0x2C22_6573);
+        // `,purchase,` or `,"purchase",`: eight bytes from the same lanes, then the rest.
+        let heads = _mm256_setr_epi64x(TYPE_PURCHASE as i64, TYPE_PURCHASE_QUOTED as i64, 0, 0);
+        let found = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(lanes, heads))) & 3;
+        let plain = (found == 1) & ((type_at.add(8) as *const u16).read_unaligned() == 0x2C65);
+        let quoted = (found == 2) & ((type_at.add(8) as *const u32).read_unaligned() == 0x2C22_6573);
         if !(plain | quoted) {
             return DECLINE;
         }
         step = 9 + 2 * usize::from(quoted);
-        let region = _mm256_loadu_si256(type_at.add(step) as *const __m256i);
-        newlines = mask(region, _mm256_set1_epi8(b'\n' as i8)) as u32;
-        commas = mask(region, _mm256_set1_epi8(b',' as i8)) as u32;
-        quotes = mask(region, _mm256_set1_epi8(b'"' as i8)) as u32;
     }
 
     // The 32 bytes from the comma after the type: the product, one more
     // comma, the price and the newline, which bit `reach` stands for. Every
-    // byte before this comma was matched and none is a newline, so this
-    // newline ends the row.
+    // byte before this comma was matched above and none is a newline, so
+    // this newline ends the row.
+    let region_at = type_at.add(step);
+    let region = _mm256_loadu_si256(region_at as *const __m256i);
+    let newlines = mask(region, newline) as u32;
     if newlines == 0 {
         return DECLINE;
     }
     let reach = newlines.trailing_zeros();
-    let region_commas = _bzhi_u32(commas, reach);
-    let region_quotes = _bzhi_u32(quotes, reach);
+    let region_commas = _bzhi_u32(mask(region, comma) as u32, reach);
+    let region_quotes = _bzhi_u32(mask(region, quote) as u32, reach);
     // Without the type's comma (bit 0): exactly one comma.
     let last = _blsr_u32(region_commas);
     if last == 0 || _blsr_u32(last) != 0 {
@@ -1137,11 +1032,11 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
     if r5 == 1 + 2 * q5 {
         return DECLINE;
     }
-    let region_at = type_at.add(step);
     let length = region_at.offset_from(p) as usize + reach as usize;
 
+    let mut valid = valid;
+    let mut purchase = None;
     if is_purchase {
-        let mut purchase = None;
         if valid {
             let q6 = (opened_late >> 1) as usize;
             let price = std::slice::from_raw_parts(region_at.add(r5 + 1 + q6), reach as usize - r5 - 1 - 2 * q6);
@@ -1152,83 +1047,16 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
                 None => valid = false,
             }
         }
-        let status =
-            event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, purchase);
-        return (length, status);
+        return (length, guess, event_lean_finish::<MODE, INDEXED>(out, row, event_code, user_code, ts, valid, ingest_seconds, purchase));
     }
-    (length, event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, None))
-}
-
-/// Where the lean kernel stores event records: the writers of the mode's
-/// partitions and the arena, looked up once per chunk instead of through
-/// `ParseOut` for every row.
-pub struct LeanSink {
-    writers: *mut PartWriter,
-    arena: *mut Arena,
-    /// General mode: the shift from a mixed code to its partition. Index
-    /// mode: the shift from an index to its partition.
-    shift: u32,
-}
-
-impl LeanSink {
-    #[inline(always)]
-    pub fn new<const INDEXED: bool>(out: &mut ParseOut) -> Self {
-        if INDEXED {
-            Self { writers: out.indexed.as_mut_ptr(), arena: &mut out.arena, shift: out.index_shift }
-        } else {
-            Self { writers: out.events.as_mut_ptr(), arena: &mut out.arena, shift: out.event_shift }
-        }
-    }
-
-    /// One event record, word for word what `emit_raw` (general mode) and
-    /// `emit_indexed` (index mode) store for the same row; the test
-    /// `whole_files_in_chunks` holds the two together.
-    ///
-    /// # Safety
-    /// The sink's `ParseOut` must not have been used since `new`; in index
-    /// mode `event` must be an index below the keys' bound.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn store<const INDEXED: bool>(
-        &self,
-        event: u64,
-        ts: u64,
-        valid: u64,
-        user: u64,
-        user_is_number: u64,
-        ingest: u64,
-        purchase: Option<(u32, u32)>,
-    ) {
-        let (part, key) = if INDEXED {
-            (event >> self.shift, ((event & ((1u64 << self.shift) - 1)) << 48) | (user_is_number << 32))
-        } else {
-            let mixed = mix(event);
-            (mixed >> self.shift, mixed << 32)
-        };
-        let word0 = key | (ts << 1) | valid;
-        let word1 = (user << 22) | (ingest << 1);
-        let writer = &mut *self.writers.add(part as usize);
-        match purchase {
-            None => {
-                let at = writer.reserve(&mut *self.arena, EVENT_BLOCK, 2);
-                *at = word0;
-                *at.add(1) = word1;
-            }
-            Some((price, category)) => {
-                let at = writer.reserve(&mut *self.arena, EVENT_BLOCK, 3);
-                *at = word0;
-                *at.add(1) = word1 | 1;
-                *at.add(2) = u64::from(price) | (u64::from(category) << 32);
-            }
-        }
-    }
+    (length, guess, event_lean_finish::<MODE, INDEXED>(out, row, event_code, user_code, ts, valid, ingest_seconds, None))
 }
 
 /// Stores (or hands back) what the lean kernel read.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
-    sink: &LeanSink,
+    out: &mut ParseOut,
     row: &mut EventRow,
     event_code: u64,
     user_code: u64,
@@ -1244,15 +1072,20 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
     // Index mode: the user of a valid row is its user number.
     let user_is_number = INDEXED & valid;
     if MODE == MODE_STORE {
-        sink.store::<INDEXED>(
-            event_code,
-            ts,
-            u64::from(valid),
-            user_code,
-            u64::from(user_is_number),
-            ingest_seconds as u64,
-            purchase,
-        );
+        if INDEXED {
+            emit_indexed(
+                out,
+                event_code,
+                ts,
+                u64::from(valid),
+                user_code,
+                u64::from(user_is_number),
+                ingest_seconds as u64,
+                purchase,
+            );
+        } else {
+            emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        }
         return ROW_DONE;
     }
     if MODE == MODE_ROW {
@@ -1272,29 +1105,27 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
     ROW_DROP
 }
 
-/// Bytes past a row's start that must be readable for the fast loop to run
-/// the lean kernel there: the first half is also run where the next row is
-/// expected to start (at most 97 bytes on) and reads 132 bytes from there.
-pub const LEAN_PAD: usize = 320;
-
-/// The tables of the lean kernel and the window's length, for its halves.
+/// The tables of the lean kernel and the window's length, for `event_lean`.
 #[inline(always)]
 pub fn lean_setup(ctx: &Ctx) -> (*const LeanTables, u64) {
     (&ctx.ts_tables.lean, (ctx.window_end - ctx.window_start) as u64)
 }
 
-/// Diagnostic: only the masks of the row at `p`, folded, and the guess of its length.
+/// `event_lean` for the fast loop: see there.
+///
+/// # Safety
+/// `p` must have `ROW_PAD` readable bytes after it and one before it;
+/// `lean` and `window_length` come from `lean_setup`.
 #[inline(always)]
-pub unsafe fn event_lean_masks(lean: *const LeanTables, p: *const u8) -> (u64, usize) {
-    let comma = _mm256_load_si256(std::ptr::addr_of!((*lean).comma) as *const __m256i);
-    let quote = _mm256_load_si256(std::ptr::addr_of!((*lean).quote) as *const __m256i);
-    let newline = _mm256_load_si256(std::ptr::addr_of!((*lean).newline) as *const __m256i);
-    let block0 = _mm256_loadu_si256(p as *const __m256i);
-    let block1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let comma_low = mask(block0, comma) | (mask(block1, comma) << 32);
-    let quote_low = mask(block0, quote) | (mask(block1, quote) << 32);
-    let guess = 64 + (mask(_mm256_loadu_si256(p.add(64) as *const __m256i), newline) as u32).trailing_zeros() as usize;
-    (comma_low ^ quote_low, guess)
+pub unsafe fn event_row_lean_step<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    lean: *const LeanTables,
+    window_length: u64,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, usize, u32) {
+    event_lean::<MODE, INDEXED>(ctx, lean, window_length, p, out, row)
 }
 
 #[cfg(test)]
@@ -1313,11 +1144,7 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
     row: &mut EventRow,
 ) -> (usize, u32) {
     let (lean, window_length) = lean_setup(ctx);
-    let mut front = std::mem::MaybeUninit::<LeanFront>::uninit();
-    event_lean_front::<INDEXED>(ctx, lean, p, front.as_mut_ptr());
-    let sink = LeanSink::new::<INDEXED>(out);
-    let (length, status) =
-        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, front.as_ptr(), &sink, row);
+    let (length, _, status) = event_lean::<MODE, INDEXED>(ctx, lean, window_length, p, out, row);
     if status == ROW_DECLINE {
         #[cfg(test)]
         DECLINED.with(|count| count.set(count.get() + 1));
