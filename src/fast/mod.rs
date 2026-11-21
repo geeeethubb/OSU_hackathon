@@ -446,7 +446,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let link_table = std::thread::scope(|scope| {
+    let (link_table, link_summary) = std::thread::scope(|scope| {
         let builder = scope.spawn(|| {
             let started = Instant::now();
             // Index mode sorts the link components by user index: a
@@ -457,8 +457,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 }
                 None => links::build(&link_pairs, &ctx.user_ids),
             };
+            // Index mode: what the table says per user index, flat.
+            let summary = ctx.keys.as_ref().map(|keys| indexed::Summary::build(keys, &table));
             link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            table
+            (table, summary)
         });
         parallel(threads, |thread| {
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
@@ -595,7 +597,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let kernels: Slots<Option<ScratchC>> = Slots::new(threads, || None);
 
     // Index mode: the winners of every index partition, in index order.
-    if let (Some(keys), Some((click_index, extras))) = (&ctx.keys, &index_state) {
+    if let (Some(keys), Some(summary), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
         let parts = parse::index_parts(keys);
         if std::env::var_os("SS_STATS").is_some() {
             let odd: usize = parse_out.iter().map(|out| out.odd_event_users.len()).sum();
@@ -605,6 +607,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         let shared = indexed::Shared {
             keys,
             links: &link_table,
+            summary,
             clicks: click_index,
             extras,
             click_exotic: &click_exotic,

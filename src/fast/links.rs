@@ -91,6 +91,21 @@ impl LinkTable {
     pub fn complex_members(&self) -> &[u64] {
         &self.complex
     }
+
+    /// TEMPORARY (the links branch brings the real one): calls
+    /// `visit(member code, name code, complex)` for every stored ID, and for
+    /// the name of every simple component (possibly more than once).
+    pub fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
+        for slot in &self.slots {
+            if slot[0] != 0 {
+                let complex = slot[1] & COMPLEX_BIT != 0;
+                visit(slot[0], slot[1] & CODE_MASK, complex);
+                if !complex {
+                    visit(slot[1] & CODE_MASK, slot[1] & CODE_MASK, false);
+                }
+            }
+        }
+    }
 }
 
 /// Starts loading the cache line at `pointer`. Never faults, changes nothing.

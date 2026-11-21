@@ -270,10 +270,61 @@ impl Extras {
     }
 }
 
+/// Set in a user's summary: it has a simple link component, named by the
+/// code in the low bits, whose members' aliases are the bits of the mask.
+const SIMPLE: u64 = 1 << 63;
+/// Set in a user's summary: the two words cannot describe its IDs (a member
+/// of a complex component, two simple components, or an alias of 64 or
+/// more). Each of its IDs is then resolved through the link table.
+const SLOW: u64 = 1 << 62;
+
+/// What the link table says about each user index, flat and in the order
+/// the index pass visits the users, so that a run costs one read instead of
+/// one table probe per ID.
+pub struct Summary {
+    /// Per user index: `[name code | SIMPLE | SLOW, member alias mask]`.
+    /// All zero: none of the user's IDs is in a link component of two or
+    /// more, so each is a person of its own.
+    users: Vec<[u64; 2]>,
+}
+
+impl Summary {
+    pub fn build(keys: &Keys, links: &LinkTable) -> Self {
+        // Zeroed pages stay untouched for user indexes without links.
+        let mut users = vec![[0u64; 2]; keys.user_bound as usize];
+        links.for_each_member(|member, name, complex| {
+            // An ID that is not a generated one makes its component complex:
+            // the generated members of that component say so themselves.
+            let Some(number) = keys.user_number_of_code(member) else {
+                return;
+            };
+            let entry = &mut users[(number >> 9) as usize];
+            let alias = number & (ALIASES - 1);
+            if complex || alias >= 64 {
+                entry[0] |= SLOW;
+            } else if entry[0] & SIMPLE == 0 {
+                entry[0] |= SIMPLE | name;
+                entry[1] |= 1 << alias;
+            } else if entry[0] & CODE_MASK == name {
+                entry[1] |= 1 << alias;
+            } else {
+                entry[0] |= SLOW;
+            }
+        });
+        Self { users }
+    }
+
+    #[inline(always)]
+    fn of(&self, user: u64) -> [u64; 2] {
+        self.users.get(user as usize).copied().unwrap_or([SLOW, 0])
+    }
+}
+
 /// What every thread reads while runs are processed.
 pub struct Shared<'a> {
     pub keys: &'a Keys,
     pub links: &'a LinkTable,
+    pub summary: &'a Summary,
     pub clicks: &'a ClickIndex,
     pub extras: &'a Extras,
     pub click_exotic: &'a [Box<[u8]>],
@@ -351,10 +402,18 @@ pub struct Runner {
     run: u64,
     records: Vec<Record>,
     merged: Vec<Record>,
+    /// The person being collected: event timestamps and purchases.
     ts: Vec<u32>,
     purchases: Vec<[u64; 2]>,
     clicks: Vec<[u64; 2]>,
-    /// Events of a run's further simple persons: `[name, ts << 1 | is purchase, purchase word]`.
+    /// A run read straight from the slots: the aliases of its main person,
+    /// and that person's name code (0: the name is `main_number`'s ID).
+    main_mask: u64,
+    main_name: u64,
+    main_number: u64,
+    /// Events of a run's further persons. On the direct path
+    /// `[user number, ts << 1 | is purchase, purchase word]`, in
+    /// `process_run` the same with the name code first.
     others: Vec<Record>,
     pub edges: Vec<Edge>,
     /// User indexes decreased inside a partition.
@@ -382,6 +441,9 @@ impl Runner {
             ts: Vec::new(),
             purchases: Vec::new(),
             clicks: Vec::new(),
+            main_mask: 0,
+            main_name: 0,
+            main_number: 0,
             others: Vec::new(),
             edges: Vec::new(),
             violated: false,
@@ -395,8 +457,10 @@ impl Runner {
         }
     }
 
-    /// The winners of one index partition: whole runs are processed, the
-    /// first and the last run are set aside as the partition's `Edge`.
+    /// The winners of one index partition. Runs in the middle are processed:
+    /// straight from the slots when the user's summary allows it, through
+    /// `process_run` otherwise. The first and the last run are set aside as
+    /// the partition's `Edge`, since they may continue next door.
     pub fn partition(
         &mut self,
         shared: &Shared,
@@ -417,6 +481,10 @@ impl Runner {
         let mut edge = Edge { part, first_user: u64::MAX, first: Vec::new(), last_user: u64::MAX, last: Vec::new() };
         let mut records = std::mem::take(&mut self.records);
         records.clear();
+        // Whether the current run is collected as records (the first run, and
+        // users the summary cannot describe) or read straight into `ts`.
+        let mut gathering = true;
+        let mut run_start = 0usize;
         for word_index in 0..self.place.occupied.len() {
             let mut bits = self.place.occupied[word_index];
             while bits != 0 {
@@ -427,9 +495,11 @@ impl Runner {
                 if word0 & 1 == 0 {
                     continue;
                 }
+                let is_purchase = word1 & 1;
                 if (word0 >> 32) & 1 == 0 {
                     // Not a generated user ID: `word1` holds its code.
-                    forward(shared.links, b_out, word0, word1, self.place.purchases[slot]);
+                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
+                    forward(shared.links, b_out, word0, word1, purchase);
                     self.general_events += 1;
                     continue;
                 }
@@ -440,14 +510,33 @@ impl Runner {
                         if edge.first_user == u64::MAX {
                             edge.first_user = current;
                             edge.first = std::mem::take(&mut records);
-                        } else {
+                        } else if gathering {
                             self.process_run(shared, b_out, c_out, current, &records);
                             records.clear();
+                        } else {
+                            self.finish_direct(shared, c_out, current);
                         }
+                        gathering = !self.begin_direct(shared, user);
                     }
                     current = user;
+                    run_start = slot;
                 }
-                records.push([word0, word1, self.place.purchases[slot]]);
+                if gathering {
+                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
+                    records.push([word0, word1, purchase]);
+                    continue;
+                }
+                let alias = (word1 >> 22) & (ALIASES - 1);
+                if alias < 64 && (self.main_mask >> alias) & 1 != 0 {
+                    let ts = (word0 >> 1) & TS_MASK;
+                    self.ts.push(ts as u32);
+                    if is_purchase == 1 {
+                        self.purchases.push([ts, self.place.purchases[slot]]);
+                    }
+                } else {
+                    let purchase = if is_purchase == 1 { self.place.purchases[slot] } else { 0 };
+                    self.add_other(word0, word1, purchase);
+                }
             }
         }
         if current != u64::MAX {
@@ -455,6 +544,21 @@ impl Runner {
                 edge.first_user = current;
                 edge.first = std::mem::take(&mut records);
             } else {
+                if !gathering {
+                    // The last run was read straight from the slots, and
+                    // nothing of it has left this runner: read it again as records.
+                    self.ts.clear();
+                    self.purchases.clear();
+                    self.others.clear();
+                    for slot in run_start..INDEX_SLOTS {
+                        let [word0, word1] = self.place.slots[slot];
+                        let occupied = (self.place.occupied[slot >> 6] >> (slot & 63)) & 1;
+                        if occupied & word0 & (word0 >> 32) & 1 == 1 {
+                            let purchase = if word1 & 1 == 1 { self.place.purchases[slot] } else { 0 };
+                            records.push([word0, word1, purchase]);
+                        }
+                    }
+                }
                 edge.last_user = current;
                 edge.last = std::mem::take(&mut records);
             }
@@ -471,6 +575,90 @@ impl Runner {
         }
     }
 
+    /// Starts a run that is read straight from the slots, if the user's
+    /// summary describes its IDs and nothing else joins the run.
+    #[inline(always)]
+    fn begin_direct(&mut self, shared: &Shared, user: u64) -> bool {
+        let [head, mask] = shared.summary.of(user);
+        if head & SLOW != 0 || (!shared.extras.is_empty() && shared.extras.by_user.contains_key(&user)) {
+            return false;
+        }
+        self.ts.clear();
+        self.purchases.clear();
+        self.others.clear();
+        // Without a simple component the first ID met becomes the main person.
+        self.main_mask = if head & SIMPLE != 0 { mask } else { 0 };
+        self.main_name = head & CODE_MASK;
+        true
+    }
+
+    /// An event of a run read straight from the slots whose ID is not one of
+    /// the main person's: an ID in no link component, a person of its own.
+    #[cold]
+    #[inline(never)]
+    fn add_other(&mut self, word0: u64, word1: u64, purchase: u64) {
+        let number = word1 >> 22;
+        let alias = number & (ALIASES - 1);
+        let ts = (word0 >> 1) & TS_MASK;
+        let is_purchase = word1 & 1;
+        if self.main_mask == 0 && alias < 64 {
+            self.main_mask = 1 << alias;
+            self.main_name = 0;
+            self.main_number = number;
+            self.ts.push(ts as u32);
+            if is_purchase == 1 {
+                self.purchases.push([ts, purchase]);
+            }
+        } else {
+            self.others.push([number, (ts << 1) | is_purchase, purchase]);
+        }
+    }
+
+    /// Ends a run read straight from the slots: its main person, then the
+    /// persons of its other IDs.
+    fn finish_direct(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64) {
+        if !self.ts.is_empty() {
+            let name =
+                if self.main_name != 0 { self.main_name } else { shared.keys.code_of_user_number(self.main_number) };
+            let mask = self.main_mask;
+            self.clicks.clear();
+            for click in shared.clicks.of(user) {
+                let alias = click[0] >> 32;
+                if alias < 64 && (mask >> alias) & 1 != 0 {
+                    self.clicks.push([click[0] & 0xFFFF_FFFF, click[1]]);
+                }
+            }
+            self.run_kernel(shared, c_out, name);
+        }
+        if !self.others.is_empty() {
+            // Rare: IDs of one user that no link joins are separate persons.
+            let mut others = std::mem::take(&mut self.others);
+            others.sort_unstable_by_key(|other| other[0]);
+            let mut from = 0;
+            while from < others.len() {
+                let number = others[from][0];
+                let to = from + others[from..].iter().take_while(|other| other[0] == number).count();
+                self.ts.clear();
+                self.purchases.clear();
+                for &[_, stamp, purchase] in &others[from..to] {
+                    self.ts.push((stamp >> 1) as u32);
+                    if stamp & 1 == 1 {
+                        self.purchases.push([stamp >> 1, purchase]);
+                    }
+                }
+                self.clicks.clear();
+                for click in shared.clicks.of(user) {
+                    if (click[0] >> 32) == number & (ALIASES - 1) {
+                        self.clicks.push([click[0] & 0xFFFF_FFFF, click[1]]);
+                    }
+                }
+                self.run_kernel(shared, c_out, shared.keys.code_of_user_number(number));
+                from = to;
+            }
+            self.others = others;
+        }
+    }
+
     /// Adds the assists still pending after runs processed outside `partition`.
     pub fn flush(&mut self, c_out: &mut PassCOut) {
         self.kernel.flush(c_out);
@@ -482,8 +670,9 @@ impl Runner {
     }
 
     /// One user's events (`word1 >> 31` is the same user index in all of
-    /// them), in any order: each simple person in it goes to the session
-    /// kernel, events of complex components go to their persons' partitions.
+    /// them), in any order, each ID resolved through the link table: each
+    /// simple person in it goes to the session kernel, events of complex
+    /// components go to their persons' partitions.
     pub fn process_run(
         &mut self,
         shared: &Shared,
@@ -559,16 +748,22 @@ impl Runner {
     }
 
     /// The simple person `name` of `user`, whose events are in `self.ts` and
-    /// `self.purchases`: adds its clicks and runs the session kernel.
+    /// `self.purchases`: adds the clicks whose own ID resolves to the same
+    /// name and runs the session kernel.
     fn person(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64, name: u64) {
         self.clicks.clear();
         for click in shared.clicks.of(user) {
-            // A click belongs to the person its own ID resolves to.
             let number = (user << 9) | (click[0] >> 32);
             if resolve(&mut self.aliases, self.run, shared, number) == name {
                 self.clicks.push([click[0] & 0xFFFF_FFFF, click[1]]);
             }
         }
+        self.run_kernel(shared, c_out, name);
+    }
+
+    /// The session kernel on the person collected in `ts`, `purchases` and `clicks`.
+    #[inline(always)]
+    fn run_kernel(&mut self, shared: &Shared, c_out: &mut PassCOut, name: u64) {
         let count = self.ts.len();
         self.inline_persons += 1;
         self.inline_events += count as u64;
