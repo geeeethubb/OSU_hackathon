@@ -1,0 +1,95 @@
+# One-off measurement, branch exp-lab only: what one event row costs in the
+# parse stage on a hosted runner, taken apart with the engine's own diagnostic
+# switches. Nothing here is ranked or scored; the runs are not in containers.
+name: parse-lab
+on:
+  push:
+    branches: [exp-lab]
+permissions:
+  contents: read
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Machine
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|L1d|L2 cache|L3 cache|MHz" || true
+          cat /sys/kernel/mm/transparent_hugepage/enabled
+          cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list || true
+          cat /sys/devices/system/cpu/cpu2/topology/thread_siblings_list || true
+      - name: Tools
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Build
+        run: |
+          docker buildx build --platform linux/amd64 --load -t ss-lab .
+          cid=$(docker create ss-lab)
+          docker cp "$cid:/pipeline" "$RUNNER_TEMP/pipeline"
+          docker rm "$cid" >/dev/null
+          chmod +x "$RUNNER_TEMP/pipeline"
+      - name: Data (20M events, seed 2) and a subset of plain rows only
+        run: |
+          D="$RUNNER_TEMP/data"; U="$RUNNER_TEMP/plain"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$D" >/dev/null
+          mkdir -p "$U/events"
+          cp -al "$D/clicks" "$U/clicks"; cp -al "$D/links" "$U/links"
+          cp "$D"/*.csv "$D"/manifest.json "$U"/
+          # Plain rows: no quote anywhere, both timestamps in the form 2026-09-16T18:24:20Z.
+          for f in "$D"/events/*.csv; do
+            { head -n 1 "$f"; tail -n +2 "$f" | grep -v '"' | grep -E '^e[0-9a-z]+,u[0-9a-z]+,[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z,[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z,' || true; } > "$U/events/$(basename "$f")"
+          done
+          echo "all rows:   $(cat "$D"/events/*.csv | wc -l) lines, $(du -sb "$D/events" | cut -f1) bytes"
+          echo "plain rows: $(cat "$U"/events/*.csv | wc -l) lines, $(du -sb "$U/events" | cut -f1) bytes"
+          echo "plain view/cart rows: $(cat "$U"/events/*.csv | grep -c -E ',(view|cart),')"
+          cat "$D"/events/*.csv "$D"/clicks/*.csv "$D"/links/*.csv "$U"/events/*.csv > /dev/null
+      - name: perf, if the runner exposes hardware counters
+        run: |
+          sudo apt-get install -y -q linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null 2>&1 || true
+          which perf || true
+          (sudo perf stat -e cycles,instructions,branches,branch-misses true 2>&1 | tail -12) || true
+      - name: Runs
+        run: |
+          P="$RUNNER_TEMP/pipeline"; D="$RUNNER_TEMP/data"; U="$RUNNER_TEMP/plain"; O="$RUNNER_TEMP/out"
+          line() {  # label, then the environment and command prefix
+            label="$1"; shift
+            rm -rf "$O"; mkdir -p "$O"
+            out=$( { env OUTPUT_DIR="$O" SCRATCH_DIR="$O" SS_TIMING=1 "$@" "$P" 2>&1 >/dev/null || true; } )
+            parse=$(printf '%s\n' "$out" | sed -n 's/.*stage=parse ms=\([0-9.]*\).*/\1/p' | head -n 1)
+            total=$(printf '%s\n' "$out" | sed -n 's/.*stage=total ms=\([0-9.]*\).*/\1/p' | head -n 1)
+            ev=$(printf '%s\n' "$out" | sed -n 's/.*detail=cpu_parse_events ms=\([0-9.]*\).*/\1/p' | head -n 1)
+            cl=$(printf '%s\n' "$out" | sed -n 's/.*detail=cpu_parse_clicks ms=\([0-9.]*\).*/\1/p' | head -n 1)
+            wd=$(printf '%s\n' "$out" | sed -n 's/.*detail=parse_workers_done ms=\([0-9.]*\).*/\1/p' | head -n 1)
+            note=$(printf '%s\n' "$out" | grep -o 'event_store_in_assembly=[a-z]*' | head -n 1)
+            echo "$label | parse_stage=$parse workers_done=$wd cpu_events=$ev cpu_clicks=$cl total=$total $note"
+          }
+          for round in 1 2 3; do
+            echo "== round $round"
+            line "all rows, full run, 4 threads        " DATA_DIR="$D" NCPU=4
+            line "all rows, DIAG=1 (real lists)        " DATA_DIR="$D" NCPU=4 SS_DIAG=1
+            line "all rows, DIAG=8 (store, one block)  " DATA_DIR="$D" NCPU=4 SS_DIAG=8
+            line "all rows, DIAG=7 (kernel, no store)  " DATA_DIR="$D" NCPU=4 SS_DIAG=7
+            line "all rows, DIAG=7, compiler's kernel  " DATA_DIR="$D" NCPU=4 SS_DIAG=7 SS_KERNEL=plain
+            line "all rows, DIAG=1, pages touched first" DATA_DIR="$D" NCPU=4 SS_DIAG=1 SS_PRETOUCH=1
+            line "all rows, DIAG=7, pages touched first" DATA_DIR="$D" NCPU=4 SS_DIAG=7 SS_PRETOUCH=1
+            line "all rows, DIAG=7, 2 threads on 2 cores" DATA_DIR="$D" NCPU=2 SS_DIAG=7 taskset -c 0,2
+            line "all rows, DIAG=7, 2 threads on 1 core " DATA_DIR="$D" NCPU=2 SS_DIAG=7 taskset -c 0,1
+            line "all rows, DIAG=7, 1 thread            " DATA_DIR="$D" NCPU=1 SS_DIAG=7 taskset -c 0
+            line "all rows, DIAG=1, 1 thread            " DATA_DIR="$D" NCPU=1 SS_DIAG=1 taskset -c 0
+            line "plain rows, DIAG=7, 4 threads         " DATA_DIR="$U" NCPU=4 SS_DIAG=7
+            line "plain rows, DIAG=7, 1 thread          " DATA_DIR="$U" NCPU=1 SS_DIAG=7 taskset -c 0
+            line "plain rows, DIAG=1, 4 threads         " DATA_DIR="$U" NCPU=4 SS_DIAG=1
+          done 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: perf runs, if available
+        run: |
+          P="$RUNNER_TEMP/pipeline"; D="$RUNNER_TEMP/data"; O="$RUNNER_TEMP/out"
+          if sudo perf stat -e instructions true 2>&1 | grep -q "not supported\|not counted\|No such\|Permission"; then
+            echo "no hardware counters on this runner" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          if ! which perf >/dev/null 2>&1; then echo "perf is not installed" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          for mode in 7 1; do
+            rm -rf "$O"; mkdir -p "$O"
+            echo "== perf stat, SS_DIAG=$mode, 1 thread" | tee -a "$GITHUB_STEP_SUMMARY"
+            (sudo perf stat -e cycles,instructions,branches,branch-misses,cache-misses,L1-dcache-load-misses,dTLB-load-misses,page-faults \
+              env DATA_DIR="$D" OUTPUT_DIR="$O" SCRATCH_DIR="$O" NCPU=1 SS_DIAG=$mode taskset -c 0 "$P" 2>&1 | tail -20 || true) | tee -a "$GITHUB_STEP_SUMMARY"
+          done
