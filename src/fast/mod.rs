@@ -558,6 +558,22 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
         });
         timing.detail("parse_workers_done", timing.since_last());
+        // Every row is in the workers' lists now and nothing reads the input
+        // files again. Their mappings (one page-table entry per 4 KiB of
+        // input) would be taken apart by the kernel when the process exits,
+        // on one thread, inside the measured time. Two helper threads do it
+        // from here on instead, beside the stages that follow; whatever they
+        // have not reached when the process ends is left to the exit as
+        // before. `SS_RELEASE=0` leaves all of it to the exit.
+        if !std::env::var_os("SS_RELEASE").is_some_and(|value| value == "0") {
+            let mut ranges: Vec<(usize, usize)> = event_files.iter().chain(&click_files).map(Mapped::range).collect();
+            // Largest first, dealt out in turn: two halves of about equal size.
+            ranges.sort_unstable_by_key(|&(_, len)| std::cmp::Reverse(len));
+            for helper in 0..2 {
+                let share: Vec<(usize, usize)> = ranges.iter().copied().skip(helper).step_by(2).collect();
+                std::thread::spawn(move || io::release_pages(&share));
+            }
+        }
         // Index mode: the clicks of generated user IDs, grouped by user
         // index. Nothing in it needs the links, so it is built here, while
         // the link builder may still be running.

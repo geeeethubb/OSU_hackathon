@@ -1,4 +1,5 @@
-//! Read-only file mappings. Mapped once, never unmapped (the process exits).
+//! Read-only file mappings. Mapped once, never unmapped (the process exits);
+//! `release_pages` lets go of their page-table entries once they are read.
 
 use std::fs::File;
 use std::io;
@@ -37,6 +38,24 @@ impl Mapped {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Address and length of the mapping, for `release_pages`.
+    pub fn range(&self) -> (usize, usize) {
+        (self.ptr as usize, self.len)
+    }
+}
+
+/// Lets go of the page-table entries of mapped files (address, length). The
+/// bytes stay readable: a later read maps its pages again from the page
+/// cache. Otherwise taking the entries down is the kernel's last job when the
+/// process exits: page by page, on one thread, before anybody is told that
+/// the process has ended.
+pub fn release_pages(ranges: &[(usize, usize)]) {
+    for &(start, len) in ranges {
+        if len > 0 {
+            sys::release(start, len);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -47,9 +66,20 @@ mod sys {
 
     extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
     const PROT_READ: i32 = 1;
     const MAP_PRIVATE: i32 = 2;
+    const MADV_DONTNEED: i32 = 4;
+
+    pub fn release(start: usize, len: usize) {
+        // SAFETY: a private read-only file mapping made by `map` and never
+        // unmapped. The advice only drops page-table entries; the result does
+        // not matter (on failure the entries stay until the process exits).
+        unsafe {
+            madvise(start as *mut u8, len, MADV_DONTNEED);
+        }
+    }
 
     pub fn map(file: &File, len: usize) -> io::Result<*const u8> {
         // SAFETY: a fresh private read-only mapping of an open file.
@@ -87,6 +117,8 @@ mod sys {
     }
     const PAGE_READONLY: u32 = 0x02;
     const FILE_MAP_READ: u32 = 0x0004;
+
+    pub fn release(_start: usize, _len: usize) {}
 
     pub fn map(file: &File, _len: usize) -> io::Result<*const u8> {
         // SAFETY: plain Win32 calls on a valid file handle. The mapping handle is
