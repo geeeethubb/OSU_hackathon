@@ -461,7 +461,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let (link_table, link_summary) = std::thread::scope(|scope| {
+    let (link_table, summary_thread) = std::thread::scope(|scope| {
         let builder = scope.spawn(|| {
             let started = Instant::now();
             // Index mode sorts the link components by user index: a
@@ -472,9 +472,20 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 }
                 None => links::build(&link_pairs, &ctx.user_ids),
             };
-            // Index mode: what the table says per user index, flat.
-            let summary = ctx.keys.as_ref().map(|keys| indexed::Summary::build(keys, &table));
             link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let table = std::sync::Arc::new(table);
+            // Index mode: what the table says per user index, flat. Only the
+            // index pass reads it, so it gets a thread of its own that may run
+            // on after the parse has ended: with eight parse threads the
+            // builder would otherwise be the last to finish.
+            let summary = ctx.keys.map(|keys| {
+                let table = std::sync::Arc::clone(&table);
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let summary = indexed::Summary::build(&keys, &table);
+                    (summary, started.elapsed())
+                })
+            });
             (table, summary)
         });
         parallel(threads, |thread| {
@@ -503,6 +514,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         timing.detail("parse_workers_done", timing.since_last());
         builder.join().unwrap()
     });
+    let link_table: &links::LinkTable = &link_table;
     timing.detail("cpu_parse_events", event_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_parse_clicks", click_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("links_build", link_build_nanos.load(Ordering::Relaxed) as f64 / 1e6);
@@ -547,10 +559,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             if at < event_parts {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
-                dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
+                dedup::dedup_partition(link_table, &lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - event_parts) {
                 let started = measure.then(Instant::now);
-                dedup::map_clicks(&link_table, batch, out);
+                dedup::map_clicks(link_table, batch, out);
                 if let Some(started) = started {
                     clicks_spent += started.elapsed().as_nanos() as u64;
                 }
@@ -614,8 +626,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 .collect();
             // SAFETY: as above.
             let out = unsafe { b_out.get(0) };
-            let extras = indexed::Extras::collect(keys, &link_table, &odd_lists, out);
-            indexed::forward_complex_clicks(keys, &link_table, &click_index, out);
+            let extras = indexed::Extras::collect(keys, link_table, &odd_lists, out);
+            indexed::forward_complex_clicks(keys, link_table, &click_index, out);
             Some((click_index, extras))
         }
         None => None,
@@ -629,16 +641,21 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let kernels: Slots<Option<ScratchC>> = Slots::new(threads, || None);
 
     // Index mode: the winners of every index partition, in index order.
-    if let (Some(keys), Some(summary), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
+    let link_summary = summary_thread.map(|thread| thread.join().unwrap());
+    if let Some((_, spent)) = &link_summary {
+        timing.detail("links_summary", spent.as_secs_f64() * 1e3);
+        timing.detail("links_summary_joined", timing.since_last());
+    }
+    if let (Some(keys), Some((summary, _)), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
         let parts = parse::index_parts(keys);
         if std::env::var_os("SS_STATS").is_some() {
             let odd: usize = parse_out.iter().map(|out| out.odd_event_users.len()).sum();
             eprintln!("SS_STATS odd_event_users={odd} extras={} click_index={}", extras.len(), click_index.len());
-            indexed::stats(keys, &link_table, &indexed_lists, parts);
+            indexed::stats(keys, link_table, &indexed_lists, parts);
         }
         let shared = indexed::Shared {
             keys,
-            links: &link_table,
+            links: link_table,
             summary,
             clicks: click_index,
             extras,
