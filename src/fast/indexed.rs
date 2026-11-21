@@ -598,10 +598,12 @@ pub struct Runner {
     pub inline_persons: u64,
     pub inline_events: u64,
     pub general_events: u64,
-    /// With `measure`: nanoseconds spent placing records and inside the session kernel.
+    /// With `measure`: nanoseconds spent placing records, inside the session
+    /// kernel, and on the assists at the end of a partition.
     pub measure: bool,
     pub place_nanos: u64,
     pub kernel_nanos: u64,
+    pub flush_nanos: u64,
     pub total_nanos: u64,
 }
 
@@ -636,6 +638,7 @@ impl Runner {
             measure: false,
             place_nanos: 0,
             kernel_nanos: 0,
+            flush_nanos: 0,
             total_nanos: 0,
         }
     }
@@ -873,10 +876,14 @@ impl Runner {
         }
         self.records = records;
         self.finish_batch(shared, c_out);
+        let started = self.measure.then(std::time::Instant::now);
         if self.hold_assists {
             self.kernel.hold_assists(c_out);
         } else {
             self.kernel.flush(c_out);
+        }
+        if let Some(started) = started {
+            self.flush_nanos += started.elapsed().as_nanos() as u64;
         }
         if !c_out.names.is_empty() {
             // A thread handles about `parts / threads` partitions like this one.
