@@ -46,7 +46,7 @@ pub const MIN_PART_BITS: u32 = 10;
 pub const MAX_PART_BITS: u32 = 13;
 /// Records a partition should hold, so that a partition and the tables built
 /// over it stay inside a core's private cache whatever the input size.
-const RECORDS_PER_PART: u64 = 16_384;
+const RECORDS_PER_PART: u64 = 24_000;
 /// Bytes of an average event row, to turn file sizes into row counts.
 const EVENT_ROW_BYTES: u64 = 77;
 /// Words per list block.
