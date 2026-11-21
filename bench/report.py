@@ -422,6 +422,9 @@ def compare_text(entry):
     text = f"{sum(1 for item in new if item.get('match'))}/{len(new)} runs of this commit **{'MATCH' if all(item.get('match') for item in new) else 'DIFFER'}**"
     if prior:
         text += f"; prior best {sum(1 for item in prior if item.get('match'))}/{len(prior)} {'MATCH' if all(item.get('match') for item in prior) else 'DIFFER'}"
+    variant = [item for item in comparisons if item.get("which") == "variant"]
+    if variant:
+        text += f"; variant {sum(1 for item in variant if item.get('match'))}/{len(variant)} {'MATCH' if all(item.get('match') for item in variant) else 'DIFFER'}"
     return text
 
 
@@ -473,6 +476,23 @@ def aa_lines(analysis):
     lines += ["", f"Signed median A − B {millis(analysis.get('median_a_minus_b_ms'), signed=True)} ms; **median absolute difference "
                   f"{millis(analysis.get('median_abs_diff_ms'))} ms**, largest {millis(analysis.get('max_abs_diff_ms'))} ms. "
                   f"Is the second run of a pair systematically faster? {order_verdict(analysis)}."]
+    return lines
+
+
+def variant_lines(analysis, aa):
+    """The same image with and without extra environment: a runtime switch judged without a build."""
+    described = " ".join(f"{key}={value}" for key, value in (analysis.get("env") or {}).items())
+    saving = analysis.get("median_a_minus_b_ms")
+    lines = [f"A is this commit's image as it is scored, B is the same image with `{described}`; {analysis.get('n')} pairs in the "
+             f"pre-shuffled order {' '.join(analysis.get('orders') or [])} on the same input, each run a fresh container; "
+             f"{cache_text(analysis.get('cache'))}.", ""]
+    lines += pair_table(analysis, "default", "variant", "saved (default − variant)")
+    lines += ["", f"Median per configuration: default {millis(analysis.get('median_a_ms'))} ms, variant {millis(analysis.get('median_b_ms'))} ms. "
+                  f"**Median paired saving of the variant {millis(saving, signed=True)} ms**; it was faster in {analysis.get('b_faster_pairs')} of "
+                  f"{analysis.get('n')} pairs. A/A noise on the same runner and input: {aa_summary(aa)}. The saving is {noise_judgement(saving, aa)}."]
+    if (analysis.get("timing_run") or {}).get("ss_timing"):
+        lines += ["", "<details><summary>Stage timings of the variant</summary>", ""]
+        lines += stage_lines(analysis["timing_run"], "Variant, one extra run with `SS_TIMING=1`") + ["", "</details>"]
     return lines
 
 
@@ -650,6 +670,8 @@ def render_bench20m(result, correctness=None, b60=None, with_line=True):
                 lines += ["", f"### Seed {seed}: A/A noise check", ""] + aa_lines(entry["aa"])
             if entry.get("ab"):
                 lines += ["", f"### Seed {seed}: prior best versus this commit", ""] + ab_lines(entry["ab"], entry.get("aa"), prior.get("sha"), result.get("sha"))
+            if entry.get("variant"):
+                lines += ["", f"### Seed {seed}: variant of this commit", ""] + variant_lines(entry["variant"], entry.get("aa"))
             lines += ["", f"### Seed {seed}: stages, memory, correctness", ""]
             if pipeline.get("timing_run"):
                 lines += stage_lines(pipeline["timing_run"], "Stage timings from one extra run with `SS_TIMING=1`")

@@ -1213,15 +1213,16 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
         return run
 
     def paired(title, tag, images, pairs):
-        """`pairs` AB/BA pairs in a pre-shuffled balanced order; images maps A and B to (image, which)."""
+        """`pairs` AB/BA pairs in a pre-shuffled balanced order; images maps A and B to (image, which)
+        or (image, which, extra environment)."""
         orders = pair_orders(pairs, f"{tag}-seed{seed}")
         before = page_cache_state(data)
         samples = []
         with group(f"seed {seed}: {title}, {pairs} pairs in the order {' '.join(orders)}"):
             for index, order in enumerate(orders, start=1):
                 for position, letter in enumerate(order, start=1):
-                    image, which = images[letter]
-                    run = timed(image, which, f"{tag}-p{index}-{letter}")
+                    image, which, *extra = images[letter]
+                    run = timed(image, which, f"{tag}-p{index}-{letter}", **({"env": extra[0]} if extra and extra[0] else {}))
                     run.update({"pair": index, "letter": letter, "position": position, "order": order})
                     samples.append(run)
         analysis = analyse_pairs(samples, orders)
@@ -1239,10 +1240,14 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
 
     # The noise check and the comparison, sized to what a run costs here.
     prior_differs = bool(prior_image) and not result.get("prior", {}).get("same_binary")
+    variant_env = dict(pair.split("=", 1) for pair in (args.variant_env or "").split() if "=" in pair)
     per_run = (pipeline.get("median_wall_s") or 0.0) + 1.5
-    aa_pairs, ab_pairs = plan_pairs(args.pairs, args.pair_budget_s, per_run, prior_differs)
+    # A variant comparison takes its share of the budget like the prior-vs-candidate one.
+    budget = args.pair_budget_s * (2 / 3 if variant_env and prior_differs else 1)
+    aa_pairs, ab_pairs = plan_pairs(args.pairs, budget, per_run, prior_differs)
+    variant_pairs = max(2, plan_pairs(args.pairs, args.pair_budget_s / 3, per_run, False)[0]) if variant_env and args.pairs else 0
     entry["pair_plan"] = {"requested": args.pairs, "budget_s": args.pair_budget_s, "per_run_s": round(per_run, 2),
-                          "aa_pairs": aa_pairs, "ab_pairs": ab_pairs}
+                          "aa_pairs": aa_pairs, "ab_pairs": ab_pairs, "variant_pairs": variant_pairs}
     if args.pairs and aa_pairs < args.pairs:
         result["warnings"].append(
             f"seed {seed}: a run takes about {per_run:.0f} s here, so the {args.pair_budget_s:.0f} s pair budget allows "
@@ -1253,6 +1258,14 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
     if prior_differs and ab_pairs:
         entry["ab"] = paired("prior best (A) versus this commit (B)", "ab",
                              {"A": (prior_image, "prior"), "B": (args.image, "new")}, ab_pairs)
+    if variant_pairs:
+        # One image, two configurations: a runtime switch can be judged without building anything.
+        described = " ".join(f"{key}={value}" for key, value in variant_env.items())
+        entry["variant"] = paired(f"this commit (A) versus this commit with {described} (B)", "var",
+                                  {"A": (args.image, "new"), "B": (args.image, "variant", variant_env)}, variant_pairs)
+        entry["variant"]["env"] = variant_env
+        with group(f"seed {seed}: one extra run of the variant with SS_TIMING=1"):
+            entry["variant"]["timing_run"] = timed(args.image, "variant", "var-timing", env=dict(variant_env, SS_TIMING="1"))
 
     with group(f"seed {seed} (v): one extra run with SS_TIMING=1"):
         pipeline["timing_run"] = timed(args.image, "new", "new-timing", env={"SS_TIMING": "1"})
@@ -1293,8 +1306,10 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
 
     # Verdicts: this commit must exit 0 and match on every run; the prior best is only reported.
     everything = runs + [pipeline["timing_run"], pipeline["memory_run"]]
-    for analysis in (entry.get("aa"), entry.get("ab")):
+    for analysis in (entry.get("aa"), entry.get("ab"), entry.get("variant")):
         everything += (analysis or {}).get("samples", [])
+    if (entry.get("variant") or {}).get("timing_run"):
+        everything.append(entry["variant"]["timing_run"])
     if entry.get("prior_timing_run"):
         everything.append(entry["prior_timing_run"])
     for run in everything:
@@ -1416,6 +1431,8 @@ def main():
                          help="AB/BA pairs for the A/A noise check and for prior-vs-candidate (0 turns both off)")
     bench20.add_argument("--pair-budget-s", type=float, default=300.0,
                          help="time the paired runs may take per seed; slow pipelines get fewer pairs")
+    bench20.add_argument("--variant-env", default="",
+                         help='also compare this commit with itself under extra environment, e.g. "SS_FAST=0"')
     bench20.add_argument("--prior-image", default="")
     bench20.add_argument("--prior-sha", default="")
     bench20.add_argument("--prior-status", default="")

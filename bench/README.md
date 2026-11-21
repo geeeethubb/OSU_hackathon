@@ -103,6 +103,10 @@ For each seed in the seed list (practice scale, `--events 20000000 --clicks 5000
    check (A is the prior). Reported: median per version, each paired saving (prior − this), the
    median paired saving, how many pairs this commit won, and the A/A variation to read it against.
    If both images hold a byte-identical `/pipeline`, there is nothing to compare and it says so.
+   A **variant** can be compared the same way without building anything: the `variant_env`
+   input, or `[variant=NAME=VALUE]` in the commit message, pairs this commit's image against
+   itself with that extra environment (a runtime switch of the engine, say). Its runs must still
+   exit 0 and match `/reference`, but a failure there is a warning, not a failed commit.
 6. **Stages**: one extra run with `SS_TIMING=1` (also of the prior best).
 7. **Memory**: one extra run as `docker create` + `docker start -a` while a thread samples the
    container's cgroup every 5 ms: `memory.peak` (which counts page cache charged to the
