@@ -469,54 +469,58 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
         std::hint::black_box(row.event);
         return position;
     }
-    'restart: while position < stop {
-        // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
-        // readable bytes after it and `position >= 8` eight before it; a
-        // first half reads from 8 bytes before to 132 bytes after where it
-        // is run, which is `position` or at most 97 bytes past it. The
-        // record of the row at `position` is the one the step reads. The
-        // sink is made anew after every use of `out`.
+    // SAFETY (all of this loop): a row that starts before `stop` has LEAN_PAD
+    // readable bytes after it and (see above) eight before it; a first half
+    // reads from 8 bytes before to 132 bytes after where it is run, which
+    // is a row's start or at most 97 bytes past one. The record of the row
+    // at `p` is the one the step reads. The sink is made anew after every
+    // use of `out`.
+    let mut p = unsafe { base.add(position) };
+    let last = unsafe { base.add(stop) };
+    'restart: while p < last {
         let sink = LeanSink::new::<INDEXED>(out);
-        unsafe { first_half::<INDEXED, PLAIN>(lean, base.add(position), records) };
+        unsafe { first_half::<INDEXED, PLAIN>(lean, p, records) };
         loop {
             // One row with its record in place `$current`; the next row's
             // first half goes to the other place.
             macro_rules! row {
                 ($current:literal) => {{
-                    let (length, guess, status) = unsafe {
-                        let p = base.add(position);
+                    let (next, status) = unsafe {
                         let current = records.add($current);
-                        let guess = (*current).guess;
-                        let common = if PLAIN {
-                            first_half::<INDEXED, true>(lean, p.add(guess + 1), records.add(1 - $current));
-                            None
+                        let (common, next) = if PLAIN {
+                            let next = p.add((*current).guess + 1);
+                            first_half::<INDEXED, true>(lean, next, records.add(1 - $current));
+                            (None, next)
                         } else {
                             // The next row's first half and, for the common
                             // kind of row, this row's second half.
-                            let step = event_lean_step::<INDEXED, $current>(lean, p.add(guess + 1), frame);
-                            (step.rare == 0).then_some(step)
+                            let (step, next) = event_lean_step::<INDEXED, $current>(lean, p, frame);
+                            ((step.rare == 0).then_some(step), next)
                         };
                         match common {
                             Some(step) => {
-                                (guess, guess, event_lean_store::<MODE, INDEXED>(ctx, current, &step, &sink, &mut row))
+                                (next, event_lean_store::<MODE, INDEXED>(ctx, current, &step, &sink, &mut row))
                             }
                             None => {
                                 let (length, status) =
                                     event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, current, &sink, &mut row);
-                                (length, guess, status)
+                                if status != ROW_DECLINE && length != (*current).guess {
+                                    // Read and stored, but the row ends elsewhere.
+                                    position = row_end_elsewhere(p.offset_from(base) as usize, length);
+                                    p = base.add(position);
+                                    continue 'restart;
+                                }
+                                (next, status)
                             }
                         }
                     };
                     if status == ROW_DECLINE {
-                        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+                        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, unsafe { p.offset_from(base) } as usize, out);
+                        p = unsafe { base.add(position) };
                         continue 'restart;
                     }
-                    if length != guess {
-                        position = row_end_elsewhere(position, length);
-                        continue 'restart;
-                    }
-                    position += guess + 1;
-                    if position >= stop {
+                    p = next;
+                    if p >= last {
                         break 'restart;
                     }
                 }};
@@ -527,7 +531,7 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
     std::hint::black_box(row.event);
-    position
+    unsafe { p.offset_from(base) as usize }
 }
 
 /// One row the lean kernel declined: through the general kernel and, if

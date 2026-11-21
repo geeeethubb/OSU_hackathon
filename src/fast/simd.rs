@@ -1492,18 +1492,26 @@ macro_rules! lean_back {
     };
 }
 
+/// From the current row (rdi) to where the next one starts by the guess in
+/// the current row's record.
+macro_rules! lean_step_enter {
+    () => {
+        concat!("add rdi, qword ptr [rdx + {c_guess}]\n", "inc rdi\n",)
+    };
+}
+
 /// One `asm!` of the pieces named in `templates`, with the registers and the
 /// table and record offsets every piece uses.
 macro_rules! lean_asm {
     (
         templates: [$($template:ident),*];
-        p: $p:expr, lean: $lean:expr, record: $record:expr;
+        p: { $($p:tt)* }, lean: $lean:expr, record: $record:expr;
         outputs: { $($outputs:tt)* };
         consts: { $($name:ident = $value:expr,)* }
     ) => {
         std::arch::asm!(
             $($template!(),)*
-            in("rdi") $p,
+            $($p)*
             in("rsi") $lean,
             in("rdx") $record,
             $($outputs)*
@@ -1567,7 +1575,7 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(lean: *const LeanTables, p: 
     if INDEXED {
         lean_asm!(
             templates: [lean_front_head, lean_ids_indexed, lean_front_tail];
-            p: p, lean: lean, record: front;
+            p: { in("rdi") p, }, lean: lean, record: front;
             outputs: { out("rax") _, out("rcx") _, out("r9") _, out("r11") _, };
             consts: {
                 id36_letter_value = offset_of!(LeanTables, id36_letter_value),
@@ -1581,7 +1589,7 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(lean: *const LeanTables, p: 
     } else {
         lean_asm!(
             templates: [lean_front_head, lean_ids_general, lean_front_tail];
-            p: p, lean: lean, record: front;
+            p: { in("rdi") p, }, lean: lean, record: front;
             outputs: { out("rax") _, out("rcx") _, out("r9") _, out("r11") _, };
             consts: {
                 id_digit_value = offset_of!(LeanTables, id_digit_value),
@@ -1624,24 +1632,27 @@ pub struct LeanStep {
     pub ingest_seconds: u64,
 }
 
-/// One step of the fast loop in one piece of assembly: the first half of the
-/// row at `p`, into record `1 - CURRENT` of the frame, and then the second
-/// half of the row before it, from record `CURRENT`, as far as the common
-/// case goes (a 13-digit or F1 timestamp, `view` or `cart`, every check
-/// passed, and the row ending right before `p`).
+/// One step of the fast loop in one piece of assembly, for the row at `p`
+/// whose first half is in record `CURRENT` of the frame: the first half of
+/// the next row (taken to start where this row's guess says), into the
+/// other record, and then this row's second half as far as the common case
+/// goes (a 13-digit or F1 timestamp, `view` or `cart`, every check passed,
+/// and the row ending right where the next one was taken to start). Returns
+/// that and where the next row was taken to start.
 ///
 /// # Safety
-/// As `event_lean_front_plain` for `p`; `frame` holds the first half of the
-/// row before `p` in record `CURRENT`.
+/// `p` has LEAN_PAD readable bytes after it and 8 before it; `frame` holds
+/// its first half in record `CURRENT`.
 #[inline(always)]
 pub unsafe fn event_lean_step<const INDEXED: bool, const CURRENT: usize>(
     lean: *const LeanTables,
     p: *const u8,
     frame: *mut LeanFrame,
-) -> LeanStep {
+) -> (LeanStep, *const u8) {
     use std::mem::{offset_of, size_of};
     let record = (frame as *mut LeanFront).add(1 - CURRENT);
     let (rare, valid, ts, ingest_seconds): (u64, u64, u64, u64);
+    let next: *const u8;
     // From the record being written to the one being read, and to the window.
     macro_rules! current {
         ($field:ident) => {
@@ -1656,8 +1667,8 @@ pub unsafe fn event_lean_step<const INDEXED: bool, const CURRENT: usize>(
     macro_rules! step_asm {
         ($ids:ident; $($name:ident = $value:expr,)*) => {
             lean_asm!(
-                templates: [lean_front_head, $ids, lean_front_tail, lean_back];
-                p: p, lean: lean, record: record;
+                templates: [lean_step_enter, lean_front_head, $ids, lean_front_tail, lean_back];
+                p: { inout("rdi") p => next, }, lean: lean, record: record;
                 outputs: {
                     lateout("rax") rare, lateout("rcx") ingest_seconds, lateout("r9") valid, lateout("r11") ts,
                 };
@@ -1665,6 +1676,7 @@ pub unsafe fn event_lean_step<const INDEXED: bool, const CURRENT: usize>(
                     $($name = $value,)*
                     day = offset_of!(LeanTables, day),
                     base_ms = offset_of!(LeanTables, base_ms),
+                    c_guess = current!(guess),
                     c_bad = current!(bad),
                     c_good = current!(good),
                     c_ingest_packed = current!(ingest_packed),
@@ -1705,7 +1717,7 @@ pub unsafe fn event_lean_step<const INDEXED: bool, const CURRENT: usize>(
             id_eights = offset_of!(LeanTables, id_eights),
         );
     }
-    LeanStep { rare, valid, ts, ingest_seconds }
+    (LeanStep { rare, valid, ts, ingest_seconds }, next)
 }
 
 /// The second half of the lean kernel: the row at `p`, whose first half is
@@ -2072,7 +2084,8 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
         let record = &*front.as_ptr();
         let mut frame = LeanFrame::new(ctx);
         frame.records[0].write(*record);
-        let step = event_lean_step::<INDEXED, 0>(lean, p.add(record.guess + 1), &mut frame);
+        let (step, next) = event_lean_step::<INDEXED, 0>(lean, p, &mut frame);
+        assert!(next == p.add(record.guess + 1));
         if step.rare == 0 {
             let mut twin = EventRow::default();
             let twin_status = event_lean_store::<MODE, INDEXED>(ctx, front.as_ptr(), &step, &sink, &mut twin);
@@ -2087,7 +2100,7 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
         // The same with the records the other way round.
         let mut frame = LeanFrame::new(ctx);
         frame.records[1].write(*record);
-        let other = event_lean_step::<INDEXED, 1>(lean, p.add(record.guess + 1), &mut frame);
+        let (other, _) = event_lean_step::<INDEXED, 1>(lean, p, &mut frame);
         assert!(other.rare == step.rare, "the two record orders differ");
         if step.rare == 0 {
             assert!((other.valid, other.ts, other.ingest_seconds) == (step.valid, step.ts, step.ingest_seconds));
