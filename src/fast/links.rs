@@ -31,13 +31,22 @@ pub struct LinkTable {
     shift: u32,
     /// Every member of every complex component.
     complex: Vec<u64>,
+    /// The name of every simple component of two or more IDs. The slots do
+    /// not hold these IDs, since they name themselves.
+    simple_names: Vec<u64>,
 }
 
 impl LinkTable {
     fn with_capacity(entries: usize) -> Self {
         let bits = (entries.max(4) * 2).next_power_of_two().trailing_zeros();
         let capacity = 1usize << bits;
-        Self { slots: vec![[0, 0]; capacity], mask: capacity - 1, shift: 64 - bits, complex: Vec::new() }
+        Self {
+            slots: vec![[0, 0]; capacity],
+            mask: capacity - 1,
+            shift: 64 - bits,
+            complex: Vec::new(),
+            simple_names: Vec::new(),
+        }
     }
 
     /// `name` is the name code, with `COMPLEX_BIT` for a complex component.
@@ -91,6 +100,23 @@ impl LinkTable {
     pub fn complex_members(&self) -> &[u64] {
         &self.complex
     }
+
+    /// Calls `visit(member code, name code, complex)` once for every ID of
+    /// every link component that has two or more IDs or is complex, the ID
+    /// that names the component included. These are all the IDs for which
+    /// `lookup` can return anything but `(itself, false)`, and the names of
+    /// their components. An ID that is alone in a simple component (linked
+    /// only to itself, and in a group) is not visited. In no particular order.
+    pub fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
+        for slot in &self.slots {
+            if slot[0] != 0 {
+                visit(slot[0], slot[1] & CODE_MASK, slot[1] & COMPLEX_BIT != 0);
+            }
+        }
+        for &name in &self.simple_names {
+            visit(name, name, false);
+        }
+    }
 }
 
 /// Starts loading the cache line at `pointer`. Never faults, changes nothing.
@@ -126,6 +152,8 @@ const MAX_SPILL: usize = 15;
 /// many lines after its home line the node sits (4 bits); two flags at the top.
 const SPILL_SHIFT: u32 = CODE_BITS + 4;
 const BELOW_SPILL: u64 = (1 << SPILL_SHIFT) - 1;
+/// On a root: another tree was joined under it, so its tree has two or more IDs.
+const JOINED: u64 = 1 << 61;
 /// On a root: its tree is complex.
 const MARKED: u64 = 1 << 62;
 /// On every node, so that none is 0, which is the empty slot.
@@ -346,12 +374,14 @@ impl<'a> Forest<'a> {
         // group. So two unmarked trees make an unmarked tree exactly when
         // their roots share a group.
         let same_group = matches!((group(code_a), group(code_b)), (Some(one), Some(other)) if one == other);
+        let mut root_node = root_node | JOINED;
         if !same_group || (node_a | node_b) & MARKED != 0 {
-            self.set_node(root, root_node | MARKED);
+            root_node |= MARKED;
             // One complex tree where there were none, one or two.
             self.complex_trees += 1;
             self.complex_trees -= usize::from(node_a & MARKED != 0) + usize::from(node_b & MARKED != 0);
         }
+        self.set_node(root, root_node);
     }
 }
 
@@ -477,6 +507,10 @@ fn build_in_forest(
         let root_node = forest.node(root);
         let complex = root_node & MARKED != 0;
         if root == slot && !complex {
+            // A root that names others is not stored, only listed.
+            if node & JOINED != 0 {
+                table.simple_names.push(forest.code_at(slot, node));
+            }
             continue;
         }
         let (user, name) = (forest.code_at(slot, node), forest.code_at(root, root_node));
@@ -550,11 +584,13 @@ fn build_general(
     }
     // A component is simple when every member is in its root's group.
     let mut complex = vec![false; codes.len()];
+    let mut several = vec![false; codes.len()];
     for at in 0..codes.len() {
         let root = root_of[at] as usize;
         if !matches!((group(codes[at]), group(codes[root])), (Some(one), Some(other)) if one == other) {
             complex[root] = true;
         }
+        several[root] |= at != root;
     }
     let stored = |at: usize| name[root_of[at] as usize] != codes[at] || complex[root_of[at] as usize];
     let mut table = LinkTable::with_capacity((0..codes.len()).filter(|&at| stored(at)).count());
@@ -565,6 +601,11 @@ fn build_general(
                 table.complex.push(codes[at]);
             }
             table.insert(codes[at], if complex[root] { name[root] | COMPLEX_BIT } else { name[root] });
+        }
+    }
+    for root in 0..codes.len() {
+        if root_of[root] as usize == root && several[root] && !complex[root] {
+            table.simple_names.push(name[root]);
         }
     }
     table
@@ -755,6 +796,26 @@ mod tests {
         let complex = naive_complex(&names, groups);
         let complex_codes: HashSet<u64> = complex.iter().map(|id| code(id)).collect();
         let unlinked: Vec<Id> = (0..200).map(|_| random_id(random, 4)).filter(|id| !names.contains_key(id)).collect();
+        // What `for_each_member` must visit: every ID of every component
+        // that has two or more IDs or is complex.
+        let mut sizes: HashMap<&Id, usize> = HashMap::new();
+        for name in names.values() {
+            *sizes.entry(name).or_default() += 1;
+        }
+        let members = |with_groups: bool| -> HashMap<u64, (u64, bool)> {
+            names
+                .iter()
+                .filter(|(id, name)| sizes[name] >= 2 || (with_groups && complex.contains(*id)))
+                .map(|(id, name)| (code(id), (code(name), with_groups && complex.contains(id))))
+                .collect()
+        };
+        let visited = |table: &LinkTable, path: &str| -> HashMap<u64, (u64, bool)> {
+            let mut seen = HashMap::new();
+            table.for_each_member(|member, name, flag| {
+                assert!(seen.insert(member, (name, flag)).is_none(), "{path}: an ID visited twice");
+            });
+            seen
+        };
         for (path, limits) in PATHS {
             let table = build_within(&lists, &users, &group, limits);
             for (id, name) in &names {
@@ -769,6 +830,7 @@ mod tests {
             }
             assert_eq!(table.complex_members().len(), complex_codes.len(), "{path}: complex members listed once");
             assert_eq!(table.complex_members().iter().copied().collect::<HashSet<u64>>(), complex_codes, "{path}");
+            assert_eq!(visited(&table, path), members(true), "{path}: for_each_member");
         }
         // Without groups the names are the same and nothing is complex.
         let table = build(&lists, &users);
@@ -776,6 +838,7 @@ mod tests {
             assert_eq!(table.lookup(code(id)), (code(name), false));
         }
         assert!(table.complex_members().is_empty());
+        assert_eq!(visited(&table, "plain build"), members(false), "plain build: for_each_member");
     }
 
     #[test]
@@ -870,6 +933,18 @@ mod tests {
             let mut expected_members: Vec<u64> = ["u7", "u7A", "u7 ", "u8zzzzzzzz", "u8", "u4"].map(code).to_vec();
             expected_members.sort_unstable();
             assert_eq!(members, expected_members, "{path}");
+            // Every ID above but `u3`, alone in a simple component, and the
+            // two that are in no link line; the names `U9` and `Ua` included.
+            let mut visited: Vec<(u64, u64, bool)> = Vec::new();
+            table.for_each_member(|member, name, flag| visited.push((member, name, flag)));
+            visited.sort_unstable();
+            let mut expected_visits: Vec<(u64, u64, bool)> = expected
+                .iter()
+                .filter(|(user, _, _)| !["u3", "u9", "U1"].contains(user))
+                .map(|&(user, name, flag)| (code(user), code(name), flag))
+                .collect();
+            expected_visits.sort_unstable();
+            assert_eq!(visited, expected_visits, "{path}");
         }
         check(&mut Random(7), &pairs, &groups);
     }
