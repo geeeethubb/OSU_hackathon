@@ -30,9 +30,12 @@ pub struct EventRow {
 }
 
 /// A valid click before its user is mapped to a person.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClickRecord {
+    /// User code. In index mode a fast kernel hands a generated user ID back
+    /// as its user number instead, and `user_is_number` says so.
     pub user: u64,
+    pub user_is_number: bool,
     /// Click ID code in the low 42 bits, campaign index above.
     pub code_and_campaign: u64,
     /// Milliseconds since `window_start - 7 days`.
@@ -106,9 +109,29 @@ pub fn click_parts(keys: &Keys) -> usize {
     (keys.user_bound >> CLICK_SHIFT) as usize + 1
 }
 
+/// The click as index mode stores it: the user of a generated user ID is its
+/// user number. A click that already carries a number is returned as it is.
+#[inline]
+pub fn click_indexed_form(keys: &Keys, click: ClickRecord) -> ClickRecord {
+    if click.user_is_number {
+        return click;
+    }
+    match keys.user_number_of_code(click.user) {
+        Some(number) => ClickRecord { user: number, user_is_number: true, ..click },
+        None => click,
+    }
+}
+
 #[inline(always)]
 pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
-    if let Some(number) = out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user)) {
+    // A kernel that read the user number from the text says so; any other
+    // click of index mode has its code turned into the number here.
+    let number = if click.user_is_number {
+        Some(click.user)
+    } else {
+        out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user))
+    };
+    if let Some(number) = number {
         // SAFETY: the number's user index is below the keys' bound, which
         // sized `user_clicks`; `reserve` returned room for two words.
         unsafe {
@@ -345,9 +368,16 @@ pub fn click_row_slow(ctx: &Ctx, line: &[u8]) -> Option<ClickRecord> {
     let user = id_code(user_id, b'u', &ctx.user_ids);
     Some(ClickRecord {
         user,
+        user_is_number: false,
         code_and_campaign: click_code | (u64::from(campaign) << 42),
         ts: (ts - click_window_start) as u32,
     })
+}
+
+/// One click line in index mode: the click of `click_row_slow`, with the
+/// user of a generated user ID as its user number.
+pub fn click_row_slow_indexed(ctx: &Ctx, keys: &Keys, line: &[u8]) -> Option<ClickRecord> {
+    click_row_slow(ctx, line).map(|click| click_indexed_form(keys, click))
 }
 
 pub fn link_row_slow(ctx: &Ctx, line: &[u8]) -> Option<(u64, u64)> {
@@ -491,53 +521,79 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
     });
 }
 
+/// The fast loop over click rows, specialized for index mode (`INDEXED`: the
+/// kernel reads a generated user ID as its user number, and `ctx.keys` must
+/// be set). Returns where the general parser must continue.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn clicks_rows_loop<const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{click_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+    let limit = end.min(buffer.len());
+    let safe = buffer.len().saturating_sub(ROW_PAD);
+    let verify = ctx.verify;
+    let mut click = ClickRecord::default();
+    while position < limit && position < safe {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`.
+        let (length, status) =
+            unsafe { click_row_fast::<INDEXED>(ctx, buffer.as_ptr().add(position), &mut click) };
+        if status == ROW_EMIT && !verify {
+            emit_click(out, &click);
+            position += length + 1;
+            continue;
+        }
+        if status == ROW_LONG {
+            let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
+            if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
+                emit_click(out, &click);
+            }
+            position = line_end + 1;
+            continue;
+        }
+        let line = &buffer[position..position + length];
+        let fast = match status {
+            ROW_EMIT => Some(click),
+            ROW_DROP => None,
+            _ => click_row_slow(ctx, line),
+        };
+        if verify && (status == ROW_EMIT || status == ROW_DROP) {
+            // In index mode the kernel must hand back exactly the indexed
+            // form of what the general parser reads.
+            let slow = match &ctx.keys {
+                Some(keys) if INDEXED => click_row_slow_indexed(ctx, keys, line),
+                _ => click_row_slow(ctx, line),
+            };
+            assert!(
+                slow == fast,
+                "click row mismatch on {:?}: fast {:?}, slow {:?}",
+                String::from_utf8_lossy(line),
+                fast,
+                slow
+            );
+        }
+        if let Some(click) = fast {
+            emit_click(out, &click);
+        }
+        position += length + 1;
+    }
+    position
+}
+
 pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
     if ctx.fast_rows {
-        use super::simd::{click_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
-        let limit = end.min(buffer.len());
-        let safe = buffer.len().saturating_sub(ROW_PAD);
-        let verify = ctx.verify;
-        let mut click = ClickRecord { user: 0, code_and_campaign: 0, ts: 0 };
-        while position < limit && position < safe {
-            // SAFETY: at least ROW_PAD readable bytes follow `position`.
-            let (length, status) = unsafe { click_row_fast(ctx, buffer.as_ptr().add(position), &mut click) };
-            if status == ROW_EMIT && !verify {
-                emit_click(out, &click);
-                position += length + 1;
-                continue;
-            }
-            if status == ROW_LONG {
-                let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
-                if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
-                    emit_click(out, &click);
-                }
-                position = line_end + 1;
-                continue;
-            }
-            let line = &buffer[position..position + length];
-            let fast = match status {
-                ROW_EMIT => Some(click),
-                ROW_DROP => None,
-                _ => click_row_slow(ctx, line),
-            };
-            if verify && (status == ROW_EMIT || status == ROW_DROP) {
-                let slow = click_row_slow(ctx, line);
-                assert!(
-                    slow == fast,
-                    "click row mismatch on {:?}: fast {:?}, slow {:?}",
-                    String::from_utf8_lossy(line),
-                    fast,
-                    slow
-                );
-            }
-            if let Some(click) = fast {
-                emit_click(out, &click);
-            }
-            position += length + 1;
-        }
+        position = if ctx.keys.is_some() {
+            clicks_rows_loop::<true>(ctx, buffer, position, end, out)
+        } else {
+            clicks_rows_loop::<false>(ctx, buffer, position, end, out)
+        };
     }
     lines_from(buffer, position, end, |line| {
         if let Some(click) = click_row_slow(ctx, line) {
