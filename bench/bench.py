@@ -47,6 +47,11 @@ MEMTOUCH_VARIANTS = {
     "4k-munmap": ["--munmap"],   # as 4k, but each thread munmaps its own part before exit
     "populate": ["--populate"],  # MAP_POPULATE instead of touching
 }
+# 96 MiB written under /output, as a pipeline's tables are, then exit.
+WRITEOUT_VARIANTS = {
+    "dirty": [],            # left dirty in the page cache, like an ordinary write
+    "fsync": ["--fsync"],   # written back inside the process
+}
 # What the image is built from (the Dockerfile and its build context, see .dockerignore).
 BUILD_INPUTS = ["Dockerfile", ".dockerignore", "Cargo.toml", "Cargo.lock", "src"]
 
@@ -421,15 +426,16 @@ def drop_page_cache():
 # the scorer's docker flags
 # --------------------------------------------------------------------------
 
-def scorer_args(*, cpus, mem, data, out, scratch, platform_=PLATFORM, ncpu=None, mem_gb=None):
-    """The flags of scripts/docker_run.sh, in its order. `cpus` like "8", `mem` like "24g"."""
+def scorer_args(*, cpus, mem, data, out, scratch, platform_=PLATFORM, ncpu=None, mem_gb=None, memory_swap=None):
+    """The flags of scripts/docker_run.sh, in its order. `cpus` like "8", `mem` like "24g".
+    `memory_swap` differs from `mem` only for the 60M /reference run, which is not a scored run."""
     ncpu = cpus.rsplit(".", 1)[0] if ncpu is None else ncpu          # ${CPUS%.*}
     mem_gb = mem.removesuffix("g") if mem_gb is None else mem_gb     # ${MEM%g}
     return [
         "--platform", platform_,
         "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,size=64m,mode=1777",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--pids-limit", "4096", "--cpus", cpus, "--memory", mem, "--memory-swap", mem,
+        "--pids-limit", "4096", "--cpus", cpus, "--memory", mem, "--memory-swap", memory_swap or mem,
         "--user", "1000:1000",
         "-v", f"{data}:/data:ro,z", "-v", f"{out}:/output:z", "-v", f"{scratch}:/scratch:z",
         "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
@@ -505,9 +511,9 @@ def parse_ss_timing(text, kind="stage"):
 
 
 def parse_diag(text):
-    """The `DIAG readthrough key=value ...` or `DIAG memtouch key=value ...` line of bench/diag."""
+    """The `DIAG readthrough|memtouch|writeout key=value ...` line of bench/diag."""
     for line in text.splitlines():
-        if line.startswith(("DIAG readthrough ", "DIAG memtouch ")):
+        if line.startswith(("DIAG readthrough ", "DIAG memtouch ", "DIAG writeout ")):
             fields = dict(part.split("=", 1) for part in line.split()[2:] if "=" in part)
             for key, value in list(fields.items()):
                 if key == "ms":
@@ -602,14 +608,16 @@ class Harness:
             self.cpuset = None
 
     def run(self, image, label, data, *, command=(), entrypoint=None, env=None, out_dir=None, split=False,
-            monitor=False, timeout=900):
+            monitor=False, timeout=900, memory_g=None, memory_swap_g=None):
         """One fresh container. Timed two ways: the Docker client's wall clock around `docker run`, and the
-        container's own State.StartedAt -> State.FinishedAt. Everything else happens outside both."""
+        container's own State.StartedAt -> State.FinishedAt. Everything else happens outside both.
+        memory_g and memory_swap_g override the memory limit; only the 60M /reference run uses them."""
         out = fresh_dir(out_dir or self.work / "out-discard")
         scratch = fresh_dir(self.work / "scratch")
         name = "ss-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", label) + "-" + uuid.uuid4().hex[:8]
-        args = ["--name", name] + scorer_args(cpus=str(self.cpus), mem=f"{self.mem_g}g", data=data, out=out,
-                                               scratch=scratch)
+        args = ["--name", name] + scorer_args(cpus=str(self.cpus), mem=f"{memory_g or self.mem_g}g", data=data, out=out,
+                                               scratch=scratch,
+                                               memory_swap=f"{memory_swap_g}g" if memory_swap_g else None)
         if self.cpuset:
             args += ["--cpuset-cpus", self.cpuset]
         for key, value in (env or {}).items():
@@ -1107,6 +1115,11 @@ def diagnostics(harness, args, data, runs, full=True):
         for name, flags in MEMTOUCH_VARIANTS.items():
             diag["memtouch"][name] = harness.series(args.diag_image, f"memtouch-{name}", data, runs,
                                                     command=["memtouch", "--mb", "1024", *flags])
+    with group("diagnostic: 96 MiB written to /output, what it costs after the process has exited"):
+        diag["writeout"] = {}
+        for name, flags in WRITEOUT_VARIANTS.items():
+            diag["writeout"][name] = harness.series(args.diag_image, f"writeout-{name}", data, runs,
+                                                    command=["writeout", "--mb", "96", *flags])
     with group("what a container sees (sysinfo)"):
         info = harness.run(args.diag_image, "sysinfo", data, command=["sysinfo"])
         diag["sysinfo"] = [line[len("SYSINFO "):] for line in info.get("stdout_tail", "").splitlines() if line.startswith("SYSINFO ")]
@@ -1322,10 +1335,22 @@ def cmd_bench60m(args):
             entry["self_check"] = self_check(out)
             if not entry["self_check"].get("ok"):
                 result["errors"].append("60M: the rules' self-check failed on the pipeline output")
+            with group("60M: one extra run with SS_TIMING=1"):
+                entry["timing_run"] = harness.run(args.image, "60m-timing", data, env={"SS_TIMING": "1"}, timeout=1800)
             with group("60M: /reference on the same input (if the runner's memory allows), then compare.py"):
+                # /reference is the correctness tool, not a scored run: it may use all the memory this
+                # machine has (and its swap), so that a full diff is possible where the scorer's 24 GB
+                # is not available. One GiB stays with the host.
+                hw = result["hardware"]
+                total_gib = (hw.get("mem_total_kb") or 0) // (1024 * 1024)
+                swap_gib = (hw.get("swap_total_kb") or 0) // (1024 * 1024)
+                reference_mem = max(harness.mem_g, min(SCORER_MEM_G, total_gib - 1))
+                reference_swap = reference_mem + (swap_gib if reference_mem < SCORER_MEM_G else 0)
                 reference_out = work / "out-60m-reference"
                 reference = harness.run(args.image, "60m-reference", data, entrypoint="/reference",
-                                        out_dir=reference_out, monitor=True, timeout=3000)
+                                        out_dir=reference_out, monitor=True, timeout=3000,
+                                        memory_g=reference_mem, memory_swap_g=reference_swap)
+                reference["limits"] = f"--memory {reference_mem}g --memory-swap {reference_swap}g"
                 reference["outputs"] = output_summary(reference_out)
                 entry["reference"] = reference
                 if reference["ok"]:

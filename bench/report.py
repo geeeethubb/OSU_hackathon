@@ -285,6 +285,49 @@ def memtouch_lines(diag):
     return lines
 
 
+WRITEOUT_LABELS = {
+    "dirty": "written and left dirty in the page cache, as an ordinary write is",
+    "fsync": "written and `fsync`ed before the process exits",
+}
+
+
+def gap_ms(run):
+    if run.get("wall_s") is None or run.get("docker_s") is None:
+        return None
+    return (run["wall_s"] - run["docker_s"]) * 1e3
+
+
+def writeout_lines(diag, pipeline=None):
+    """Output bytes: what they cost inside the container's time, and after the process has exited."""
+    variants = diag.get("writeout") or {}
+    if not variants:
+        return []
+    noop_gap = _median([gap_ms(run) for run in (diag.get("noop") or {}).get("runs") or []])
+    first = next((run.get("diag") for series in variants.values() for run in series.get("runs") or [] if run.get("diag")), {}) or {}
+    lines = [f"{first.get('mb', 96)} MiB written under `/output`, then exit; three fresh containers per variant. The last column is the Docker "
+             "client's wall time beyond the container's own time: what happens after the process has exited and before `docker run` returns. "
+             f"For a no-op container that is {millis(noop_gap)} ms on this runner.", "",
+             "| variant | in-process ms (median) | container ms, `State.StartedAt`→`FinishedAt` (median) | Docker client wall ms (median) | "
+             "client wall − container, ms (median) |", "|---|---:|---:|---:|---:|"]
+    cell = lambda values, middle: (", ".join(f"{value:,.1f}" for value in values) + f" (**{millis(middle)}**)") if values else "n/a"  # noqa: E731
+    for name, series in variants.items():
+        runs = series.get("runs") or []
+        inner = [run["diag"]["ms"] for run in runs if run.get("diag") and "ms" in run["diag"]]
+        outer = [run["docker_s"] * 1e3 for run in runs if run.get("docker_s") is not None]
+        wall = [run["wall_s"] * 1e3 for run in runs if run.get("wall_s") is not None]
+        gaps = [gap_ms(run) for run in runs if gap_ms(run) is not None]
+        lines.append(f"| {WRITEOUT_LABELS.get(name, name)} | {cell(inner, _median(inner))} | {cell(outer, _median(outer))} | "
+                     f"{cell(wall, _median(wall))} | {cell(gaps, _median(gaps))} |")
+    if pipeline and pipeline.get("runs"):
+        runs = pipeline["runs"]
+        gaps = [gap_ms(run) for run in runs if gap_ms(run) is not None]
+        produced = _median([run.get("output_bytes") for run in runs])
+        lines += ["", f"The pipeline's own runs above wrote {size(produced)} each and show a client wall − container time of "
+                      f"{', '.join(millis(value) for value in gaps)} ms (median {millis(_median(gaps))}). "
+                      "The container's own time does not include it; a timer around `docker run` would."]
+    return lines
+
+
 def diag_lines(diag):
     lines = []
     noop = diag.get("noop") or {}
@@ -513,6 +556,8 @@ def compact_rows(result, correctness=None, b60=None):
         exact = result.get("sha") or "?"
         if result.get("source_sha") and result["source_sha"] != result.get("sha"):
             exact += f" (image built from the same Dockerfile, Cargo files and src/ as {result['source_sha']})"
+        if result.get("run_url"):
+            exact += f" [run {result['run_url'].rsplit('/', 1)[-1]}]({result['run_url']})"
         cells = [
             exact,
             baseline or "none",
@@ -641,6 +686,9 @@ def render_bench20m(result, correctness=None, b60=None, with_line=True):
             memory_lines = memtouch_lines(entry["diag"])
             if memory_lines:
                 lines += ["", f"### Seed {seed}: anonymous memory, fault-in and exit teardown", ""] + memory_lines
+            output_lines = writeout_lines(entry["diag"], pipeline)
+            if output_lines:
+                lines += ["", f"### Seed {seed}: output bytes, during and after the run", ""] + output_lines
             sysinfo = entry["diag"].get("sysinfo")
             if sysinfo:
                 lines += ["", "<details><summary>What a process sees inside the container (<code>diag sysinfo</code>, scorer flags)</summary>", "",
@@ -693,12 +741,16 @@ def render_bench60m(result):
                 rows.append(("`/reference` on the same input", f"did not finish on this runner: exit {reference.get('exit_code')}"
                                                                + (" (OOM-killed)" if reference.get("oom_killed") else "")
                                                                + f", peak memory {monitor_text(reference)}. Correctness rests on the self-check above."))
+            if reference.get("limits"):
+                rows.append(("`/reference` memory limit", f"`{reference['limits']}`: all this runner has. It is the correctness tool, not a "
+                                                          "scored run, so its limit is not the pipeline's."))
         lines += ["", f"### Seed {entry.get('seed')}: one pipeline run with the scorer's flags", "", "| | |", "|---|---|"]
         lines += [f"| {name} | {value} |" for name, value in rows]
         for item in [item for item in entry.get("compare") or [] if not item.get("match")][:2]:
             lines += ["", "```", item.get("output", ""), "```"]
-        if run.get("ss_timing"):
-            lines += [""] + stage_lines(run, "Stage timings")
+        staged = entry.get("timing_run") or run
+        if staged.get("ss_timing"):
+            lines += [""] + stage_lines(staged, "Stage timings from one extra run with `SS_TIMING=1`")
     return "\n".join(lines) + "\n"
 
 

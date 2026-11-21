@@ -39,6 +39,10 @@ on:
       seed_60m:
         description: "bench-60m: generator seed"
         default: "2"
+      standin:
+        description: "harness self-test: behave as if this commit had no root Dockerfile"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,6 +57,8 @@ env:
   DIAG_IMAGE: ss-diag:latest
   TOOLS_KEY: ss-tools-v1
   PYTHONDONTWRITEBYTECODE: "1"
+  # Harness self-test: behave as if this commit had no root Dockerfile.
+  STANDIN: ${{ inputs.standin }}
 
 jobs:
   correctness:
@@ -83,11 +89,11 @@ jobs:
           path: ~/ss-tools
           key: ${{ env.TOOLS_KEY }}
       - name: Build image (linux/amd64)
-        if: hashFiles('Dockerfile') != ''
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
         run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
       - name: Fixtures, extra fixtures and the dev answer
         run: |
-          image=""; [ -f Dockerfile ] && image="$IMAGE"
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
           python3 bench/bench.py correctness --image "$image" --tools "$HOME/ss-tools" \
             --work "$RUNNER_TEMP/ss" --out-json "$RUNNER_TEMP/evidence/correctness.json"
       - name: Report
@@ -139,13 +145,13 @@ jobs:
           path: ~/ss-tools
           key: ${{ env.TOOLS_KEY }}
       - name: Build image (linux/amd64)
-        if: hashFiles('Dockerfile') != ''
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
         run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
       - name: Build diagnostics image
         run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
       - name: Build prior-best image (bench/BEST_SHA)
         id: prior
-        if: hashFiles('Dockerfile') != ''
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
         run: bash bench/build_prior.sh ss-prior:latest
       - name: Benchmark (20M events)
         env:
@@ -153,7 +159,7 @@ jobs:
           PRIOR_SHA: ${{ steps.prior.outputs.sha }}
           PRIOR_STATUS: ${{ steps.prior.outputs.status }}
         run: |
-          image=""; [ -f Dockerfile ] && image="$IMAGE"
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
           cold=""; [ "$COLD_RUN" = "true" ] && cold="--cold-run"
           # Seeds: the run_workflow input, else [seeds=2,7] in the commit message, else the
           # BENCH_SEEDS repository variable, else bench/SEEDS, else 2.
@@ -230,13 +236,13 @@ jobs:
           path: ~/ss-tools
           key: ${{ env.TOOLS_KEY }}
       - name: Build image (linux/amd64)
-        if: hashFiles('Dockerfile') != ''
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
         run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
       - name: Build diagnostics image
         run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
       - name: Benchmark (60M events)
         run: |
-          image=""; [ -f Dockerfile ] && image="$IMAGE"
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
           python3 bench/bench.py bench60m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
             --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M"

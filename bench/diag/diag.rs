@@ -30,6 +30,14 @@
 //!         --munmap    each thread munmaps its own part before the process
 //!                     exits (teardown in parallel, inside the process)
 //!
+//!   diag writeout [--mb N] [--files K] [--fsync]
+//!       Writes N MiB (default 96) into K files (default 1) under $OUTPUT_DIR
+//!       and exits, as a pipeline writing its tables does. Without --fsync
+//!       the data is still dirty in the page cache at exit: what Docker then
+//!       spends before `docker run` returns shows up as client wall time
+//!       beyond the container's own time. With --fsync the write-back happens
+//!       inside the process instead, which prices the same bytes on this disk.
+//!
 //!   diag sysinfo
 //!       Prints what a process inside the container can see: CPUs, memory,
 //!       cgroup limits, transparent huge pages, mounts, environment.
@@ -63,6 +71,13 @@ fn main() {
                 1
             }
         },
+        Some("writeout") => match writeout(&args[2..], started) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("diag writeout: {error}");
+                1
+            }
+        },
         Some("sysinfo") => {
             sysinfo();
             0
@@ -71,7 +86,7 @@ fn main() {
             eprintln!(
                 "usage: diag noop | diag readthrough [--mode read|read-scan|mmap-touch|mmap-scan|mmap-populate-scan] \
                  [--threads N] [--chunk-kb K] | diag memtouch [--mb N] [--thp] [--populate] [--munmap] [--threads T] \
-                 | diag sysinfo"
+                 | diag writeout [--mb N] [--files K] [--fsync] | diag sysinfo"
             );
             2
         }
@@ -500,6 +515,42 @@ fn memtouch(args: &[String], started: Instant) -> io::Result<()> {
         u8::from(advised),
         u8::from(populate),
         unmapped.load(Ordering::Relaxed) >> 20,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// writeout
+// ---------------------------------------------------------------------------
+
+fn writeout(args: &[String], started: Instant) -> io::Result<()> {
+    use std::io::Write;
+    let megabytes = option_value(args, "--mb").and_then(|text| text.parse::<usize>().ok()).unwrap_or(96);
+    let files = option_value(args, "--files")
+        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|&count| count > 0)
+        .unwrap_or(1);
+    let sync = args.iter().any(|argument| argument == "--fsync");
+    let folder = env::var_os("OUTPUT_DIR").map_or_else(|| PathBuf::from("/output"), PathBuf::from).join("diag-writeout");
+    fs::create_dir_all(&folder)?;
+    // Not all zeros, so nothing along the way can treat the blocks as holes.
+    let block: Vec<u8> = (0..1usize << 20).map(|index| (index * 31 % 251) as u8).collect();
+    let mut written = 0usize;
+    for index in 0..files {
+        let mut file = File::create(folder.join(format!("part-{index}.bin")))?;
+        let share = megabytes / files + usize::from(index < megabytes % files);
+        for _ in 0..share {
+            file.write_all(&block)?;
+            written += 1;
+        }
+        if sync {
+            file.sync_all()?;
+        }
+    }
+    println!(
+        "DIAG writeout mb={written} files={files} fsync={} ms={:.3}",
+        u8::from(sync),
+        started.elapsed().as_secs_f64() * 1e3
     );
     Ok(())
 }

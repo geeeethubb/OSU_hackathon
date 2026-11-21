@@ -3,10 +3,12 @@
 How this repository measures the pipeline, so that a number in a report can be traced to exactly
 what was timed. The workflow is `.github/workflows/ci.yml`; everything it calls lives here.
 
-Every measurement runs on a GitHub-hosted `ubuntu-latest` runner (so far: 4 vCPUs of an AMD EPYC
-7763, 15.6 GiB RAM, no AVX-512). The scorer is a different machine (8 pinned hyperthreads of an
-Intel Xeon with AVX-512, 24 GB). These numbers rank candidates against each other on one machine;
-they do not predict the score.
+Every measurement runs on a GitHub-hosted `ubuntu-latest` runner: 4 vCPUs and 15.6 GiB RAM, but
+not one machine type. Jobs so far landed on an AMD EPYC 7763 (no AVX-512), an AMD EPYC 9V45 and an
+Intel Xeon 6975P-C (both with AVX-512), with different disks. So absolute times are comparable
+only within one job, which is why every comparison is paired inside a job and every report names
+its CPU. The scorer is yet another machine (8 pinned hyperthreads of an Intel Xeon with AVX-512,
+24 GB). These numbers rank candidates; they do not predict the score.
 
 ## What is timed
 
@@ -24,9 +26,14 @@ comparing them all happen outside. The organizers' `scripts/docker_run.sh` is ne
 benchmark number: it may start a second, clean-up container after the scored one.
 
 Container time is more than the pipeline's own work. It also holds Docker's start of the
-container (measured below with a binary that exits at once: about 78 ms on these runners) and the
+container (measured below with a binary that exits at once: 55 to 78 ms on these runners) and the
 kernel freeing the process's memory at exit, which `SS_TIMING` cannot see. The report shows
 "container time minus in-process total" for the stage run so this share stays visible.
+
+The client wall holds more again: whatever Docker does after the process has exited and before
+`docker run` returns. That grows with the bytes the run wrote to `/output` (on one runner type,
+about half a second for 98 MB), and it is why the two numbers are never merged. Which of the two
+the official timer resembles is not known.
 
 `SS_TIMING detail=<name> ms=<float>` lines (summed worker time, or work that overlaps a stage) are
 listed apart from the stages and never added to them.
@@ -78,6 +85,9 @@ For each seed in the seed list (practice scale, `--events 20000000 --clicks 5000
      pages; 2 MiB-aligned with `MADV_HUGEPAGE`; with each thread unmapping its part before exit;
      with `MAP_POPULATE` instead of touching. In-process time is the fault-in cost; container time
      minus in-process time minus the no-op floor is the teardown at exit.
+   - *output bytes*: 96 MiB written under `/output`, then exit, once left dirty in the page cache
+     and once `fsync`ed first. Client wall minus container time is what the bytes cost after the
+     process has exited; the `fsync` variant prices the same bytes inside the process.
    - `diag sysinfo`: CPUs, cgroup limits, huge-page settings and mounts as seen from inside.
 
    The first seed gets all of them; later seeds only the no-op and `mmap-scan`, which depend on
@@ -131,13 +141,16 @@ wall is kept for every sample.
 - **bench-60m** (final scale; `run_60m` input, or `[60m]` in the commit message): `--events
   60000000 --clicks 15000000`, one run with the scorer's flags. Reports the exit code, container
   time against the 180 s cap, peak memory, output and scratch use, disk free, the rules'
-  self-check, and the diff against `/reference` when the reference fits in the runner's memory.
+  self-check, stages from one extra run, and the diff against `/reference`. The reference is the
+  correctness tool, not a scored run, so it gets all the memory the runner has (`--memory` of RAM
+  minus 1 GiB, plus the swap); if it still does not finish, the report says that correctness at
+  this scale rests on the self-check alone.
 - **report**: one sticky pull-request comment per commit SHA, found again by a hidden marker and
   updated in place.
 
 A pull request from a branch of this repository is tested by its push event; the pull_request
 event only syncs the comment. Without a root `Dockerfile` the pipeline steps are skipped and only
-the diagnostics run.
+the diagnostics run; the `standin` input runs any commit that way, as a self-test of the harness.
 
 ## Evidence
 
@@ -170,7 +183,7 @@ evidence. On a machine other people are timing on, run it through the shared loc
 | `report.py` | Renders a result JSON as Markdown, including the compact line |
 | `sticky_comment.py` | Builds and posts the per-commit pull-request comment |
 | `ledger.py`, `LEDGER.md` | The experiment ledger |
-| `diag/diag.rs`, `diag.Dockerfile` | The diagnostics binary (`noop`, `readthrough`, `memtouch`, `sysinfo`) in an empty image |
+| `diag/diag.rs`, `diag.Dockerfile` | The diagnostics binary (`noop`, `readthrough`, `memtouch`, `writeout`, `sysinfo`) in an empty image |
 | `fetch_tools.sh` | Generator and dev answer, cached |
 | `build_prior.sh` | Builds the image of `bench/BEST_SHA` |
 | `local_bench.py` | Native timing helper |
