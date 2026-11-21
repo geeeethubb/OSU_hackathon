@@ -70,13 +70,16 @@ pub struct ScratchI {
     /// whatever an earlier partition left in a slot is never taken for a
     /// record, and nothing is cleared between partitions.
     tag: u64,
+    /// How the lists are read (`PLACE_PLAIN` and the others).
+    mode: u8,
 }
 
 impl ScratchI {
     /// For partitions of `1 << index_shift` indexes.
     pub fn new(index_shift: u32) -> Self {
         let slots = 1usize << index_shift;
-        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0 }
+        let mode = std::env::var("SS_PLACE").ok().and_then(|value| value.parse().ok()).unwrap_or(PLACE_PLAIN);
+        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0, mode }
     }
 
     /// Word 0 of a slot that holds a valid event of a generated user ID of
@@ -87,8 +90,128 @@ impl ScratchI {
     }
 }
 
+/// One record into the slot of its index, if it is the first copy the
+/// partition has there or one with a smaller ingest_ts. Returns whether it
+/// was written.
+#[inline(always)]
+fn put(slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64, word0: u64, word1: u64, purchase: u64) -> bool {
+    let slot = (word0 >> 48) as usize & (slots.len() - 1);
+    let held = slots[slot];
+    // Step 2 of the rules: the copy with the smallest ingest_ts wins (the
+    // first seen among equal ones, which are identical).
+    let first = held[0] >> TAG_SHIFT != tag;
+    let wins = first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK);
+    if wins {
+        slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
+        // Only a purchase writes its word: every reader looks at
+        // `purchases[slot]` only when the slot's winner has the purchase
+        // bit, and that winner wrote it here. What an earlier winner or
+        // partition left is never read.
+        if word1 & 1 == 1 {
+            purchases[slot] = purchase;
+        }
+    }
+    wins
+}
+
+/// The records of one block into their slots. Returns whether any was written.
+#[inline(always)]
+fn place_block(block: &[u64], slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64) -> bool {
+    let mut any = false;
+    let mut at = 0;
+    while at < block.len() {
+        // Blocks hold whole records: two words, plus one for a purchase.
+        let (word0, word1) = (block[at], block[at + 1]);
+        let has_purchase = (word1 & 1) as usize;
+        let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
+        at += 2 + has_purchase;
+        any |= put(slots, purchases, tag, word0, word1, purchase);
+    }
+    any
+}
+
+/// `place_block` with the slots asked for a window of records ahead of the
+/// writes: the slot table does not stay in the nearest cache while two
+/// threads share a core.
+#[inline(always)]
+fn place_block_ahead(block: &[u64], slots: &mut [[u64; 2]], purchases: &mut [u64], tag: u64) -> bool {
+    const WINDOW: usize = 32;
+    let mut starts = [0usize; WINDOW];
+    let mut any = false;
+    let mut at = 0;
+    while at < block.len() {
+        let mut count = 0;
+        while count < WINDOW && at < block.len() {
+            let slot = (block[at] >> 48) as usize & (slots.len() - 1);
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                // SAFETY: a prefetch reads nothing; the address is inside the table.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(slots.as_ptr().add(slot) as *const i8) };
+            }
+            let _ = slot;
+            starts[count] = at;
+            count += 1;
+            at += 2 + (block[at + 1] & 1) as usize;
+        }
+        for &start in &starts[..count] {
+            let (word0, word1) = (block[start], block[start + 1]);
+            let purchase = if word1 & 1 == 1 { block[start + 2] } else { 0 };
+            any |= put(slots, purchases, tag, word0, word1, purchase);
+        }
+    }
+    any
+}
+
+/// Asks for every cache line of a block: the lists were written long ago by
+/// other threads, and a block is too short for the hardware prefetcher to
+/// get ahead of the reader.
+#[inline(always)]
+fn prefetch(block: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut at = 0;
+        while at < block.len() {
+            // SAFETY: a prefetch reads nothing; the address is inside the block.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(block.as_ptr().add(at) as *const i8) };
+            at += 8;
+        }
+        if let Some(last) = block.last() {
+            // SAFETY: as above.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(last as *const u64 as *const i8) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = block;
+}
+
+/// How `place` reads the lists (`SS_PLACE`, for A/B runs; the slot table
+/// is the same whichever it is).
+pub const PLACE_PLAIN: u8 = 0;
+/// The next block of a list is asked for while the current one is read.
+pub const PLACE_NEXT_BLOCK: u8 = 1;
+/// The lists are read a block at a time in turn, each list's next block
+/// asked for a whole round before it is read.
+pub const PLACE_IN_TURN: u8 = 2;
+/// `PLACE_NEXT_BLOCK`, and the slots are asked for a window of records
+/// before they are written.
+pub const PLACE_SLOTS_AHEAD: u8 = 3;
+
 /// Places a partition's records by index. Returns whether there were any.
 fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
+    match scratch.mode {
+        PLACE_NEXT_BLOCK => place_as::<PLACE_NEXT_BLOCK>(lists, scratch),
+        PLACE_IN_TURN => place_as::<PLACE_IN_TURN>(lists, scratch),
+        PLACE_SLOTS_AHEAD => place_as::<PLACE_SLOTS_AHEAD>(lists, scratch),
+        _ => place_as::<PLACE_PLAIN>(lists, scratch),
+    }
+}
+
+/// `place`, reading the lists the way `MODE` says. The order in which the
+/// records are read does not matter: copies of one event with equal
+/// ingest_ts are identical.
+fn place_as<const MODE: u8>(lists: &[PartList], scratch: &mut ScratchI) -> bool {
     if scratch.tag == TAG_MAX {
         // Out of tags (2^31 partitions on one thread): start over.
         scratch.slots.fill([0; 2]);
@@ -96,33 +219,51 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
     }
     scratch.tag += 1;
     let tag = scratch.tag;
+    let (slots, purchases) = (&mut scratch.slots[..], &mut scratch.purchases[..]);
     let mut any = false;
-    for list in lists {
-        for block in list.blocks() {
-            let mut at = 0;
-            while at < block.len() {
-                // Blocks hold whole records: two words, plus one for a purchase.
-                let (word0, word1) = (block[at], block[at + 1]);
-                let has_purchase = (word1 & 1) as usize;
-                let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
-                at += 2 + has_purchase;
-                let slot = (word0 >> 48) as usize & (scratch.slots.len() - 1);
-                let held = scratch.slots[slot];
-                // Step 2 of the rules: the copy with the smallest ingest_ts
-                // wins (the first seen among equal ones, which are identical).
-                let first = held[0] >> TAG_SHIFT != tag;
-                if first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK) {
-                    scratch.slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
-                    // Only a purchase writes its word: every reader looks at
-                    // `purchases[slot]` only when the slot's winner has the
-                    // purchase bit, and that winner wrote it here. What an
-                    // earlier winner or partition left is never read.
-                    if has_purchase == 1 {
-                        scratch.purchases[slot] = purchase;
-                    }
-                    any = true;
+    if MODE == PLACE_IN_TURN {
+        let mut readers: Vec<_> = lists.iter().map(PartList::blocks).collect();
+        let mut ahead: Vec<Option<&[u64]>> = readers.iter_mut().map(Iterator::next).collect();
+        for block in ahead.iter().flatten() {
+            prefetch(block);
+        }
+        let mut left = true;
+        while left {
+            left = false;
+            for (reader, next) in readers.iter_mut().zip(ahead.iter_mut()) {
+                let Some(block) = next.take() else {
+                    continue;
+                };
+                *next = reader.next();
+                if let Some(following) = *next {
+                    prefetch(following);
+                    left = true;
                 }
+                any |= place_block(block, slots, purchases, tag);
             }
+        }
+        return any;
+    }
+    for list in lists {
+        if MODE == PLACE_PLAIN {
+            for block in list.blocks() {
+                any |= place_block(block, slots, purchases, tag);
+            }
+            continue;
+        }
+        let mut blocks = list.blocks();
+        let mut following = blocks.next();
+        while let Some(block) = following {
+            // The block after this one arrives while this one is read.
+            following = blocks.next();
+            if let Some(next) = following {
+                prefetch(next);
+            }
+            any |= if MODE == PLACE_SLOTS_AHEAD {
+                place_block_ahead(block, slots, purchases, tag)
+            } else {
+                place_block(block, slots, purchases, tag)
+            };
         }
     }
     any
