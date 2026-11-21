@@ -134,6 +134,9 @@ pub struct Keys {
     pub index_bound: u64,
     /// User indexes (`user number >> 9`) are below this.
     pub user_bound: u64,
+    /// Event indexes per index partition, as a shift (`SS_INDEX_SHIFT`,
+    /// 10 to 16; a partition's slot table should stay in the L2 cache).
+    pub index_shift: u32,
 }
 
 impl Keys {
@@ -271,8 +274,15 @@ pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
     if backward * 50 > layout.len() {
         return None;
     }
-    Some(Keys { event_key, user_key, index_bound, user_bound })
+    let index_shift = std::env::var("SS_INDEX_SHIFT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(DEFAULT_INDEX_SHIFT, |shift| shift.clamp(10, 16));
+    Some(Keys { event_key, user_key, index_bound, user_bound, index_shift })
 }
+
+/// 16,384 events per index partition: two words per slot make 256 KiB.
+pub const DEFAULT_INDEX_SHIFT: u32 = 14;
 
 #[cfg(test)]
 mod tests {
