@@ -99,7 +99,12 @@ impl Default for Arena {
 }
 
 /// Appends records to one partition.
+///
+/// `repr(C)`: the event parser's assembly stores through `cursor` and compares
+/// against `end` directly, so the order of the fields is part of the contract
+/// (four words; the cursor first, the block's end second).
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct PartWriter {
     cursor: *mut u64,
     end: *mut u64,
