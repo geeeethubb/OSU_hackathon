@@ -99,7 +99,7 @@ impl ParseOut {
 }
 
 /// User indexes per click list of index mode, as a shift.
-pub const CLICK_SHIFT: u32 = 9;
+pub const CLICK_SHIFT: u32 = 14;
 pub const CLICK_USERS: usize = 1 << CLICK_SHIFT;
 /// Words per block of those lists: a list holds a few hundred clicks.
 const USER_CLICK_BLOCK: usize = 128;
