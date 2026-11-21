@@ -546,16 +546,13 @@ fn user_daily_file(
         let top_category = &rows.top_category[start..end];
         // Days with purchases go last in their row group: the other rows then
         // share one run of zero revenue and one run of null categories.
-        writer.begin(names.len(), |row| top_category[row] != NO_CATEGORY)?;
+        writer.begin(top_category, |&category| category != NO_CATEGORY)?;
         writer.runs(names, |code, slot| user_name(code, slot, user_exotic))?;
-        writer.dates(|row| days[row])?;
-        if !writer.ints(|row| sessions[row])?
-            || !writer.ints(|row| events[row])?
-            || !writer.sparse_ints(|row| revenue[row])?
-        {
+        writer.dates(days)?;
+        if !writer.ints(sessions)? || !writer.ints(events)? || !writer.sparse_ints(revenue)? {
             return Ok(false);
         }
-        writer.strings(&ctx.category_names, |row| top_category[row], NO_CATEGORY)?;
+        writer.strings(&ctx.category_names, top_category, NO_CATEGORY)?;
         start = end;
     }
     writer.finish()?;
@@ -617,14 +614,12 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
         let mut start = 0;
         while start < day.len() {
             let end = (start + GROUP_ROWS).min(day.len());
-            let (channel, day) = (&channel[start..end], &day[start..end]);
-            writer.begin(end - start, |_| false)?;
+            writer.begin(&day[start..end], |_| false)?;
             writer.runs(&campaign[start..end], |id, _| Text::Long(&ctx.campaign_ids[id as usize]))?;
-            writer.strings(&channels, |row| channel[row], u32::MAX)?;
-            writer.dates(|row| day[row])?;
+            writer.strings(&channels, &channel[start..end], u32::MAX)?;
+            writer.dates(&day[start..end])?;
             for column in &columns {
-                let column = &column[start..end];
-                if !writer.ints(|row| column[row])? {
+                if !writer.ints(&column[start..end])? {
                     return Ok(false);
                 }
             }

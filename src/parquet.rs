@@ -377,21 +377,29 @@ pub fn write_file(path: &Path, columns: &[(&str, &Column)], num_rows: usize) -> 
 // The streaming writer.
 // ---------------------------------------------------------------------------
 
-/// Most rows a row group of [`GroupWriter`] may hold: row positions and
-/// dictionary indices of a row group then fit 16 bits with a value to spare.
-pub const MAX_GROUP_ROWS: usize = 1 << 15;
+/// Most rows a row group of [`GroupWriter`] may hold. The writer's scratch
+/// memory is a few bytes per row of this, whatever the size of the file.
+pub const MAX_GROUP_ROWS: usize = 1 << 14;
 /// Pending bytes at which [`GroupWriter::begin`] writes before it starts a row group.
 const FLUSH_BYTES: usize = 1 << 16;
 /// Bytes of the slot [`GroupWriter::runs`] hands its callback.
 pub const SHORT_TEXT: usize = 16;
 /// Integers below this find their dictionary index in a direct map.
 const DIRECT: usize = 1 << 16;
-/// "Not in the dictionary yet" in the direct map.
-const UNSEEN: u16 = u16::MAX;
 /// Distinct integers outside the direct map a chunk may hold before it is written PLAIN.
 const MOST_FAR: usize = 64;
 /// Leading zeros that make [`GroupWriter::sparse_ints`] write them as one run.
 const ZERO_RUN: usize = 16;
+/// The per-row scratch arrays have one entry per row position. The hot loops
+/// index them through `& ROW_MASK`, which changes no index below
+/// [`MAX_GROUP_ROWS`] and lets the compiler leave out the bounds check.
+const ROW_MASK: usize = MAX_GROUP_ROWS - 1;
+/// Bytes of the RLE runs of one `runs` chunk at most (three per run, a run
+/// per row and one more per 63 rows), rounded up; the arrays have 8 more for
+/// the 4-byte store that writes a run.
+const RUN_BYTES: usize = 1 << 16;
+const RUN_MASK: usize = RUN_BYTES - 1;
+const _: () = assert!(3 * (MAX_GROUP_ROWS + MAX_GROUP_ROWS / 63) < RUN_BYTES);
 
 /// What a column of [`GroupWriter`] holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -428,6 +436,14 @@ pub enum Text<'a> {
     Long(&'a [u8]),
 }
 
+/// A zeroed array on the heap. Pages of it that are never written cost nothing.
+fn zeroed<T: Copy + Default, const SIZE: usize>() -> Box<[T; SIZE]> {
+    match vec![T::default(); SIZE].into_boxed_slice().try_into() {
+        Ok(array) => array,
+        Err(_) => unreachable!(),
+    }
+}
+
 /// Replaces `buffer` by a zeroed one of at least `needed` bytes that starts
 /// with the same `keep` bytes. A fresh zeroed allocation costs nothing for the
 /// pages that are never written.
@@ -444,14 +460,21 @@ fn index_width(entries: usize) -> usize {
     (usize::BITS - entries.saturating_sub(1).leading_zeros()).max(1) as usize
 }
 
-/// Bit-packs `values` at `width` bits each (1 to 16, every value below
-/// `2^width`), least significant bits first and padded with zeros to a
-/// multiple of eight values: the body of one bit-packed run. `out` must hold
-/// `ceil(values / 8) * width` bytes plus 16 that get zeroed or scribbled on.
-fn pack(values: &[u16], width: usize, out: &mut [u8]) {
+/// Whether an integer can be stored as INT32.
+fn fits_int32(value: i64) -> bool {
+    i64::from(value as i32) == value
+}
+
+/// Bit-packs `value(0)`, `value(1)`, ... `value(count - 1)` at `width` bits
+/// each (1 to 16, every value below `2^width`), least significant bits first
+/// and padded with zeros to a multiple of eight values: the body of one
+/// bit-packed run. `out` must hold `ceil(count / 8) * width` bytes plus 16
+/// that get zeroed or scribbled on.
+#[inline]
+fn pack(count: usize, value: impl Fn(usize) -> u16, width: usize, out: &mut [u8]) {
     debug_assert!((1..=16).contains(&width));
     // Eight values are `width` whole bytes: four per half, both halves in one word.
-    let word = |group: &[u16; 8]| -> u128 {
+    let word = |group: [u16; 8]| -> u128 {
         let (mut low, mut high) = (0u64, 0u64);
         for slot in 0..4 {
             low |= u64::from(group[slot]) << (slot * width);
@@ -459,33 +482,102 @@ fn pack(values: &[u16], width: usize, out: &mut [u8]) {
         }
         u128::from(low) | (u128::from(high) << (4 * width))
     };
+    let mut to = 0;
     let mut at = 0;
-    let mut groups = values.chunks_exact(8);
-    for group in &mut groups {
-        let group: &[u16; 8] = group.try_into().unwrap();
-        out[at..at + 16].copy_from_slice(&word(group).to_le_bytes());
-        at += width;
+    if width <= 8 {
+        // The common case: eight values fit one 64-bit word.
+        while at + 8 <= count {
+            let mut packed = 0u64;
+            for slot in 0..8 {
+                packed |= u64::from(value(at + slot)) << (slot * width);
+            }
+            out[to..to + 8].copy_from_slice(&packed.to_le_bytes());
+            to += width;
+            at += 8;
+        }
     }
-    let rest = groups.remainder();
-    if !rest.is_empty() {
-        let mut last = [0u16; 8];
-        last[..rest.len()].copy_from_slice(rest);
-        out[at..at + 16].copy_from_slice(&word(&last).to_le_bytes());
+    while at + 8 <= count {
+        let group = std::array::from_fn(|slot| value(at + slot));
+        out[to..to + 16].copy_from_slice(&word(group).to_le_bytes());
+        to += width;
+        at += 8;
+    }
+    if at < count {
+        let group = std::array::from_fn(|slot| if at + slot < count { value(at + slot) } else { 0 });
+        out[to..to + 16].copy_from_slice(&word(group).to_le_bytes());
     }
 }
 
+/// Stores one RLE run of `rows` rows (at most 63) of dictionary entry `index`
+/// at `runs[at..at + 3]`: a one-byte header (twice the length) and the 16-bit
+/// index. The byte after it is scribbled on.
+#[inline]
+fn put_run(runs: &mut [u8; RUN_BYTES + 8], at: usize, rows: usize, index: usize) {
+    let at = at & RUN_MASK;
+    let record = ((rows as u32) << 1) | ((index as u32) << 8);
+    runs[at..at + 4].copy_from_slice(&record.to_le_bytes());
+}
+
 /// Appends RLE runs of dictionary entry `index` for `rows` rows, at most 63
-/// rows each: a one-byte header (twice the length) and the 16-bit index.
-/// Returns the new fill of `records`, which must have a spare byte.
-fn rle_runs(records: &mut [u8], mut used: usize, mut rows: usize, index: usize) -> usize {
+/// rows each, and returns the new fill of `runs`.
+fn rle_runs(runs: &mut [u8; RUN_BYTES + 8], mut used: usize, mut rows: usize, index: usize) -> usize {
     while rows > 0 {
         let take = rows.min(63);
-        let record = ((take as u32) << 1) | ((index as u32) << 8);
-        records[used..used + 4].copy_from_slice(&record.to_le_bytes());
+        put_run(runs, used, take, index);
         used += 3;
         rows -= take;
     }
     used
+}
+
+/// Appends one RLE run of a definition level: a varint header (twice the
+/// length) and the level. An empty run is not written.
+fn level_run(levels: &mut Vec<u8>, length: usize, level: bool) {
+    if length > 0 {
+        put_varint(levels, (length as u64) << 1);
+        levels.push(u8::from(level));
+    }
+}
+
+/// The bytes of a file that are not written yet: its magic, then whole row
+/// groups. The vector keeps its full length; `used` is how much is filled.
+struct Pending {
+    bytes: Vec<u8>,
+    used: usize,
+    /// File offset of `bytes[0]`.
+    written: u64,
+}
+
+impl Pending {
+    /// The file offset of the next byte.
+    fn position(&self) -> u64 {
+        self.written + self.used as u64
+    }
+
+    /// The next `bytes` bytes, to be filled by the caller.
+    #[inline]
+    fn room(&mut self, bytes: usize) -> &mut [u8] {
+        let start = self.used;
+        let end = start + bytes;
+        if end > self.bytes.len() {
+            enlarge(&mut self.bytes, start, end);
+        }
+        self.used = end;
+        &mut self.bytes[start..end]
+    }
+
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.room(bytes.len()).copy_from_slice(bytes);
+    }
+
+    /// The body of one bit-packed run of `count` values (see [`pack`]).
+    #[inline]
+    fn pack(&mut self, count: usize, value: impl Fn(usize) -> u16, width: usize) {
+        let bytes = count.div_ceil(8) * width;
+        pack(count, value, width, self.room(bytes + 16));
+        self.used -= 16;
+    }
 }
 
 /// Writes a Parquet file one row group at a time.
@@ -498,9 +590,9 @@ fn rle_runs(records: &mut [u8], mut used: usize, mut rows: usize, index: usize) 
 ///
 /// Rows of a row group are not written in the caller's order: `begin` takes a
 /// predicate that sends rows to the tail of the row group. Every column
-/// method takes values by the caller's row number and applies the same order,
-/// so a caller that puts its rare, expensive rows (here: days with purchases)
-/// in the tail gets long runs in the head for free.
+/// method takes its values in the caller's order and applies the same
+/// reordering, so a caller that puts its rare, expensive rows (here: days
+/// with purchases) in the tail gets long runs in the head for free.
 ///
 /// Encodings, per column chunk, all standard:
 /// * `runs`: a dictionary page with one entry per run of equal keys and an
@@ -515,34 +607,30 @@ fn rle_runs(records: &mut [u8], mut used: usize, mut rows: usize, index: usize) 
 pub struct GroupWriter<'a> {
     file: File,
     fields: &'a [(&'a str, ColumnType)],
-    /// Bytes not written yet: the file's magic, then whole row groups. The
-    /// vector keeps its full length; `used` is how much of it is filled.
-    pending: Vec<u8>,
-    used: usize,
-    /// File offset of `pending[0]`.
-    written: u64,
+    out: Pending,
     /// `fields.len()` chunks per finished row group, then those of the open one.
     chunks: Vec<ChunkInfo>,
     /// Rows of every row group; the last one is open until the next `begin` or `finish`.
     groups: Vec<usize>,
     /// The open row group: the caller's row written at each position (head
     /// rows, then tail rows), how many head rows there are, and for every
-    /// caller's row the number of tail rows before it (one extra entry: all).
-    order: Vec<u16>,
+    /// caller's row the number of tail rows up to and including it.
+    order: Box<[u16; MAX_GROUP_ROWS]>,
     head: usize,
-    tails: Vec<u16>,
+    tails: Box<[u16; MAX_GROUP_ROWS]>,
     /// Scratch of `runs`: where each run starts, the dictionary page, and the
     /// RLE runs of the head and of the tail.
-    starts: Vec<u32>,
+    starts: Box<[u16; MAX_GROUP_ROWS]>,
     entries: Vec<u8>,
-    head_runs: Vec<u8>,
-    tail_runs: Vec<u8>,
-    /// Scratch of the dictionary encoders: an index per written row, the
-    /// distinct integers, their indices by value (`direct`, all `UNSEEN`
-    /// between chunks) and the few values beyond it (`far`).
-    indices: Vec<u16>,
+    head_runs: Box<[u8; RUN_BYTES + 8]>,
+    tail_runs: Box<[u8; RUN_BYTES + 8]>,
+    /// Scratch of the dictionary encoders: an index per caller's row, the
+    /// distinct integers, for every small integer its index plus one
+    /// (`direct`, all zero between chunks) and the few integers beyond it
+    /// (`far`).
+    by_row: Box<[u16; MAX_GROUP_ROWS]>,
     distinct: Vec<i64>,
-    direct: Vec<u16>,
+    direct: Box<[u16; DIRECT]>,
     far: Vec<(i64, u16)>,
 }
 
@@ -551,60 +639,53 @@ impl<'a> GroupWriter<'a> {
         let mut writer = Self {
             file: File::create(path)?,
             fields,
-            pending: Vec::new(),
-            used: 0,
-            written: 0,
+            out: Pending { bytes: Vec::new(), used: 0, written: 0 },
             chunks: Vec::new(),
             groups: Vec::new(),
-            order: Vec::new(),
+            order: zeroed(),
             head: 0,
-            tails: Vec::new(),
-            starts: Vec::new(),
+            tails: zeroed(),
+            starts: zeroed(),
             entries: Vec::new(),
-            head_runs: Vec::new(),
-            tail_runs: Vec::new(),
-            indices: Vec::new(),
+            head_runs: zeroed(),
+            tail_runs: zeroed(),
+            by_row: zeroed(),
             distinct: Vec::new(),
-            direct: Vec::new(),
+            direct: zeroed(),
             far: Vec::new(),
         };
-        writer.put(b"PAR1");
+        writer.out.put(b"PAR1");
         Ok(writer)
     }
 
-    /// Starts a row group of `rows` rows (1 to [`MAX_GROUP_ROWS`]). The rows
-    /// for which `tail` is true are written after all the others; within
-    /// each of the two parts rows keep the caller's order.
-    pub fn begin(&mut self, rows: usize, tail: impl Fn(usize) -> bool) -> io::Result<()> {
+    /// Starts a row group with one row per element of `marks` (1 to
+    /// [`MAX_GROUP_ROWS`]). The rows whose mark makes `tail` true are written
+    /// after all the others; within each of the two parts rows keep the
+    /// caller's order.
+    pub fn begin<T>(&mut self, marks: &[T], tail: impl Fn(&T) -> bool) -> io::Result<()> {
+        let rows = marks.len();
         assert!((1..=MAX_GROUP_ROWS).contains(&rows), "row group size");
         assert_eq!(self.chunks.len(), self.groups.len() * self.fields.len(), "the open row group lacks columns");
-        if self.used >= FLUSH_BYTES {
+        if self.out.used >= FLUSH_BYTES {
             self.flush()?;
         }
         // Usually enough for the whole row group, so the buffer is sized once.
-        let wanted = self.used + 16 * rows + (1 << 12);
-        if self.pending.len() < wanted {
-            enlarge(&mut self.pending, self.used, wanted);
-        }
-        if self.order.len() < rows {
-            self.order.resize(rows, 0);
-            self.tails.resize(rows + 1, 0);
-            self.indices.resize(rows, 0);
-            self.distinct.resize(rows, 0);
+        let wanted = self.out.used + 16 * rows + (1 << 12);
+        if self.out.bytes.len() < wanted {
+            enlarge(&mut self.out.bytes, self.out.used, wanted);
         }
         // Without a branch per row: every row is stored as the next head row
         // and as the next tail row, and only one of the two is kept.
-        let (order, tails, behind) = (&mut self.order, &mut self.tails, &mut self.indices);
-        let (mut head, mut tail_rows) = (0, 0);
-        for row in 0..rows {
-            let is_tail = tail(row);
-            tails[row] = tail_rows as u16;
-            order[head] = row as u16;
-            behind[tail_rows] = row as u16;
+        let (order, tails, behind) = (&mut *self.order, &mut *self.tails, &mut *self.by_row);
+        let (mut head, mut tail_rows) = (0usize, 0usize);
+        for (row, mark) in marks.iter().enumerate() {
+            let is_tail = tail(mark);
+            order[head & ROW_MASK] = row as u16;
+            behind[tail_rows & ROW_MASK] = row as u16;
             head += usize::from(!is_tail);
             tail_rows += usize::from(is_tail);
+            tails[row & ROW_MASK] = tail_rows as u16;
         }
-        tails[rows] = tail_rows as u16;
         order[head..rows].copy_from_slice(&behind[..tail_rows]);
         self.head = head;
         self.groups.push(rows);
@@ -624,56 +705,31 @@ impl<'a> GroupWriter<'a> {
         }
         meta.string(6, CREATED_BY);
         let meta = meta.finish();
-        self.put(&meta);
-        self.put(&(meta.len() as u32).to_le_bytes());
-        self.put(b"PAR1");
+        self.out.put(&meta);
+        self.out.put(&(meta.len() as u32).to_le_bytes());
+        self.out.put(b"PAR1");
         self.flush()
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.write_all(&self.pending[..self.used])?;
-        self.written += self.used as u64;
-        self.used = 0;
+        self.file.write_all(&self.out.bytes[..self.out.used])?;
+        self.out.written += self.out.used as u64;
+        self.out.used = 0;
         Ok(())
     }
 
-    /// The file offset of the next pending byte.
-    fn position(&self) -> u64 {
-        self.written + self.used as u64
-    }
-
-    /// The next `bytes` pending bytes, to be filled by the caller.
-    #[inline]
-    fn room(&mut self, bytes: usize) -> &mut [u8] {
-        let start = self.used;
-        let end = start + bytes;
-        if end > self.pending.len() {
-            enlarge(&mut self.pending, start, end);
-        }
-        self.used = end;
-        &mut self.pending[start..end]
-    }
-
-    #[inline]
-    fn put(&mut self, bytes: &[u8]) {
-        self.room(bytes.len()).copy_from_slice(bytes);
-    }
-
-    /// Rows of the open row group.
-    fn rows(&self) -> usize {
-        *self.groups.last().expect("no open row group")
-    }
-
-    /// The type of the column that comes next in the open row group.
-    fn next(&self) -> ColumnType {
+    /// The type of the column that comes next in the open row group, which
+    /// must have `values` rows.
+    fn next(&self, values: usize) -> ColumnType {
+        assert_eq!(values, *self.groups.last().expect("no open row group"), "column length");
         let done = self.chunks.len() - (self.groups.len() - 1) * self.fields.len();
         self.fields[done].1
     }
 
     /// Records the chunk that started at `offset` and ends at the current position.
     fn chunk(&mut self, physical_type: i32, offset: u64, data_page_offset: u64) {
-        let num_values = self.rows() as u64;
-        let size = self.position() - offset;
+        let num_values = *self.groups.last().expect("no open row group") as u64;
+        let size = self.out.position() - offset;
         self.chunks.push(ChunkInfo { physical_type, offset, data_page_offset, size, num_values });
     }
 
@@ -687,70 +743,67 @@ impl<'a> GroupWriter<'a> {
         keys: &[u64],
         mut text: impl FnMut(u64, &mut [u8; SHORT_TEXT]) -> Text<'t>,
     ) -> io::Result<()> {
-        assert!(self.next() == ColumnType::Str, "column type");
-        let rows = self.rows();
-        assert_eq!(keys.len(), rows, "column length");
+        assert!(self.next(keys.len()) == ColumnType::Str, "column type");
+        let rows = keys.len();
 
         // Where each run starts, without a branch per row: every row writes
         // its position into the slot of the run that would start there, and
         // the slot is kept only when the key differs from the one before.
-        if self.starts.len() <= rows {
-            self.starts.resize(rows + 1, 0);
-        }
-        let starts = &mut self.starts[..=rows];
-        let mut count = 0;
+        let starts = &mut *self.starts;
+        let mut count = 0usize;
         let mut previous = !keys[0];
         for (at, &key) in keys.iter().enumerate() {
-            starts[count] = at as u32;
+            starts[count & ROW_MASK] = at as u16;
             count += usize::from(key != previous);
             previous = key;
         }
-        starts[count] = rows as u32;
 
         // One dictionary entry per run (PLAIN: length, then bytes), and its
         // rows as one RLE run among the head rows and one among the tail rows.
-        let most_runs = 3 * (count + rows / 63) + 4;
-        if self.head_runs.len() < most_runs {
-            self.head_runs = vec![0; most_runs];
-            self.tail_runs = vec![0; most_runs];
-        }
         if self.entries.len() < 13 * count + 32 {
             self.entries = vec![0; 13 * count + 32];
         }
         let (entries, head_runs, tail_runs, tails) =
-            (&mut self.entries, &mut self.head_runs, &mut self.tail_runs, &self.tails);
+            (&mut self.entries, &mut *self.head_runs, &mut *self.tail_runs, &*self.tails);
         let (mut entries_used, mut head_used, mut tail_used) = (0, 0, 0);
+        // Tail rows before the run at hand: runs follow one another.
+        let mut tails_before = 0;
         for run in 0..count {
-            let (start, end) = (starts[run] as usize, starts[run + 1] as usize);
+            let start = usize::from(starts[run & ROW_MASK]);
+            let end = if run + 1 < count { usize::from(starts[(run + 1) & ROW_MASK]) } else { rows };
             if entries.len() < entries_used + 4 + SHORT_TEXT {
                 enlarge(entries, entries_used, entries_used + 4 + SHORT_TEXT);
             }
-            let slot: &mut [u8; SHORT_TEXT] =
-                (&mut entries[entries_used + 4..entries_used + 4 + SHORT_TEXT]).try_into().unwrap();
+            let entry: &mut [u8; 4 + SHORT_TEXT] =
+                (&mut entries[entries_used..entries_used + 4 + SHORT_TEXT]).try_into().unwrap();
+            let (length_slot, slot) = entry.split_at_mut(4);
+            let slot: &mut [u8; SHORT_TEXT] = slot.try_into().unwrap();
             let length = match text(keys[start], slot) {
                 Text::Short(length) => {
                     assert!(length <= SHORT_TEXT);
+                    length_slot.copy_from_slice(&(length as u32).to_le_bytes());
                     length
                 }
                 Text::Long(bytes) => {
                     if entries.len() < entries_used + 4 + bytes.len() {
                         enlarge(entries, entries_used, entries_used + 4 + bytes.len());
                     }
+                    entries[entries_used..entries_used + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
                     entries[entries_used + 4..entries_used + 4 + bytes.len()].copy_from_slice(bytes);
                     bytes.len()
                 }
             };
-            entries[entries_used..entries_used + 4].copy_from_slice(&(length as u32).to_le_bytes());
             entries_used += 4 + length;
 
-            let behind = usize::from(tails[end] - tails[start]);
+            let tails_through = usize::from(tails[(end - 1) & ROW_MASK]);
+            let behind = tails_through - tails_before;
+            tails_before = tails_through;
             let ahead = end - start - behind;
             if ahead <= 63 && behind <= 63 {
                 // Both runs are stored; an empty one is overwritten by the next.
-                let index = (run as u32) << 8;
-                head_runs[head_used..head_used + 4].copy_from_slice(&(((ahead as u32) << 1) | index).to_le_bytes());
+                put_run(head_runs, head_used, ahead, run);
                 head_used += if ahead > 0 { 3 } else { 0 };
-                tail_runs[tail_used..tail_used + 4].copy_from_slice(&(((behind as u32) << 1) | index).to_le_bytes());
+                put_run(tail_runs, tail_used, behind, run);
                 tail_used += if behind > 0 { 3 } else { 0 };
             } else {
                 head_used = rle_runs(head_runs, head_used, ahead, run);
@@ -758,269 +811,290 @@ impl<'a> GroupWriter<'a> {
             }
         }
 
-        let offset = self.position();
+        let offset = self.out.position();
         let header = page_header(PAGE_DICTIONARY, count, entries_used, ENCODING_PLAIN)?;
-        self.put(&header);
-        let entries = std::mem::take(&mut self.entries);
-        self.put(&entries[..entries_used]);
-        self.entries = entries;
-        let data_page_offset = self.position();
+        self.out.put(&header);
+        self.out.put(&self.entries[..entries_used]);
+        let data_page_offset = self.out.position();
         let mut header = page_header(PAGE_DATA, rows, 1 + head_used + tail_used, ENCODING_RLE_DICTIONARY)?;
         header.push(16); // bit width of the indices
-        self.put(&header);
-        let head_runs = std::mem::take(&mut self.head_runs);
-        self.put(&head_runs[..head_used]);
-        self.head_runs = head_runs;
-        let tail_runs = std::mem::take(&mut self.tail_runs);
-        self.put(&tail_runs[..tail_used]);
-        self.tail_runs = tail_runs;
+        self.out.put(&header);
+        self.out.put(&self.head_runs[..head_used]);
+        self.out.put(&self.tail_runs[..tail_used]);
         self.chunk(TYPE_BYTE_ARRAY, offset, data_page_offset);
         Ok(())
     }
 
     /// A string column (nullable or not, as its field says): the value of a
-    /// row is `dictionary[index(row)]`, or null where the index is `null`.
-    pub fn strings<S: AsRef<[u8]>>(
-        &mut self,
-        dictionary: &[S],
-        index: impl Fn(usize) -> u32,
-        null: u32,
-    ) -> io::Result<()> {
-        let optional = match self.next() {
+    /// row is `dictionary[indices[row]]`, or null where the index is `null`.
+    pub fn strings<S: AsRef<[u8]>>(&mut self, dictionary: &[S], indices: &[u32], null: u32) -> io::Result<()> {
+        let optional = match self.next(indices.len()) {
             ColumnType::Str => false,
             ColumnType::OptStr => true,
             _ => panic!("column type"),
         };
-        let rows = self.rows();
+        let rows = indices.len();
+        let head = self.head;
+        let order = &self.order[..rows];
 
-        // In written order: the definition levels (1 = present) as RLE runs of
-        // a varint header (twice the length) and the level, and the indices
-        // of the values that are present.
-        let mut levels: Vec<u8> = Vec::new();
-        let mut run: Option<(bool, u64)> = None;
-        let (mut present, mut highest, mut plain_size) = (0usize, 0u32, 0usize);
-        for at in 0..rows {
-            let value = index(usize::from(self.order[at]));
-            let here = value != null;
-            match &mut run {
-                Some((level, length)) if *level == here => *length += 1,
-                _ => {
-                    if let Some((level, length)) = run {
-                        put_varint(&mut levels, length << 1);
-                        levels.push(u8::from(level));
-                    }
-                    run = Some((here, 1));
-                }
-            }
-            if here {
-                assert!((value as usize) < dictionary.len(), "index outside the dictionary");
-                self.indices[present] = value as u16;
-                present += 1;
-                highest = highest.max(value);
-                plain_size += 4 + dictionary[value as usize].as_ref().len();
-            }
-        }
-        if let Some((level, length)) = run {
-            put_varint(&mut levels, length << 1);
-            levels.push(u8::from(level));
+        // One pass in the caller's order: how many values are present, the
+        // highest index, and whether the nulls are exactly the head rows.
+        let (mut present, mut highest, mut nulls_lead, mut tails_before) = (0usize, 0u32, true, 0u16);
+        for (&index, &tails_through) in indices.iter().zip(&self.tails[..rows]) {
+            let here = index != null;
+            present += usize::from(here);
+            highest = highest.max(if here { index } else { 0 });
+            nulls_lead &= here == (tails_through != tails_before);
+            tails_before = tails_through;
         }
         assert!(optional || present == rows, "null in a required column");
-        // What a data page starts with: the levels behind their byte length.
-        let mut prefix = Vec::with_capacity(4 + levels.len());
-        if optional {
+        assert!(present == 0 || (highest as usize) < dictionary.len(), "index outside the dictionary");
+
+        // The definition levels (1 = present) of a nullable column, as RLE
+        // runs in written order behind their byte length: what its data page
+        // starts with. And the caller's rows of the values that are present,
+        // in written order.
+        let mut prefix = Vec::with_capacity(16);
+        let mut scattered = Vec::new();
+        let valued: &[u16] = if !optional {
+            order
+        } else {
+            let mut levels = Vec::with_capacity(8);
+            let valued = if nulls_lead {
+                level_run(&mut levels, head, false);
+                level_run(&mut levels, rows - head, true);
+                &order[head..]
+            } else {
+                let (mut level, mut length) = (false, 0);
+                for &row in order {
+                    let here = indices[usize::from(row)] != null;
+                    if here != level {
+                        level_run(&mut levels, length, level);
+                        (level, length) = (here, 0);
+                    }
+                    length += 1;
+                    if here {
+                        scattered.push(row);
+                    }
+                }
+                level_run(&mut levels, length, level);
+                &scattered[..]
+            };
             prefix.extend_from_slice(&(levels.len() as u32).to_le_bytes());
             prefix.extend_from_slice(&levels);
-        }
+            valued
+        };
+        debug_assert_eq!(valued.len(), present);
+        let plain_size: usize =
+            valued.iter().map(|&row| 4 + dictionary[indices[usize::from(row)] as usize].as_ref().len()).sum();
 
         let width = index_width(dictionary.len());
         let groups = present.div_ceil(8);
         let dictionary_size: usize = dictionary.iter().map(|entry| 4 + entry.as_ref().len()).sum();
-        let offset = self.position();
+        let offset = self.out.position();
+        let mut data_page_offset = offset;
         if present > 0 && dictionary.len() <= DIRECT && dictionary_size + groups * width + 32 < plain_size {
             let header = page_header(PAGE_DICTIONARY, dictionary.len(), dictionary_size, ENCODING_PLAIN)?;
-            self.put(&header);
+            self.out.put(&header);
             for entry in dictionary {
                 let entry = entry.as_ref();
-                self.put(&(entry.len() as u32).to_le_bytes());
-                self.put(entry);
+                self.out.put(&(entry.len() as u32).to_le_bytes());
+                self.out.put(entry);
             }
-            let data_page_offset = self.position();
+            data_page_offset = self.out.position();
             let mut start = vec![width as u8];
             put_varint(&mut start, ((groups as u64) << 1) | 1);
             let size = prefix.len() + start.len() + groups * width;
             let mut header = page_header(PAGE_DATA, rows, size, ENCODING_RLE_DICTIONARY)?;
             header.extend_from_slice(&prefix);
             header.extend_from_slice(&start);
-            self.put(&header);
-            let indices = std::mem::take(&mut self.indices);
-            pack(&indices[..present], width, self.room(groups * width + 16));
-            self.indices = indices;
-            self.used -= 16;
-            self.chunk(TYPE_BYTE_ARRAY, offset, data_page_offset);
+            self.out.put(&header);
+            self.out.pack(present, |at| indices[usize::from(valued[at])] as u16, width);
         } else {
             let mut header = page_header(PAGE_DATA, rows, prefix.len() + plain_size, ENCODING_PLAIN)?;
             header.extend_from_slice(&prefix);
-            self.put(&header);
-            for at in 0..rows {
-                let value = index(usize::from(self.order[at]));
-                if value != null {
-                    let entry = dictionary[value as usize].as_ref();
-                    self.put(&(entry.len() as u32).to_le_bytes());
-                    self.put(entry);
-                }
+            self.out.put(&header);
+            for &row in valued {
+                let entry = dictionary[indices[usize::from(row)] as usize].as_ref();
+                self.out.put(&(entry.len() as u32).to_le_bytes());
+                self.out.put(entry);
             }
-            self.chunk(TYPE_BYTE_ARRAY, offset, offset);
         }
+        self.chunk(TYPE_BYTE_ARRAY, offset, data_page_offset);
         Ok(())
     }
 
     /// An integer column with few distinct values. `Ok(false)` means the
-    /// field is INT32 and a value does not fit (it is negative or over
-    /// `i32::MAX`): the file is unusable and the caller starts it again with
-    /// an INT64 field.
-    pub fn ints(&mut self, value: impl Fn(usize) -> i64) -> io::Result<bool> {
-        let Some(physical_type) = self.integer_type(&value) else {
-            return Ok(false);
+    /// field is INT32 and a value does not fit: the file is unusable and the
+    /// caller starts it again with an INT64 field.
+    pub fn ints(&mut self, values: &[i64]) -> io::Result<bool> {
+        let physical_type = match self.next(values.len()) {
+            ColumnType::Int32 => TYPE_INT32,
+            ColumnType::Int64 => TYPE_INT64,
+            _ => panic!("column type"),
         };
-        self.integers(physical_type, value)?;
+        let count = self.number(values);
+        if physical_type == TYPE_INT32 {
+            // Every value is in the dictionary, unless numbering gave up.
+            let fits = match count {
+                Some(count) => self.distinct[..count].iter().all(|&value| fits_int32(value)),
+                None => values.iter().all(|&value| fits_int32(value)),
+            };
+            if !fits {
+                return Ok(false);
+            }
+        }
+        self.integers(physical_type, values, count)?;
         Ok(true)
     }
 
+    /// A DATE column.
+    pub fn dates(&mut self, days: &[i32]) -> io::Result<()> {
+        assert!(self.next(days.len()) == ColumnType::Date, "column type");
+        let count = self.number(days);
+        self.integers(TYPE_INT32, days, count)
+    }
+
     /// An integer column that is zero in most rows, when the row group's
-    /// order puts those rows first. `Ok(false)` as for [`ints`](Self::ints).
-    pub fn sparse_ints(&mut self, value: impl Fn(usize) -> i64) -> io::Result<bool> {
-        let Some(physical_type) = self.integer_type(&value) else {
-            return Ok(false);
+    /// order puts the other rows in the tail. `Ok(false)` as for
+    /// [`ints`](Self::ints).
+    pub fn sparse_ints(&mut self, values: &[i64]) -> io::Result<bool> {
+        let (physical_type, bytes) = match self.next(values.len()) {
+            ColumnType::Int32 => (TYPE_INT32, 4),
+            ColumnType::Int64 => (TYPE_INT64, 8),
+            _ => panic!("column type"),
         };
-        let bytes = if physical_type == TYPE_INT64 { 8 } else { 4 };
-        let rows = self.rows();
-        let zeros = self.order[..rows].iter().take_while(|&&row| value(usize::from(row)) == 0).count();
-        let offset = self.position();
+        let rows = values.len();
+        // One pass in the caller's order: the range, and whether every head row is zero.
+        let (mut least, mut most, mut head_bits, mut tails_before) = (0i64, 0i64, 0i64, 0u16);
+        for (&value, &tails_through) in values.iter().zip(&self.tails[..rows]) {
+            least = least.min(value);
+            most = most.max(value);
+            head_bits |= if tails_through != tails_before { 0 } else { value };
+            tails_before = tails_through;
+        }
+        if bytes == 4 && !(fits_int32(least) && fits_int32(most)) {
+            return Ok(false);
+        }
+        let zeros = if head_bits == 0 {
+            self.head
+        } else {
+            self.order[..rows].iter().take_while(|&&row| values[usize::from(row)] == 0).count()
+        };
+
+        let offset = self.out.position();
         let mut data_page_offset = offset;
         let mut done = 0;
         if zeros >= ZERO_RUN {
             // A dictionary that holds 0, and the leading zeros as one RLE run of its index.
             let header = page_header(PAGE_DICTIONARY, 1, bytes, ENCODING_PLAIN)?;
-            self.put(&header);
-            self.put(&[0u8; 8][..bytes]);
-            data_page_offset = self.position();
+            self.out.put(&header);
+            self.out.put(&[0u8; 8][..bytes]);
+            data_page_offset = self.out.position();
             let mut run = vec![1u8]; // bit width of the index
             put_varint(&mut run, (zeros as u64) << 1);
             run.push(0);
             let mut header = page_header(PAGE_DATA, zeros, run.len(), ENCODING_RLE_DICTIONARY)?;
             header.extend_from_slice(&run);
-            self.put(&header);
+            self.out.put(&header);
             done = zeros;
         }
         if done < rows {
-            self.plain_page(bytes, done, &value)?;
+            self.plain_page(bytes, done, values)?;
         }
         self.chunk(physical_type, offset, data_page_offset);
         Ok(true)
     }
 
-    /// A DATE column.
-    pub fn dates(&mut self, day: impl Fn(usize) -> i32) -> io::Result<()> {
-        assert!(self.next() == ColumnType::Date, "column type");
-        self.integers(TYPE_INT32, |row| i64::from(day(row)))
-    }
-
-    /// The physical type of the integer column that comes next, or `None`
-    /// when it is INT32 and one of its values does not fit.
-    fn integer_type(&self, value: &impl Fn(usize) -> i64) -> Option<i32> {
-        match self.next() {
-            ColumnType::Int64 => Some(TYPE_INT64),
-            ColumnType::Int32 => {
-                // A negative value has the top bit set, so one OR tells both.
-                let all = (0..self.rows()).fold(0u64, |all, row| all | value(row) as u64);
-                (all <= i32::MAX as u64).then_some(TYPE_INT32)
-            }
-            _ => panic!("column type"),
-        }
-    }
-
-    /// One PLAIN data page of `value` for the written rows from `from` on.
-    fn plain_page(&mut self, bytes: usize, from: usize, value: &impl Fn(usize) -> i64) -> io::Result<()> {
-        let rows = self.rows();
+    /// One PLAIN data page of the integers of the written rows from position `from` on.
+    fn plain_page<T: Copy + Into<i64>>(&mut self, bytes: usize, from: usize, values: &[T]) -> io::Result<()> {
+        let rows = values.len();
         let header = page_header(PAGE_DATA, rows - from, (rows - from) * bytes, ENCODING_PLAIN)?;
-        self.put(&header);
-        let order = std::mem::take(&mut self.order);
-        let out = self.room((rows - from) * bytes);
-        for (slot, &row) in out.chunks_exact_mut(bytes).zip(&order[from..rows]) {
+        self.out.put(&header);
+        let out = self.out.room((rows - from) * bytes);
+        for (slot, &row) in out.chunks_exact_mut(bytes).zip(&self.order[from..rows]) {
             // Little-endian two's complement: the low bytes are the INT32.
-            slot.copy_from_slice(&value(usize::from(row)).to_le_bytes()[..bytes]);
+            let value: i64 = values[usize::from(row)].into();
+            slot.copy_from_slice(&value.to_le_bytes()[..bytes]);
         }
-        self.order = order;
         Ok(())
     }
 
-    /// One INT32 or INT64 chunk (every value fits): the distinct values as a
-    /// dictionary and bit-packed indices, or PLAIN when that is smaller.
-    fn integers(&mut self, physical_type: i32, value: impl Fn(usize) -> i64) -> io::Result<()> {
-        let bytes = if physical_type == TYPE_INT64 { 8 } else { 4 };
-        let rows = self.rows();
-        if self.direct.is_empty() {
-            self.direct = vec![UNSEEN; DIRECT];
-        }
-        // The index of every written row, numbering values as they first appear.
-        let (order, indices, distinct, direct, far) =
-            (&self.order, &mut self.indices, &mut self.distinct, &mut self.direct, &mut self.far);
+    /// Numbers the distinct values of a column as they first appear in the
+    /// caller's order: `by_row` gets the number of every row's value and
+    /// `distinct` the values. `None` when too many values lie outside the
+    /// direct map for a dictionary to be worth it.
+    fn number<T: Copy + Into<i64>>(&mut self, values: &[T]) -> Option<usize> {
+        let (by_row, distinct, direct, far) =
+            (&mut self.by_row[..values.len()], &mut self.distinct, &mut *self.direct, &mut self.far);
+        distinct.clear();
         far.clear();
-        let mut count = 0;
-        let mut too_many = false;
-        for at in 0..rows {
-            let value = value(usize::from(order[at]));
-            indices[at] = if (value as u64) < DIRECT as u64 {
+        let mut gave_up = false;
+        for (index, &value) in by_row.iter_mut().zip(values) {
+            let value: i64 = value.into();
+            *index = if (value as u64) < DIRECT as u64 {
+                // The map holds the index plus one; zero is "not seen yet".
                 let slot = &mut direct[value as usize];
-                if *slot == UNSEEN {
-                    *slot = count as u16;
-                    distinct[count] = value;
-                    count += 1;
+                if *slot == 0 {
+                    distinct.push(value);
+                    *slot = distinct.len() as u16;
                 }
-                *slot
+                *slot - 1
             } else if let Some(known) = far.iter().find(|known| known.0 == value) {
                 known.1
             } else if far.len() < MOST_FAR {
-                far.push((value, count as u16));
-                distinct[count] = value;
-                count += 1;
-                (count - 1) as u16
+                far.push((value, distinct.len() as u16));
+                distinct.push(value);
+                (distinct.len() - 1) as u16
             } else {
-                too_many = true;
+                gave_up = true;
                 break;
             };
         }
-        for &value in &distinct[..count] {
+        // Leave the direct map clean for the next chunk.
+        for &value in distinct.iter() {
             if (value as u64) < DIRECT as u64 {
-                direct[value as usize] = UNSEEN;
+                direct[value as usize] = 0;
             }
         }
+        (!gave_up).then_some(distinct.len())
+    }
 
-        let width = index_width(count);
+    /// One INT32 or INT64 chunk (every value fits) of a column that `number`
+    /// has just numbered: the distinct values as a dictionary and bit-packed
+    /// indices, or PLAIN when that is smaller.
+    fn integers<T: Copy + Into<i64>>(
+        &mut self,
+        physical_type: i32,
+        values: &[T],
+        count: Option<usize>,
+    ) -> io::Result<()> {
+        let bytes = if physical_type == TYPE_INT64 { 8 } else { 4 };
+        let rows = values.len();
         let groups = rows.div_ceil(8);
-        let offset = self.position();
-        if too_many || count * bytes + groups * width + 32 >= rows * bytes {
-            self.plain_page(bytes, 0, &value)?;
-            self.chunk(physical_type, offset, offset);
-            return Ok(());
-        }
+        let offset = self.out.position();
+        let count = match count {
+            Some(count) if count * bytes + groups * index_width(count) + 32 < rows * bytes => count,
+            _ => {
+                self.plain_page(bytes, 0, values)?;
+                self.chunk(physical_type, offset, offset);
+                return Ok(());
+            }
+        };
+        let width = index_width(count);
         let header = page_header(PAGE_DICTIONARY, count, count * bytes, ENCODING_PLAIN)?;
-        self.put(&header);
-        let distinct = std::mem::take(&mut self.distinct);
-        for (slot, value) in self.room(count * bytes).chunks_exact_mut(bytes).zip(&distinct) {
+        self.out.put(&header);
+        for (slot, value) in self.out.room(count * bytes).chunks_exact_mut(bytes).zip(&self.distinct[..count]) {
             slot.copy_from_slice(&value.to_le_bytes()[..bytes]);
         }
-        self.distinct = distinct;
-        let data_page_offset = self.position();
+        let data_page_offset = self.out.position();
         let mut start = vec![width as u8];
         put_varint(&mut start, ((groups as u64) << 1) | 1);
         let mut header = page_header(PAGE_DATA, rows, start.len() + groups * width, ENCODING_RLE_DICTIONARY)?;
         header.extend_from_slice(&start);
-        self.put(&header);
-        let indices = std::mem::take(&mut self.indices);
-        pack(&indices[..rows], width, self.room(groups * width + 16));
-        self.indices = indices;
-        self.used -= 16;
+        self.out.put(&header);
+        let (order, by_row) = (&*self.order, &*self.by_row);
+        self.out.pack(rows, |at| by_row[usize::from(order[at & ROW_MASK]) & ROW_MASK], width);
         self.chunk(physical_type, offset, data_page_offset);
         Ok(())
     }
@@ -1057,7 +1131,7 @@ mod tests {
                     .collect();
                 let bytes = count.div_ceil(8) * width;
                 let mut out = vec![0xAAu8; bytes + 16];
-                pack(&values, width, &mut out);
+                pack(count, |at| values[at], width, &mut out);
                 assert_eq!(unpack(&out[..bytes], width, count), values, "width {width} count {count}");
                 // The values that pad the last group are zero.
                 let padded = unpack(&out[..bytes], width, count.div_ceil(8) * 8);
@@ -1066,22 +1140,33 @@ mod tests {
         }
         // Width 4 is two values per byte, low nibble first.
         let mut out = [0u8; 24];
-        pack(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 4, &mut out);
+        pack(9, |at| at as u16 + 1, 4, &mut out);
         assert_eq!(&out[..8], &[0x21, 0x43, 0x65, 0x87, 0x09, 0, 0, 0]);
     }
 
     #[test]
     fn index_widths() {
-        for (entries, width) in [(0, 1), (1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (16, 4), (17, 5), (256, 8), (257, 9), (65536, 16)] {
+        let cases = [(0, 1), (1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (16, 4), (17, 5), (256, 8), (257, 9), (65536, 16)];
+        for (entries, width) in cases {
             assert_eq!(index_width(entries), width, "{entries} entries");
         }
     }
 
     #[test]
     fn long_runs_are_split() {
-        let mut records = vec![0u8; 64];
-        assert_eq!(rle_runs(&mut records, 0, 0, 7), 0);
-        let used = rle_runs(&mut records, 0, 130, 0x1234);
-        assert_eq!(&records[..used], &[126, 0x34, 0x12, 126, 0x34, 0x12, 8, 0x34, 0x12]);
+        let mut runs: Box<[u8; RUN_BYTES + 8]> = zeroed();
+        assert_eq!(rle_runs(&mut runs, 0, 0, 7), 0);
+        let used = rle_runs(&mut runs, 0, 130, 0x1234);
+        assert_eq!(&runs[..used], &[126, 0x34, 0x12, 126, 0x34, 0x12, 8, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn int32_range() {
+        for value in [0, 1, -1, i64::from(i32::MAX), i64::from(i32::MIN)] {
+            assert!(fits_int32(value));
+        }
+        for value in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1, i64::MAX, i64::MIN, 1 << 32] {
+            assert!(!fits_int32(value));
+        }
     }
 }
