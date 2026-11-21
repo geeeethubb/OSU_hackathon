@@ -379,6 +379,9 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
             events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
         }
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 3 => {
+            events_lean_loop::<3, INDEXED>(ctx, buffer, position, end, out)
+        }
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
             events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
         }
@@ -388,6 +391,15 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
 
 /// The lean kernel's loop when rows are stored (or, in a diagnostic mode,
 /// dropped). Nothing is called on its common path.
+///
+/// The kernel works in two halves, and the loop runs them out of step: the
+/// first half of the next row, then the second half of this one. A row's
+/// first half is everything that takes long to arrive (loads, the vector
+/// units); run one row early, its results are there when the second half
+/// needs them, and the processor never sits with a window full of work that
+/// is waiting. The next row's start is taken from this row's early guess of
+/// its own length; where that was wrong, or the row is declined, the first
+/// half is simply run again at the right place.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
@@ -397,24 +409,67 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_row_lean_step, lean_setup, ROW_DECLINE, ROW_PAD};
-    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
+    use super::simd::{
+        event_lean_back, event_lean_front, event_lean_masks, lean_setup, LeanFront, LEAN_PAD, ROW_DECLINE,
+    };
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(LEAN_PAD));
     let (lean, window_length) = lean_setup(ctx);
     // Opaque to the optimizer: see `LeanTables`.
     let lean = std::hint::black_box(lean);
+    let base = buffer.as_ptr();
     let mut row = EventRow::default();
-    while position < stop {
-        // SAFETY: at least ROW_PAD readable bytes follow `position`, and the
-        // tables are those of `ctx`.
-        let (length, guess, status) = unsafe {
-            event_row_lean_step::<MODE, INDEXED>(ctx, lean, window_length, buffer.as_ptr().add(position), out, &mut row)
-        };
-        if status == ROW_DECLINE {
-            position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
-        } else if length != guess {
-            position = row_end_elsewhere(position, length);
-        } else {
+    if MODE == 2 {
+        while position < stop {
+            // SAFETY: at least LEAN_PAD readable bytes follow `position`.
+            let (folded, guess) = unsafe { event_lean_masks(lean, base.add(position)) };
+            row.event ^= folded;
             position += guess + 1;
+        }
+        std::hint::black_box(row.event);
+        return position;
+    }
+    let mut fronts = [std::mem::MaybeUninit::<LeanFront>::uninit(); 2];
+    let mut which = 0;
+    if MODE == 3 {
+        // Diagnostic: first halves only.
+        while position < stop {
+            // SAFETY: as below.
+            unsafe {
+                event_lean_front::<INDEXED>(ctx, lean, base.add(position), fronts[0].as_mut_ptr());
+                let front = &*fronts[0].as_ptr();
+                row.event ^= front.fold();
+                position += front.guess + 1;
+            }
+        }
+        std::hint::black_box(row.event);
+        return position;
+    }
+    'restart: while position < stop {
+        // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
+        // readable bytes after it; a first half reads at most 132 bytes from
+        // where it is run, which is `position` or at most 97 bytes past it.
+        unsafe { event_lean_front::<INDEXED>(ctx, lean, base.add(position), fronts[which].as_mut_ptr()) };
+        loop {
+            let p = unsafe { base.add(position) };
+            let current = fronts[which].as_ptr();
+            let guess = unsafe { (*current).guess };
+            let (length, status) = unsafe {
+                event_lean_front::<INDEXED>(ctx, lean, p.add(guess + 1), fronts[which ^ 1].as_mut_ptr());
+                event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, current, out, &mut row)
+            };
+            if status == ROW_DECLINE {
+                position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+                continue 'restart;
+            }
+            if length != guess {
+                position = row_end_elsewhere(position, length);
+                continue 'restart;
+            }
+            position += guess + 1;
+            which ^= 1;
+            if position >= stop {
+                break 'restart;
+            }
         }
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
