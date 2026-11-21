@@ -24,14 +24,14 @@
 //!   first and last runs are set aside and joined afterwards (`chains`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::arena::PartList;
 use super::codes::{unmix, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
-use super::keys::{Keys, USER_NUMBER};
+use super::keys::Keys;
 use super::links::LinkTable;
-use super::parse::{INDEX_SLOTS, RAW_CLICK_WORDS};
+use super::parse::{CLICK_USERS, INDEX_SLOTS};
 use super::sessions::{PassCOut, ScratchC, EVENT_SPARE};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
@@ -127,98 +127,99 @@ impl ClickIndex {
     }
 }
 
-/// Builds a `ClickIndex` in two parallel passes over the parsed clicks with a
-/// serial step between them: `count` every batch, `layout`, `scatter` every
-/// batch, `finish`.
+/// Builds a `ClickIndex` from the per-user-range click lists of index mode
+/// (`parse::emit_click`): every range is counted and laid out on its own, in
+/// parallel, so the writes of one range stay within a few kilobytes.
 pub struct ClickIndexBuilder {
-    /// Per user index: its click count, then where its next click goes.
-    cursors: Vec<AtomicU32>,
+    /// Where each range's clicks begin; one more entry closes the last range.
+    bases: Vec<u32>,
+    ends: Vec<u32>,
     clicks: Vec<[u64; 2]>,
 }
 
-/// The click array while several threads fill disjoint entries of it.
+/// The two arrays while several threads fill disjoint parts of them.
 #[derive(Clone, Copy)]
-pub struct ClickTarget(*mut [u64; 2]);
+pub struct ClickTarget {
+    ends: *mut u32,
+    clicks: *mut [u64; 2],
+}
 
-// SAFETY: every entry is written by exactly one thread (the cursors hand each
-// position out once), and nothing reads the array until all have finished.
+// SAFETY: a range's entries are written by the one thread that fills that
+// range, and nothing reads the arrays until all have finished.
 unsafe impl Send for ClickTarget {}
 unsafe impl Sync for ClickTarget {}
 
 impl ClickIndexBuilder {
-    pub fn new(keys: &Keys) -> Self {
-        // Zeroed pages stay untouched until a user index in them is counted.
-        let mut zeros = std::mem::ManuallyDrop::new(vec![0u32; keys.user_bound as usize + 1]);
-        // SAFETY: `AtomicU32` has the size, alignment and bit validity of
-        // `u32`, and the vector's buffer changes hands exactly once.
-        let cursors =
-            unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut AtomicU32, zeros.len(), zeros.capacity()) };
-        Self { cursors, clicks: Vec::new() }
+    /// `lists[thread][range]` are the click lists. Ranges after the last one
+    /// that has clicks are left out.
+    pub fn new(lists: &[Vec<PartList>]) -> (Self, ClickTarget) {
+        let ranges = lists.first().map_or(0, Vec::len);
+        let mut bases = Vec::with_capacity(ranges + 1);
+        let (mut total, mut used) = (0usize, 0usize);
+        for range in 0..ranges {
+            bases.push(total as u32);
+            let clicks: usize = lists.iter().map(|per_thread| per_thread[range].words() / 2).sum();
+            if clicks > 0 {
+                used = range + 1;
+            }
+            total += clicks;
+        }
+        assert!(total <= u32::MAX as usize);
+        bases.truncate(used);
+        bases.push(total as u32);
+        let mut ends: Vec<u32> = Vec::with_capacity(used * CLICK_USERS);
+        let mut clicks: Vec<[u64; 2]> = Vec::with_capacity(total);
+        // SAFETY: `fill` writes every entry of every used range exactly once
+        // before `finish` hands the vectors out; neither type has invalid values.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            ends.set_len(used * CLICK_USERS);
+            clicks.set_len(total);
+        }
+        let target = ClickTarget { ends: ends.as_mut_ptr(), clicks: clicks.as_mut_ptr() };
+        (Self { bases, ends, clicks }, target)
     }
 
-    /// Counts a batch of parsed clicks (blocks of `[user, click code and
-    /// campaign, ts]`, the user as index mode's `emit_click` stores it). A
-    /// click of an ID that is not a generated one goes to its person's
-    /// partition instead. Returns the highest user index seen plus one.
-    pub fn count(&self, links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) -> u64 {
-        let mut users = 0;
-        for block in blocks {
-            for click in block.chunks_exact(RAW_CLICK_WORDS) {
-                if click[0] & USER_NUMBER != 0 {
-                    let user = (click[0] & !USER_NUMBER) >> 9;
-                    // SAFETY: `emit_click` only stores numbers whose index
-                    // is below `user_bound`, the length of `cursors`.
-                    unsafe { self.cursors.get_unchecked(user as usize) }.fetch_add(1, Ordering::Relaxed);
-                    users = users.max(user + 1);
-                } else {
-                    forward_click(out, links.person(click[0]), click[2], click[1]);
+    /// The ranges `fill` must be called for, each once.
+    pub fn ranges(&self) -> usize {
+        self.bases.len() - 1
+    }
+
+    /// Lays out one range: `lists` are its click lists, one per thread.
+    pub fn fill(&self, range: usize, lists: &[PartList], target: ClickTarget) {
+        let mut counts = [0u32; CLICK_USERS];
+        for list in lists {
+            for block in list.blocks() {
+                for click in block.chunks_exact(2) {
+                    counts[((click[0] >> 41) as usize) & (CLICK_USERS - 1)] += 1;
                 }
             }
         }
-        users
-    }
-
-    /// Turns the counts of the first `users` user indexes into start
-    /// positions and makes room for the clicks.
-    pub fn layout(&mut self, users: u64) -> ClickTarget {
-        self.cursors.truncate(users as usize);
-        let mut total = 0u32;
-        for cursor in &mut self.cursors {
-            let count = *cursor.get_mut();
-            *cursor.get_mut() = total;
-            total += count;
+        let mut cursors = [0u32; CLICK_USERS];
+        let mut running = self.bases[range];
+        for user in 0..CLICK_USERS {
+            cursors[user] = running;
+            running += counts[user];
+            // SAFETY: `range` is below `ranges()`, so the entry exists; this
+            // call is the only writer of this range's entries.
+            unsafe { *target.ends.add(range * CLICK_USERS + user) = running };
         }
-        self.clicks = Vec::with_capacity(total as usize);
-        // SAFETY: `scatter` writes each of the `total` entries exactly once
-        // before `finish` hands the vector out, and `[u64; 2]` has no invalid values.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            self.clicks.set_len(total as usize)
-        };
-        ClickTarget(self.clicks.as_mut_ptr())
-    }
-
-    /// Puts a batch's clicks in their users' ranges.
-    pub fn scatter(&self, blocks: &[&[u64]], target: ClickTarget) {
-        for block in blocks {
-            for click in block.chunks_exact(RAW_CLICK_WORDS) {
-                if click[0] & USER_NUMBER != 0 {
-                    let number = click[0] & !USER_NUMBER;
-                    // SAFETY: the same clicks were counted, so the user's
-                    // cursor exists and stays inside the user's range.
-                    unsafe {
-                        let at = self.cursors.get_unchecked((number >> 9) as usize).fetch_add(1, Ordering::Relaxed);
-                        *target.0.add(at as usize) = [click[2] | ((number & (ALIASES - 1)) << 32), click[1]];
-                    }
+        debug_assert_eq!(running, self.bases[range + 1]);
+        for list in lists {
+            for block in list.blocks() {
+                for click in block.chunks_exact(2) {
+                    let user = ((click[0] >> 41) as usize) & (CLICK_USERS - 1);
+                    // SAFETY: the same clicks were counted just above, so the
+                    // cursor stays inside this range's part of `clicks`.
+                    unsafe { *target.clicks.add(cursors[user] as usize) = [click[0] & ((1 << 41) - 1), click[1]] };
+                    cursors[user] += 1;
                 }
             }
         }
     }
 
     pub fn finish(self) -> ClickIndex {
-        // Every cursor has moved to its user's end.
-        let ends = self.cursors.into_iter().map(AtomicU32::into_inner).collect();
-        ClickIndex { ends, clicks: self.clicks }
+        ClickIndex { ends: self.ends, clicks: self.clicks }
     }
 }
 
@@ -362,15 +363,15 @@ pub struct Edge {
 }
 
 /// Joins the edge runs of neighbouring partitions into whole runs, in index
-/// order. `None` when user indexes decrease somewhere: the data is not laid
-/// out the way index mode needs.
-pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<(u64, Vec<Record>)>> {
+/// order, without copying a record. `None` when user indexes decrease
+/// somewhere: the data is not laid out the way index mode needs.
+pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<Chain>> {
     edges.sort_unstable_by_key(|edge| edge.part);
-    let mut whole: Vec<(u64, Vec<Record>)> = Vec::new();
-    let mut open: Option<(u64, Vec<Record>)> = None;
+    let mut whole: Vec<Chain> = Vec::new();
+    let mut open: Option<Chain> = None;
     for edge in edges {
         match &mut open {
-            Some((user, records)) if *user == edge.first_user => records.extend_from_slice(&edge.first),
+            Some((user, pieces)) if *user == edge.first_user => pieces.push(edge.first),
             _ => {
                 if let Some(previous) = open.take() {
                     if edge.first_user < previous.0 {
@@ -378,19 +379,23 @@ pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<(u64, Vec<Record>)>> {
                     }
                     whole.push(previous);
                 }
-                open = Some((edge.first_user, edge.first));
+                open = Some((edge.first_user, vec![edge.first]));
             }
         }
         if edge.last_user != u64::MAX {
             // The runner checked the order of the runs inside a partition:
             // this is a later user.
             whole.extend(open.take());
-            open = Some((edge.last_user, edge.last));
+            open = Some((edge.last_user, vec![edge.last]));
         }
     }
     whole.extend(open);
     Some(whole)
 }
+
+/// One user's run that touched partition edges: its records, in the pieces
+/// the partitions set aside (index order).
+pub type Chain = (u64, Vec<Vec<Record>>);
 
 /// One thread's state for the index pass.
 pub struct Runner {
@@ -401,7 +406,6 @@ pub struct Runner {
     aliases: Vec<[u64; 2]>,
     run: u64,
     records: Vec<Record>,
-    merged: Vec<Record>,
     /// The person being collected: event timestamps and purchases.
     ts: Vec<u32>,
     purchases: Vec<[u64; 2]>,
@@ -437,7 +441,6 @@ impl Runner {
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
-            merged: Vec::new(),
             ts: Vec::new(),
             purchases: Vec::new(),
             clicks: Vec::new(),
@@ -511,7 +514,7 @@ impl Runner {
                             edge.first_user = current;
                             edge.first = std::mem::take(&mut records);
                         } else if gathering {
-                            self.process_run(shared, b_out, c_out, current, &records);
+                            self.process_run(shared, b_out, c_out, current, &[&records]);
                             records.clear();
                         } else {
                             self.finish_direct(shared, c_out, current);
@@ -670,28 +673,24 @@ impl Runner {
     }
 
     /// One user's events (`word1 >> 31` is the same user index in all of
-    /// them), in any order, each ID resolved through the link table: each
-    /// simple person in it goes to the session kernel, events of complex
-    /// components go to their persons' partitions.
+    /// them), given in pieces and in any order, each ID resolved through the
+    /// link table: each simple person in it goes to the session kernel,
+    /// events of complex components go to their persons' partitions.
     pub fn process_run(
         &mut self,
         shared: &Shared,
         b_out: &mut PassBOut,
         c_out: &mut PassCOut,
         user: u64,
-        records: &[Record],
+        pieces: &[&[Record]],
     ) {
-        let mut merged = std::mem::take(&mut self.merged);
-        let extra = if shared.extras.is_empty() { None } else { shared.extras.by_user.get(&user) };
-        let records = match extra {
-            Some((used, more)) => {
+        // The user's events whose own ID is not a generated one join the run.
+        let extra: &[Record] = match shared.extras.by_user.get(&user) {
+            Some((used, more)) if !shared.extras.is_empty() => {
                 used.store(true, Ordering::Relaxed);
-                merged.clear();
-                merged.extend_from_slice(records);
-                merged.extend_from_slice(more);
-                &merged[..]
+                more
             }
-            None => records,
+            _ => &[],
         };
         self.run += 1;
         self.ts.clear();
@@ -699,7 +698,7 @@ impl Runner {
         self.others.clear();
         // The first simple person met; codes are never 0.
         let mut first = 0u64;
-        for &[word0, word1, purchase] in records {
+        for &[word0, word1, purchase] in pieces.iter().copied().chain(std::iter::once(extra)).flatten() {
             let name = resolve(&mut self.aliases, self.run, shared, word1 >> 22);
             let ts = (word0 >> 1) & TS_MASK;
             let is_purchase = word1 & 1;
@@ -744,7 +743,6 @@ impl Runner {
                 self.others = others;
             }
         }
-        self.merged = merged;
     }
 
     /// The simple person `name` of `user`, whose events are in `self.ts` and

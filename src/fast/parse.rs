@@ -6,7 +6,7 @@
 
 use super::arena::{Arena, PartWriter};
 use super::codes::{id_code, mix};
-use super::keys::{base36_value, Keys, USER_NUMBER};
+use super::keys::{base36_value, Keys};
 use super::{Ctx, EVENT_BLOCK};
 use crate::util::{parse_price, parse_ts, split_fields, LATE_MS, WEEK_MS};
 
@@ -59,10 +59,14 @@ pub struct ParseOut {
     /// Valid clicks in parse order, three words each: user code, click code
     /// and campaign, ts. They live in the arena like the events do, so the
     /// list never reallocates and sits in huge pages where those exist.
-    /// Three words per click: user, click code and campaign, ts. In index
-    /// mode the user word of a generated ID is its user number with
-    /// `keys::USER_NUMBER` set; any other ID keeps its code.
+    /// Three words per click: user code, click code and campaign, ts. In
+    /// index mode only the clicks of IDs that are not generated ones.
     pub clicks: PartWriter,
+    /// Index mode: the clicks of generated user IDs, one list per run of
+    /// `CLICK_USERS` user indexes, two words per click:
+    /// ts (32) | alias (9) | user index within the run (9), then click code
+    /// and campaign.
+    pub user_clicks: Vec<PartWriter>,
     /// The keys of index mode, for `emit_click`.
     pub keys: Option<Keys>,
     pub links: Vec<(u64, u64)>,
@@ -81,18 +85,38 @@ impl ParseOut {
             indexed: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| index_parts(&keys))],
             odd_event_users: Vec::new(),
             clicks: PartWriter::EMPTY,
+            user_clicks: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| click_parts(&keys))],
             keys: ctx.keys,
             links: Vec::new(),
         }
     }
 }
 
+/// User indexes per click list of index mode, as a shift.
+pub const CLICK_SHIFT: u32 = 9;
+pub const CLICK_USERS: usize = 1 << CLICK_SHIFT;
+/// Words per block of those lists: a list holds a few hundred clicks.
+const USER_CLICK_BLOCK: usize = 128;
+
+/// How many click lists cover every user index below the keys' bound.
+pub fn click_parts(keys: &Keys) -> usize {
+    (keys.user_bound >> CLICK_SHIFT) as usize + 1
+}
+
 #[inline(always)]
 pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
-    let user = match &out.keys {
-        Some(keys) => keys.user_number_of_code(click.user).map_or(click.user, |number| number | USER_NUMBER),
-        None => click.user,
-    };
+    if let Some(number) = out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user)) {
+        // SAFETY: the number's user index is below the keys' bound, which
+        // sized `user_clicks`; `reserve` returned room for two words.
+        unsafe {
+            let writer = out.user_clicks.get_unchecked_mut((number >> (9 + CLICK_SHIFT)) as usize);
+            let at = writer.reserve(&mut out.arena, USER_CLICK_BLOCK, 2);
+            *at = u64::from(click.ts) | ((number & ((1 << (9 + CLICK_SHIFT)) - 1)) << 32);
+            *at.add(1) = click.code_and_campaign;
+        }
+        return;
+    }
+    let user = click.user;
     let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
     // SAFETY: `reserve` returned room for three words.
     unsafe {

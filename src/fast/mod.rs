@@ -509,13 +509,12 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let indexed_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
+    // Index mode: per worker, the clicks of generated user IDs by user range.
+    let user_click_lists: Vec<Vec<PartList>> =
+        parse_out.iter_mut().map(|out| out.user_clicks.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
-    // Index mode: clicks are grouped by user index instead of being sent to
-    // their persons' partitions one by one.
-    let mut click_builder = ctx.keys.as_ref().map(indexed::ClickIndexBuilder::new);
-    let click_users = AtomicU64::new(0);
     let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
     let winners_nanos = AtomicU64::new(0);
@@ -536,13 +535,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - event_parts) {
                 let started = measure.then(Instant::now);
-                match (&ctx.keys, &click_builder) {
-                    (Some(_), Some(builder)) => {
-                        let users = builder.count(&link_table, batch, out);
-                        click_users.fetch_max(users, Ordering::Relaxed);
-                    }
-                    _ => dedup::map_clicks(&link_table, batch, out),
-                }
+                dedup::map_clicks(&link_table, batch, out);
                 if let Some(started) = started {
                     clicks_spent += started.elapsed().as_nanos() as u64;
                 }
@@ -559,13 +552,22 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     // Index mode: the click index, and the few events and clicks that are
     // already known to belong to the general path.
-    let index_state = match (&ctx.keys, click_builder.take()) {
-        (Some(keys), Some(mut builder)) => {
-            let target = builder.layout(click_users.load(Ordering::Relaxed));
+    let index_state = match &ctx.keys {
+        Some(keys) => {
+            // The clicks of generated user IDs, grouped by user index.
+            let (builder, target) = indexed::ClickIndexBuilder::new(&user_click_lists);
+            let ranges = builder.ranges();
             let next = AtomicUsize::new(0);
             parallel(threads, |_| {
-                while let Some(batch) = click_batches.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    builder.scatter(batch, target);
+                let mut lists: Vec<PartList> = Vec::with_capacity(user_click_lists.len());
+                loop {
+                    let range = next.fetch_add(1, Ordering::Relaxed);
+                    if range >= ranges {
+                        break;
+                    }
+                    lists.clear();
+                    lists.extend(user_click_lists.iter().map(|per_thread| per_thread[range]));
+                    builder.fill(range, &lists, target);
                 }
             });
             let click_index = builder.finish();
@@ -586,7 +588,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             indexed::forward_complex_clicks(keys, &link_table, &click_index, out);
             Some((click_index, extras))
         }
-        _ => None,
+        None => None,
     };
     timing.stage("dedup");
 
@@ -657,8 +659,11 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         parallel(threads, |thread| {
             // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
             let (b, c, runner) = unsafe { (b_out.get(thread), c_out.get(thread), runners.get(thread)) };
+            let mut pieces: Vec<&[indexed::Record]> = Vec::new();
             while let Some((user, records)) = chains.get(next.fetch_add(1, Ordering::Relaxed)) {
-                runner.process_run(&shared, b, c, *user, records);
+                pieces.clear();
+                pieces.extend(records.iter().map(Vec::as_slice));
+                runner.process_run(&shared, b, c, *user, &pieces);
             }
             runner.flush(c);
         });

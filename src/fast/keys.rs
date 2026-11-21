@@ -12,9 +12,6 @@
 //! an index is checked for the properties it relies on.
 
 use super::codes::{CHAR_VALUE, P37};
-
-/// Set in a parsed click's user word when it holds a user number, not a code.
-pub const USER_NUMBER: u64 = 1 << 63;
 use crate::util::split_fields;
 
 pub const MASK: u64 = (1 << 40) - 1;
