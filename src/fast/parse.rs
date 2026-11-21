@@ -415,10 +415,12 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
+    use super::simd::{event_kernel, LeanFrame, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
     let kernel = event_kernel();
     // The kernel in assembly is for index mode.
     let assembly = INDEXED && kernel == KERNEL_LEAN;
+    // Its loop with the store inside, where the writers are as that takes them.
+    let run = assembly && MODE == MODE_STORE && LeanFrame::stores(ctx);
     match kernel {
         KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
         // Checked rows go one by one through the loop that compares them.
@@ -436,14 +438,106 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
             events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
         }
+        // Timing only: the store into one block (elsewhere SS_DIAG=8 stores as usual).
+        _ if run && ctx.diag == 8 => events_assembly_run::<true>(ctx, buffer, position, end, out),
+        _ if run => events_assembly_run::<false>(ctx, buffer, position, end, out),
         _ if assembly => events_assembly_loop::<MODE>(ctx, buffer, position, end, out),
         _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
 }
 
-/// The loop of the lean kernel in assembly (index mode) when rows are
-/// stored (or, in a diagnostic mode, dropped). Nothing is called on its
-/// common path.
+/// The lean kernel in assembly (index mode) when rows are stored: the loop
+/// over the rows and the store are in the assembly too, which comes back
+/// here only for a row that needs something else.
+///
+/// `DUMMY` is for timing only (`SS_DIAG=8`): the same loop and the same
+/// store, but every record goes into one block that is written over and
+/// over, and what comes back here is read and dropped. Against `SS_DIAG=7`
+/// (the kernel without any store) and `SS_DIAG=1` (the real lists) it tells
+/// what the store's instructions cost and what its lists cost.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn events_assembly_run<const DUMMY: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{event_lean_common, event_lean_run, lean_setup, LeanFrame, MODE_STORE, ROW_PAD};
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
+    let (lean, _) = lean_setup(ctx);
+    let mut row = EventRow::default();
+    // The assembly reads up to 16 bytes before a row.
+    while position < stop.min(16) {
+        position = if DUMMY {
+            event_row_plain::<7, true>(ctx, buffer, position, out, &mut row)
+        } else {
+            event_row_plain::<MODE_STORE, true>(ctx, buffer, position, out, &mut row)
+        };
+    }
+    if position < stop {
+        let mut frame = LeanFrame::new(ctx);
+        // The one block of the timing variant, and a writer's worth of
+        // words for it: the cursor, the end of the block, and two more.
+        let mut block = [0u64; 512];
+        let block_start = block.as_mut_ptr();
+        let mut one_writer = [block_start, block_start.wrapping_add(block.len()), block_start, block_start];
+        if DUMMY {
+            frame.one_list();
+        }
+        let frame = &mut frame as *mut LeanFrame;
+        let base = buffer.as_ptr();
+        // SAFETY (all of this): a row that starts before `stop` has ROW_PAD
+        // readable bytes after it and, here, 16 before it; the tables and
+        // the frame are those of `ctx`, whose writers `LeanFrame::stores`
+        // found fit (the caller asked).
+        let mut p = unsafe { base.add(position) };
+        let last = unsafe { base.add(stop) };
+        while p < last {
+            let writers = if DUMMY { one_writer.as_mut_ptr().cast() } else { out.indexed.as_mut_ptr() };
+            let (status, at) = unsafe { event_lean_run(lean, p, last, frame, writers) };
+            p = match status {
+                0 => at,
+                3 if DUMMY => {
+                    // The block is full: from its start again; the row is dropped.
+                    one_writer[0] = block_start;
+                    unsafe { (*frame).next }
+                }
+                3 => unsafe {
+                    // The row's list needs a new block: `emit_indexed` gets it one.
+                    event_lean_common::<MODE_STORE>((*frame).read(status), out, &mut row);
+                    (*frame).next
+                },
+                _ => unsafe {
+                    // A purchase (what was read of it is in the frame) or a declined row.
+                    let position = at.offset_from(base) as usize;
+                    let read = (*frame).read(status);
+                    let (ts, ingest, index, user, keep) =
+                        (read.ts, read.ingest_seconds, read.index, read.user_number, read.keep);
+                    let frame = frame as *const LeanFrame;
+                    let next = if DUMMY {
+                        event_row_rare::<7>(ctx, frame, buffer, position, out, &mut row, status, ts, ingest, index, user, keep)
+                    } else {
+                        event_row_rare::<MODE_STORE>(
+                            ctx, frame, buffer, position, out, &mut row, status, ts, ingest, index, user, keep,
+                        )
+                    };
+                    base.add(next)
+                },
+            };
+        }
+        position = unsafe { p.offset_from(base) } as usize;
+        std::hint::black_box(&block);
+    }
+    // The timing variant folds what it reads into `row.event`; keep it alive.
+    std::hint::black_box(row.event);
+    position
+}
+
+/// The lean kernel in assembly (index mode) row by row, for the diagnostic
+/// mode that stores nothing (`MODE` 7) and for a run whose writers the loop
+/// in assembly cannot store through.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn events_assembly_loop<const MODE: u32>(

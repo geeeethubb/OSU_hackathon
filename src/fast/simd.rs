@@ -14,6 +14,7 @@ use std::arch::x86_64::*;
 use std::hint::select_unpredictable;
 
 use super::codes::id_code;
+use super::arena::PartWriter;
 use super::keys::{pre, unscramble, MASK as NUMBER_MASK};
 use super::parse::{emit_code_click, emit_indexed, emit_number_click, emit_raw, ClickRecord, EventRow, ParseOut};
 use super::Ctx;
@@ -1747,8 +1748,9 @@ macro_rules! lean_offset {
 
 /// A purchase: `,purchase,` or `,"purchase",`, then the same 32 bytes, of
 /// which the frame gets what the caller needs to read product and price.
+/// `$then` is where a purchase that is regular goes.
 macro_rules! lean_purchase {
-    () => {
+    ($then:literal) => {
         concat!(
             "3:\n",
             "mov r8, qword ptr [r11]\n",
@@ -1774,7 +1776,7 @@ macro_rules! lean_purchase {
             ),
             "jnz 2f\n",
             "mov r15d, 2\n",
-            "jmp 8f\n",
+            $then,
         )
     };
 }
@@ -1794,10 +1796,154 @@ macro_rules! lean_row {
             "jz 8f\n",
             "jmp 2f\n",
             lean_offset!(),
-            lean_purchase!(),
+            lean_purchase!("jmp 8f\n"),
             "2:\n",
             "mov r15d, 1\n",
             "8:\n",
+        )
+    };
+}
+
+/// A `view` or `cart` into the list of its index partition: the two words
+/// `emit_indexed` stores. From the index in the top 40 bits: the partition
+/// (the bits from the partition shift up), its writer (the cursor, then the
+/// end of its block), and the index within the partition at bit 48. A full
+/// block is the caller's to replace (22).
+macro_rules! lean_store {
+    () => {
+        concat!(
+            "pext r8, r9, qword ptr [rdx + {part_mask}]\n",
+            "shl r8, 5\n",
+            "add r8, qword ptr [rdx + {writers}]\n",
+            "mov r11, qword ptr [r8]\n",
+            "lea r13, [r11 + 16]\n",
+            "cmp r13, qword ptr [r8 + 8]\n",
+            "ja 22f\n",
+            "mov qword ptr [r8], r13\n",
+            "shl r9, 24\n",
+            "and r9, qword ptr [rdx + {low_mask}]\n",
+            // ts, valid and user-is-number: all of them, or nothing.
+            "lea rax, [rax + rax + 1]\n",
+            "bts rax, 32\n",
+            "and rax, r12\n",
+            "or rax, r9\n",
+            "mov qword ptr [r11], rax\n",
+            // The user (kept by a valid row only) at bit 22, the ingest seconds at bit 1.
+            "and r10, r12\n",
+            "shr r10, 2\n",
+            "lea r10, [r10 + rcx*2]\n",
+            "mov qword ptr [r11 + 8], r10\n",
+        )
+    };
+}
+
+/// Row after row from rdi until the frame's `last`, each `view` and `cart`
+/// stored. r15 at the end: 0 when the next row (rdi) is at or past `last`;
+/// 1 for a row (rdi) the kernel declines; 2 for a purchase and 3 for a row
+/// whose list needs a new block: what was read of it is in the frame, and
+/// the caller stores it and comes back for the row at `next`.
+macro_rules! lean_run {
+    () => {
+        concat!(
+            "9:\n",
+            lean_head!(),
+            lean_ids!(),
+            lean_ts!(),
+            lean_ingest!(),
+            lean_type!(),
+            lean_tail!("", "", ""),
+            "jnz 2f\n",
+            lean_store!(),
+            "mov rdi, qword ptr [rdx + {next}]\n",
+            "cmp rdi, qword ptr [rdx + {last}]\n",
+            "jb 9b\n",
+            "xor r15d, r15d\n",
+            "jmp 8f\n",
+            lean_offset!(),
+            lean_purchase!("jmp 23f\n"),
+            "22:\n",
+            "mov r15d, 3\n",
+            "23:\n",
+            "shr r9, 24\n",
+            "shr r10, 24\n",
+            "mov qword ptr [rdx + {read}], rax\n",
+            "mov qword ptr [rdx + {read} + 8], rcx\n",
+            "mov qword ptr [rdx + {read} + 16], r9\n",
+            "mov qword ptr [rdx + {read} + 24], r10\n",
+            "mov qword ptr [rdx + {read} + 32], r12\n",
+            "jmp 8f\n",
+            "2:\n",
+            "mov r15d, 1\n",
+            "8:\n",
+            // The compiler does not know the vector registers were used here.
+            "vzeroupper\n",
+        )
+    };
+}
+
+/// One `asm!` of the kernel: its pieces, its operands, and the places in the
+/// tables and in the frame that every use of it names.
+macro_rules! lean_asm {
+    ([$($template:expr,)*] $($operands:tt)*) => {
+        std::arch::asm!(
+            $($template,)*
+            $($operands)*
+            comma = const std::mem::offset_of!(LeanTables, comma),
+            quote = const std::mem::offset_of!(LeanTables, quote),
+            newline = const std::mem::offset_of!(LeanTables, newline),
+            ingest_close = const std::mem::offset_of!(LeanTables, ingest_close),
+            type_masks = const std::mem::offset_of!(LeanTables, type_masks),
+            type_texts = const std::mem::offset_of!(LeanTables, type_texts),
+            type_step = const std::mem::offset_of!(LeanTables, type_step),
+            purchase = const std::mem::offset_of!(LeanTables, purchase),
+            late_bias = const std::mem::offset_of!(LeanTables, late_bias),
+            late_limit = const std::mem::offset_of!(LeanTables, late_limit),
+            tens = const std::mem::offset_of!(LeanTables, tens),
+            id_digit = const std::mem::offset_of!(LeanTables, id_digit),
+            nine = const std::mem::offset_of!(LeanTables, nine),
+            id_letter = const std::mem::offset_of!(LeanTables, id_letter),
+            twenty_five = const std::mem::offset_of!(LeanTables, twenty_five),
+            id36_letter_value = const std::mem::offset_of!(LeanTables, id36_letter_value),
+            id36_pairs = const std::mem::offset_of!(LeanTables, id36_pairs),
+            id36_fours = const std::mem::offset_of!(LeanTables, id36_fours),
+            id36_eights = const std::mem::offset_of!(LeanTables, id36_eights),
+            id_ranges = const std::mem::offset_of!(LeanTables, id_ranges),
+            offset_pattern = const std::mem::offset_of!(LeanTables, offset_pattern),
+            offset_limit = const std::mem::offset_of!(LeanTables, offset_limit),
+            offset_shuffle = const std::mem::offset_of!(LeanTables, offset_shuffle),
+            offset_ceilings = const std::mem::offset_of!(LeanTables, offset_ceilings),
+            offset_weights = const std::mem::offset_of!(LeanTables, offset_weights),
+            form_mid = const std::mem::offset_of!(LeanTables, form_of_length) + 128,
+            offset_form = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, offset),
+            plain_start = const std::mem::offset_of!(LeanTables, forms)
+                + std::mem::offset_of!(TimeForms, plain)
+                + std::mem::offset_of!(TimeForm, start),
+            day = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, day),
+            f_pattern = const std::mem::offset_of!(TimeForm, pattern),
+            f_limit = const std::mem::offset_of!(TimeForm, limit),
+            f_shuffle = const std::mem::offset_of!(TimeForm, shuffle),
+            f_ceilings = const std::mem::offset_of!(TimeForm, ceilings),
+            f_first = const std::mem::offset_of!(TimeForm, first),
+            f_second = const std::mem::offset_of!(TimeForm, second),
+            f_index_mask = const std::mem::offset_of!(TimeForm, index_mask),
+            f_year_mask = const std::mem::offset_of!(TimeForm, year_mask),
+            f_high_mask = const std::mem::offset_of!(TimeForm, high_mask),
+            f_scale = const std::mem::offset_of!(TimeForm, scale),
+            f_start = const std::mem::offset_of!(TimeForm, start),
+            f_day = const FORM_DAY,
+            next = const std::mem::offset_of!(LeanFrame, next),
+            window_length = const std::mem::offset_of!(LeanFrame, window_length),
+            inverse_b = const std::mem::offset_of!(LeanFrame, inverse_b),
+            inverse_a = const std::mem::offset_of!(LeanFrame, inverse_a),
+            event_key = const std::mem::offset_of!(LeanFrame, event_key),
+            user_key = const std::mem::offset_of!(LeanFrame, user_key),
+            index_limit = const std::mem::offset_of!(LeanFrame, index_limit),
+            user_limit = const std::mem::offset_of!(LeanFrame, user_limit),
+            region = const std::mem::offset_of!(LeanFrame, region),
+            reach = const std::mem::offset_of!(LeanFrame, reach),
+            last_comma = const std::mem::offset_of!(LeanFrame, last_comma),
+            opened = const std::mem::offset_of!(LeanFrame, opened),
+            options(nostack),
         )
     };
 }
@@ -1825,6 +1971,43 @@ pub struct LeanFrame {
     reach: u32,
     last_comma: u32,
     opened: u32,
+    // For the loop in assembly: where it stops, the writers of the index
+    // partitions, which bits of an index (in the top 40 bits) are its
+    // partition, and which bits of the index at bit 48 a record keeps.
+    last: *const u8,
+    writers: *mut PartWriter,
+    part_mask: u64,
+    low_mask: u64,
+    /// What the loop read of the row it hands back: ts, ingest seconds,
+    /// index, user number and the validity mask.
+    handed: [u64; 5],
+}
+
+/// Whether a `PartWriter` is what the loop in assembly takes it for: four
+/// words, the cursor first and the end of the block second, a record of two
+/// words going where the cursor is as long as the end is not passed. Asked
+/// of `reserve` itself, once: with room for exactly one record it must hand
+/// out the cursor and move it on, and nothing else (with the end anywhere
+/// else there would be no room, and a new block).
+fn writer_as_assumed() -> bool {
+    static ASSUMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASSUMED.get_or_init(|| {
+        if std::mem::size_of::<PartWriter>() != 32 {
+            return false;
+        }
+        let mut block = [0u64; 8];
+        let base = block.as_mut_ptr();
+        let mut arena = super::arena::Arena::new();
+        // SAFETY: four pointers into `block`, as a writer has them; whatever
+        // their order, `reserve` and `grow` only write `block[1..3]`.
+        unsafe {
+            let words: [*mut u64; 4] = [base, base.add(2), base.add(1), base.add(1)];
+            let mut writer: PartWriter = std::mem::transmute(words);
+            let at = writer.reserve(&mut arena, super::EVENT_BLOCK, 2);
+            let after: [*mut u64; 4] = std::mem::transmute(writer);
+            at == base && after == [base.add(2), base.add(2), base.add(1), base.add(1)]
+        }
+    })
 }
 
 impl LeanFrame {
@@ -1853,7 +2036,31 @@ impl LeanFrame {
             reach: 0,
             last_comma: 0,
             opened: 0,
+            last: std::ptr::null(),
+            writers: std::ptr::null_mut(),
+            part_mask: u64::MAX << (24 + keys.index_shift),
+            low_mask: ((1u64 << keys.index_shift) - 1) << 48,
+            handed: [0; 5],
         }
+    }
+
+    /// Whether `event_lean_run` can store for this run: the writers are as
+    /// its store takes them, and an index within a partition fits the 16
+    /// bits a record has for it.
+    pub fn stores(ctx: &Ctx) -> bool {
+        ctx.keys.as_ref().is_some_and(|keys| keys.index_shift <= 16) && writer_as_assumed()
+    }
+
+    /// Timing only: every row into the first writer `event_lean_run` is
+    /// given, whatever its index.
+    pub fn one_list(&mut self) {
+        self.part_mask = 0;
+    }
+
+    /// What `event_lean_run` read of the row it handed back with `status`.
+    pub fn read(&self, status: u64) -> LeanRow {
+        let [ts, ingest_seconds, index, user_number, keep] = self.handed;
+        LeanRow { status, ts, ingest_seconds, index, user_number, keep }
     }
 }
 
@@ -1881,13 +2088,14 @@ pub struct LeanRow {
 /// `ctx`.
 #[inline(always)]
 pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut LeanFrame) -> LeanRow {
-    use std::mem::offset_of;
     let (status, ts, ingest_seconds, index, user_number, keep): (u64, u64, u64, u64, u64, u64);
-    std::arch::asm!(
-        lean_row!(),
-        // The numbers come back at the bottom of their words.
-        "shr r9, 24",
-        "shr r10, 24",
+    lean_asm!(
+        [
+            lean_row!(),
+            // The numbers come back at the bottom of their words.
+            "shr r9, 24",
+            "shr r10, 24",
+        ]
         in("rdi") p,
         in("rsi") lean,
         in("rdx") frame,
@@ -1899,62 +2107,55 @@ pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut 
         lateout("r12") keep,
         out("r8") _, out("r11") _, out("r13") _, out("r14") _,
         out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
-        comma = const offset_of!(LeanTables, comma),
-        quote = const offset_of!(LeanTables, quote),
-        newline = const offset_of!(LeanTables, newline),
-        ingest_close = const offset_of!(LeanTables, ingest_close),
-        type_masks = const offset_of!(LeanTables, type_masks),
-        type_texts = const offset_of!(LeanTables, type_texts),
-        type_step = const offset_of!(LeanTables, type_step),
-        purchase = const offset_of!(LeanTables, purchase),
-        late_bias = const offset_of!(LeanTables, late_bias),
-        late_limit = const offset_of!(LeanTables, late_limit),
-        tens = const offset_of!(LeanTables, tens),
-        id_digit = const offset_of!(LeanTables, id_digit),
-        nine = const offset_of!(LeanTables, nine),
-        id_letter = const offset_of!(LeanTables, id_letter),
-        twenty_five = const offset_of!(LeanTables, twenty_five),
-        id36_letter_value = const offset_of!(LeanTables, id36_letter_value),
-        id36_pairs = const offset_of!(LeanTables, id36_pairs),
-        id36_fours = const offset_of!(LeanTables, id36_fours),
-        id36_eights = const offset_of!(LeanTables, id36_eights),
-        id_ranges = const offset_of!(LeanTables, id_ranges),
-        offset_pattern = const offset_of!(LeanTables, offset_pattern),
-        offset_limit = const offset_of!(LeanTables, offset_limit),
-        offset_shuffle = const offset_of!(LeanTables, offset_shuffle),
-        offset_ceilings = const offset_of!(LeanTables, offset_ceilings),
-        offset_weights = const offset_of!(LeanTables, offset_weights),
-        form_mid = const offset_of!(LeanTables, form_of_length) + 128,
-        offset_form = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, offset),
-        plain_start = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, plain) + offset_of!(TimeForm, start),
-        day = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, day),
-        f_pattern = const offset_of!(TimeForm, pattern),
-        f_limit = const offset_of!(TimeForm, limit),
-        f_shuffle = const offset_of!(TimeForm, shuffle),
-        f_ceilings = const offset_of!(TimeForm, ceilings),
-        f_first = const offset_of!(TimeForm, first),
-        f_second = const offset_of!(TimeForm, second),
-        f_index_mask = const offset_of!(TimeForm, index_mask),
-        f_year_mask = const offset_of!(TimeForm, year_mask),
-        f_high_mask = const offset_of!(TimeForm, high_mask),
-        f_scale = const offset_of!(TimeForm, scale),
-        f_start = const offset_of!(TimeForm, start),
-        f_day = const FORM_DAY,
-        next = const offset_of!(LeanFrame, next),
-        window_length = const offset_of!(LeanFrame, window_length),
-        inverse_b = const offset_of!(LeanFrame, inverse_b),
-        inverse_a = const offset_of!(LeanFrame, inverse_a),
-        event_key = const offset_of!(LeanFrame, event_key),
-        user_key = const offset_of!(LeanFrame, user_key),
-        index_limit = const offset_of!(LeanFrame, index_limit),
-        user_limit = const offset_of!(LeanFrame, user_limit),
-        region = const offset_of!(LeanFrame, region),
-        reach = const offset_of!(LeanFrame, reach),
-        last_comma = const offset_of!(LeanFrame, last_comma),
-        opened = const offset_of!(LeanFrame, opened),
-        options(nostack),
     );
     LeanRow { status, ts, ingest_seconds, index, user_number, keep }
+}
+
+/// The lean kernel in assembly on the rows from `p` on, storing every
+/// `view` and `cart` it reads in `out`, until a row starts at or after
+/// `last` or one needs the caller. Returns a status and a row:
+///   0: nothing more to do; the next row is the one returned (at or after `last`).
+///   1: the kernel declines the row returned.
+///   2, 3: the row returned was read but not stored: a purchase (2,
+///      `event_lean_purchase` ends it) or a row whose list needs a new
+///      block (3, `event_lean_common` stores it). `frame.read(status)` is
+///      what was read, and the next row is at `frame.next`.
+///
+/// # Safety
+/// `LeanFrame::stores(ctx)` holds for the `ctx` of `lean` and `frame`; `p`
+/// is before `last`, and every row start before `last` has `ROW_PAD`
+/// readable bytes after it and 16 before it. `writers` are the writers of
+/// that `ctx`'s index partitions (`ParseOut::indexed`, taken anew after
+/// every other use of the `ParseOut`), or, after `LeanFrame::one_list`, one
+/// writer's worth of words: a cursor and the end of its block.
+#[inline(always)]
+pub unsafe fn event_lean_run(
+    lean: *const LeanTables,
+    p: *const u8,
+    last: *const u8,
+    frame: *mut LeanFrame,
+    writers: *mut PartWriter,
+) -> (u64, *const u8) {
+    (*frame).last = last;
+    (*frame).writers = writers;
+    let status: u64;
+    let at: *const u8;
+    lean_asm!(
+        [lean_run!(),]
+        inout("rdi") p => at,
+        in("rsi") lean,
+        in("rdx") frame,
+        lateout("r15") status,
+        out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+        out("r12") _, out("r13") _, out("r14") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+        last = const std::mem::offset_of!(LeanFrame, last),
+        writers = const std::mem::offset_of!(LeanFrame, writers),
+        part_mask = const std::mem::offset_of!(LeanFrame, part_mask),
+        low_mask = const std::mem::offset_of!(LeanFrame, low_mask),
+        read = const std::mem::offset_of!(LeanFrame, handed),
+    );
+    (status, at)
 }
 
 /// The end of a purchase `event_lean_asm` read (status 2): its price and its
@@ -3529,6 +3730,17 @@ mod tests {
             }
             assert!(check.answered.iter().all(|&count| count > rounds / 20), "{:?}", check.answered);
         });
+    }
+
+    /// The loop in assembly stores only where the writers are laid out as it
+    /// takes them. This build must be one of those: `whole_files_in_chunks`
+    /// is what covers that store.
+    #[test]
+    fn the_writers_are_as_the_assembly_takes_them() {
+        assert!(writer_as_assumed());
+        for window in 0..WINDOWS.len() {
+            assert!(LeanFrame::stores(&Checker::new(window).ctx));
+        }
     }
 
     /// Everything a chunk parse stored, list by list.
