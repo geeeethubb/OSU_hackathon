@@ -926,6 +926,33 @@ impl ScratchC {
         person_in_order(&self.params, self.tuning, &mut self.work, out, click_exotic, name, events, purchases, clicks);
     }
 
+    /// Where `Sessions` writes the sessions of the person under way: session
+    /// starts and event counts. Both have room for every session a person
+    /// can have while its timestamps are at most `TS_MASK`.
+    #[inline(always)]
+    pub fn session_scratch(&mut self) -> (&mut [u32], &mut [u32]) {
+        (&mut self.work.start, &mut self.work.count)
+    }
+
+    /// `one_person_in_order` for a person whose events the caller has fed to
+    /// `sessions` one at a time (all of them accepted), without ever
+    /// collecting the timestamps: the rows and cells are the same. The
+    /// assists stay pending until `flush`.
+    #[inline]
+    pub fn finish_sessions(
+        &mut self,
+        sessions: Sessions,
+        out: &mut PassCOut,
+        click_exotic: &[Box<[u8]>],
+        name: u64,
+        purchases: &[[u64; 2]],
+        clicks: &[[u64; 2]],
+    ) {
+        let count = sessions.close(&mut self.work.count);
+        self.work.profile.lap(3);
+        finish_person(&self.params, self.tuning, &mut self.work, out, click_exotic, name, count, purchases, clicks);
+    }
+
     /// Adds the assists that `one_person` left pending to `out`.
     pub fn flush(&mut self, out: &mut PassCOut) {
         apply_assists(&mut self.work.pending, &mut out.campaign_days);
@@ -969,28 +996,75 @@ fn starts_up_to(starts: &[u32], limit: u32) -> usize {
     }
 }
 
+/// The sessions of one person while its events arrive one at a time in time
+/// order. `start` and `count` are the two slices of
+/// `ScratchC::session_scratch`, the same ones in every call for a person.
+#[derive(Clone, Copy, Default)]
+pub struct Sessions {
+    /// The number of the open session.
+    open: usize,
+    /// Events before the open session, and events so far.
+    first: u32,
+    events: u32,
+    /// The latest timestamp.
+    latest: u32,
+}
+
+impl Sessions {
+    /// Starts a person at its first event.
+    #[inline(always)]
+    pub fn begin(start: &mut [u32], ts: u32) -> Self {
+        start[0] = ts;
+        Self { open: 0, first: 0, events: 1, latest: ts }
+    }
+
+    /// The person's next event. `false`, with nothing changed, when it is
+    /// earlier than the one before it: the events are not in time order,
+    /// and the person has to be done from all its timestamps instead.
+    #[inline(always)]
+    pub fn add(&mut self, start: &mut [u32], count: &mut [u32], ts: u32) -> bool {
+        if ts < self.latest {
+            return false;
+        }
+        // The open session's count and the next one's start are written
+        // before the gap decides whether a session starts here.
+        let cut = ts - self.latest > GAP;
+        count[self.open] = self.events - self.first;
+        start[self.open + 1] = ts;
+        self.first = if cut { self.events } else { self.first };
+        self.open += usize::from(cut);
+        self.events += 1;
+        self.latest = ts;
+        true
+    }
+
+    /// How many events the person has so far.
+    #[inline(always)]
+    pub fn events(&self) -> u32 {
+        self.events
+    }
+
+    /// Ends the person: writes the last session's count and returns the
+    /// number of sessions.
+    #[inline(always)]
+    fn close(self, count: &mut [u32]) -> usize {
+        count[self.open] = self.events - self.first;
+        self.open + 1
+    }
+}
+
 /// Sessions of one person whose timestamps are already ascending, in one
 /// pass over them. Returns how many, or `None` at the first timestamp that
 /// is smaller than the one before it.
 fn sessions_in_order(events: &[u32], work: &mut Work) -> Option<usize> {
-    let mut open = 0;
-    let mut first = 0;
-    work.start[0] = events[0];
-    for at in 1..events.len() {
-        let (previous, ts) = (events[at - 1], events[at]);
-        if ts < previous {
+    let (start, count) = (&mut work.start[..], &mut work.count[..]);
+    let mut sessions = Sessions::begin(start, events[0]);
+    for &ts in &events[1..] {
+        if !sessions.add(start, count, ts) {
             return None;
         }
-        // The open session's count and the next one's start are written
-        // before the gap decides whether a session starts here.
-        let cut = ts - previous > GAP;
-        work.count[open] = (at - first) as u32;
-        work.start[open + 1] = ts;
-        first = if cut { at } else { first };
-        open += usize::from(cut);
     }
-    work.count[open] = (events.len() - first) as u32;
-    Some(open + 1)
+    Some(sessions.close(count))
 }
 
 /// Sessions of one person by sorting its timestamps. Returns how many.
@@ -1956,10 +2030,21 @@ mod tests {
         tables
     }
 
-    /// Runs every person through `person_in_order`, as a caller that keeps
-    /// each person's events together does: with the events sorted, or (to
-    /// reach the fallback) just as they come.
-    fn run_in_order(world: &World, tuning: Tuning, partitions: &[Partition], sorted: bool) -> Tables {
+    /// How `run_in_order` hands a person to the kernel.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Entry {
+        /// All timestamps at once, sorted.
+        Sorted,
+        /// All timestamps at once, as they come (the fallback, mostly).
+        AsTheyCome,
+        /// One event at a time through `Sessions`, sorted or as they come;
+        /// a person that turns out not to be in order is handed over whole.
+        Streamed(bool),
+    }
+
+    /// Runs every person through the entries for a caller that keeps each
+    /// person's events together.
+    fn run_in_order(world: &World, tuning: Tuning, partitions: &[Partition], entry: Entry) -> Tables {
         let params = Params::new(
             world.window_start,
             world.first_day,
@@ -1994,10 +2079,19 @@ mod tests {
                 }
             }
             for (&local, (events, purchases, clicks)) in &mut people {
-                if sorted {
+                if matches!(entry, Entry::Sorted | Entry::Streamed(true)) {
                     events.sort_unstable();
                 }
                 let name = unmix(((partition.part as u64) << TEST_PERSON_SHIFT) | u64::from(local));
+                if let Entry::Streamed(_) = entry {
+                    let (start, count) = scratch.session_scratch();
+                    let mut sessions = Sessions::begin(start, events[0]);
+                    if events[1..].iter().all(|&ts| sessions.add(start, count, ts)) {
+                        assert_eq!(sessions.events() as usize, events.len());
+                        scratch.finish_sessions(sessions, &mut out, &world.exotic, name, purchases, clicks);
+                        continue;
+                    }
+                }
                 scratch.one_person_in_order(&mut out, &world.exotic, name, events, purchases, clicks);
             }
             scratch.flush(&mut out);
@@ -2233,8 +2327,9 @@ mod tests {
             assert!(got == want, "seed {seed}: tables differ with the default tuning");
             // The entry for events that are already in time order, and its
             // fallback when they are not.
-            assert!(run_in_order(&world, tuning, &partitions, true) == want, "seed {seed}: in order");
-            assert!(run_in_order(&world, tuning, &partitions, false) == want, "seed {seed}: not in order");
+            for entry in [Entry::Sorted, Entry::AsTheyCome, Entry::Streamed(true), Entry::Streamed(false)] {
+                assert!(run_in_order(&world, tuning, &partitions, entry) == want, "seed {seed}: one of the in-order entries");
+            }
         }
     }
 
@@ -2334,8 +2429,9 @@ mod tests {
         let want = expected(&world, &partitions);
         for tuning in tunings() {
             assert!(run(&world, tuning, &partitions, &mut Rng(window_start as u64)) == want);
-            assert!(run_in_order(&world, tuning, &partitions, true) == want);
-            assert!(run_in_order(&world, tuning, &partitions, false) == want);
+            for entry in [Entry::Sorted, Entry::AsTheyCome, Entry::Streamed(true), Entry::Streamed(false)] {
+                assert!(run_in_order(&world, tuning, &partitions, entry) == want);
+            }
         }
         want.rows.values().map(|row| row.0).sum()
     }
