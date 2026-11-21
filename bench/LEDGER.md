@@ -534,3 +534,25 @@ changed_stage_and_hypothesis: candidate D (links per user in shards, overlapped 
 decision: keep; named as the commit to submit in the PR at 21:45 UTC; bench/BEST_SHA moves to it
 official_receipt_and_score: not yet submitted
 ```
+
+### 21:46 UTC
+
+- **Calibration table (data, not a model).** Official scores are relayed by the submission watch and
+  have two decimals; "paired CI change" is the median paired container-time difference against the
+  previously scored commit, summed over the intermediate candidates where there were several, each
+  measured on 4-logical-CPU GitHub runners (2 cores x 2 threads) whose CPU model differs from run to run.
+  | scored commit | official | paired CI change since the previous scored commit | what changed |
+  |---|---:|---|---|
+  | `e4eef020` | 1.38 s | n/a | first AVX2 row parser |
+  | `23b285da` | 0.84 s | about -630 ms (three steps: -380, -177, -63 on seed 2; EPYC runners) | leaner parser, prefetching dedup, flat union-find, session pass without sorts, huge pages |
+  | `2b2cccd1` | 0.71 s | about -240 ms (-100 on an EPYC 7763, -139 on a Xeon 8573C) | streaming Parquet writer, branch-light sessions, lean event kernel |
+  | `4567e953` | 0.66 s | -49 to -59 ms (EPYC 7763; -52 / -59 on fresh seeds) | index mode as the default |
+  | `2dae9298` | 0.64 s | -74 to -81 ms (EPYC 7763) | click numbers from text, lean kernel v2, ordered sessions |
+  | `9cb9ad6e` | 0.64 s | +1 to +13 ms slower (Xeon 8573C) | summary thread, overlapped startup, parser step later reverted |
+  Official change per paired CI millisecond in these five steps: 0.86, 0.54, about 0.9, about 0.26, and
+  no change for no change. The spread is as large as the values: the scores are rounded to 0.01 s, the
+  scorer's run-to-run variation is unknown, and the CI runners differ. What the table supports: CI wins
+  have always arrived as official wins of the same sign and usually of about half the size or more; it
+  does not support a fixed-cost estimate for the scorer, and none is assumed from here on.
+- **Unknown:** the scorer's container lifecycle cost, its CPU model and SMT behaviour, and how much its
+  runs vary. Candidate E has not been scored yet; CI says it is 56 to 67 ms faster than `2dae9298`.
