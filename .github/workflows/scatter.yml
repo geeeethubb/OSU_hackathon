@@ -1,5 +1,5 @@
-# One-off experiment: the data-movement kill test of bench/experiments/scatter.rs
-# on a Linux runner (transparent huge pages, the scorer's kind of memory system).
+# One-off experiment: the data-movement kill tests of bench/experiments/ on a
+# Linux runner (transparent huge pages, the scorer's kind of memory system).
 name: scatter-experiment
 on:
   push:
@@ -12,14 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: rustc -O -C target-cpu=x86-64-v3 -C codegen-units=1 bench/experiments/scatter.rs -o scatter
+        run: rustc -O -C target-cpu=x86-64-v3 -C codegen-units=1 bench/experiments/scatter2.rs -o scatter2
       - name: Machine
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)|L2 cache|L3 cache|Thread" || true
           cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: 20M records, 4 threads
-        run: ./scatter 20000000 4 6 | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: 20M records, 2 threads
-        run: ./scatter 20000000 2 3 | tee -a "$GITHUB_STEP_SUMMARY"
+        run: ./scatter2 20000000 4 6 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: 60M records, 4 threads
-        run: ./scatter 60000000 4 4 | tee -a "$GITHUB_STEP_SUMMARY"
+        run: ./scatter2 60000000 4 4 | tee -a "$GITHUB_STEP_SUMMARY"
