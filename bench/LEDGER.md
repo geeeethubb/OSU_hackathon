@@ -219,7 +219,7 @@ CI gave 1,165 ms on a Xeon 8573C runner and about 620 ms on an EPYC 9V45 runner 
 ### 19:31 UTC
 
 ```text
-candidate_full_sha: 4567e9531dc58ed5eb43d0c3bcd7ebbf0c82f6ef  (index mode is the default)
+candidate_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (index mode is the default)
 baseline_full_sha: 2b2cccd1ba1cb12bc5a074a899ce54c868205b86  (official 0.71 s)
 default_command_and_env: /pipeline, no environment variable (SS_STRUCT=0 selects the general path)
 CPU_topology / limits / image_digest: GitHub runner, AMD EPYC 7763, 4 vCPU (2 cores x 2 threads), --cpus 4 --memory 13g; run 44940522202
@@ -265,3 +265,63 @@ official_receipt_and_score: not yet submitted
   seeds 2 and 3 MATCH; SS_STRUCT=0: 36/36, 43/43, dev and seed 2 MATCH; 24 small generated datasets MATCH.
 - **Expected by 20:05 UTC from the agents, for candidate B:** index-mode click path without the
   code-to-number round trip, a faster index-mode event kernel, a session kernel entry for events in time order.
+
+### 19:47 UTC
+
+- **Correction:** the previous entries and `bench/BEST_SHA` in commit `b32d77f` named the index-default
+  commit with a wrong full hash (typed from memory; the tail was invalid). The officially accepted
+  0.66 s commit is `4567e9532f4019fbfd0e92908fd01cc49f24f67d`; the ledger and `bench/BEST_SHA` now carry
+  it, and every 40-character hash in the ledger was checked against the repository. Because of the
+  invalid baseline, the CI run of `b32d77f` has no prior-versus-candidate pairs: this commit repeats
+  the comparison.
+- **Confirmation of `4567e953` on fresh seeds (run 44941343462, same SHA, seeds 7 and 11):** 51.9 and
+  59.0 ms faster than `2b2cccd1`, 12/12 pairs; 36/36, 43/43, dev MATCH, 29/29 runs MATCH per seed.
+- **In CI now (this commit), paired against the 0.66 s commit:** candidate A of the last entry plus two
+  small index-pass changes (click lists counted by all threads; "does this user have extra events"
+  answered by a bit test instead of a hash probe per run). Laptop checks with SS_VERIFY=1: 42 unit
+  tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH; 16 small generated datasets and three mutated
+  ones MATCH the reference pipeline.
+
+### 19:57 UTC
+
+- **In CI now (this commit), candidate B for the next submission, paired against the 0.66 s commit
+  `4567e9532f4019fbfd0e92908fd01cc49f24f67d`:** candidate A plus three agent steps, each verified by its
+  author and again on the merged tree:
+  - index-mode click path: the kernel reads the user number from the text and writes into the
+    per-user-range list (click agent, `4989f58`; laptop, one thread: 29.9 -> 21.2 ns per click row);
+  - lean event kernel v2: row end from the decode, range compares for the canonical-ID checks, a store
+    loop without a call on the common path (parser agent, `82182bb`; laptop, one thread, index mode:
+    25.3 -> 23.4 ns per row), with a whole-file differential test of the store loops in both modes;
+  - sessions from events in time order in one pass (sessions agent, `5cb6ad0`; about 20% of the
+    per-person kernel in its replay), called from the index pass.
+- **Laptop checks on the merged tree:** 43 unit tests; with SS_VERIFY=1 and without it: 36/36, 43/43, dev
+  and 20M seed 2 MATCH (seed 3 too, both ways); 24 small generated datasets and three mutated ones MATCH
+  the reference pipeline in the scored configuration.
+
+### 20:11 UTC
+
+```text
+candidate_full_sha: 75b2600374845cd51890684f9fcf12b008a968e8  (candidate B)
+baseline_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (official 0.66 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, AMD EPYC 9V74, 4 vCPU, --cpus 4 --memory 13g; run 44943649309
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 43 unit tests incl. 9 differential parser tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 14/18 pairs won on a noisy runner; +68.8 / +71.1 / +57.3 ms (medians 762.4 -> 694.9, 770.3 -> 698.0, 792.9 -> 734.2); seed 3 larger than every A/A difference, seeds 2 and 5 larger than the median A/A difference but inside its range
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,437.5 ms / 2.08 GiB; 241.8 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: parse 413 -> 365 ms (events 1,327 -> 1,189, clicks 320 -> 270 CPU-ms), index pass 211 -> 197 ms (kernel in one ordered pass); in-process 676 -> 614 ms
+decision: keep; commit to submit for the next window unless the 2^14 variant below measures better
+official_receipt_and_score: not yet submitted
+```
+
+- **Candidate A alone (`4641345`, run 44942802240, Xeon 6975P-C) was neutral** against the 0.66 s commit
+  (+1.1 / -0.6 / +3.5 ms; 60M -27.5 ms paired), as the audit notes; in the same run 2^14-event partitions
+  beat 2^15 by 7.3 / 12.3 / 16.8 ms (17/18 pairs), the opposite of the EPYC 7763 result. The scorer is a
+  Xeon, so the default goes back to 2^14.
+- **In CI now (this commit):** candidate B with 2^14-event partitions as the default (variant: 2^15) and
+  the purchase plane written only for purchases (the audit's suggestion; every reader is gated by the
+  winner's purchase bit). Laptop checks in the scored configuration: 43 unit tests, 36/36, 43/43, dev
+  and 20M seeds 2 and 3 MATCH.
+- **Sessions agent, target 2 (attribution overhead):** three exact variants measured, none faster
+  (within 0.5%); dropped. The remaining kernel cost is spread over five short per-person loops.
