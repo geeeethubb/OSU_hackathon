@@ -112,7 +112,13 @@ struct Thrift {
 
 impl Thrift {
     fn new() -> Self {
-        Self { out: Vec::with_capacity(32), last_field: 0, stack: [0; 8], depth: 0 }
+        Self::reusing(Vec::with_capacity(32))
+    }
+
+    /// Writes into the allocation of `out`, whose content is dropped.
+    fn reusing(mut out: Vec<u8>) -> Self {
+        out.clear();
+        Self { out, last_field: 0, stack: [0; 8], depth: 0 }
     }
 
     fn field(&mut self, id: i16, wire_type: u8) {
@@ -210,8 +216,10 @@ fn definition_levels(present: &[bool]) -> Vec<u8> {
 /// The header of a dictionary page (`encoding` of its values) or of a data
 /// page v1 (`encoding` of its values; levels are RLE). `raw_size` is the size
 /// of the page's body and `stored_size` what it takes in the file: the same
-/// unless the chunk has a codec.
+/// unless the chunk has a codec. The header is written into the allocation
+/// of `scratch`.
 fn page_header(
+    scratch: Vec<u8>,
     page_type: i32,
     num_values: usize,
     raw_size: usize,
@@ -222,7 +230,7 @@ fn page_header(
     let raw_size = i32::try_from(raw_size).map_err(too_large)?;
     let stored_size = i32::try_from(stored_size).map_err(too_large)?;
     let num_values = i32::try_from(num_values).map_err(too_large)?;
-    let mut header = Thrift::new();
+    let mut header = Thrift::reusing(scratch);
     header.i32(1, page_type);
     header.i32(2, raw_size); // uncompressed_page_size
     header.i32(3, stored_size); // compressed_page_size
@@ -355,7 +363,7 @@ pub fn write_file(path: &Path, columns: &[(&str, &Column)], num_rows: usize) -> 
                 }
             };
             let page_size = levels.len() + values.len();
-            let header = page_header(PAGE_DATA, num_rows, page_size, page_size, ENCODING_PLAIN)?;
+            let header = page_header(Vec::new(), PAGE_DATA, num_rows, page_size, page_size, ENCODING_PLAIN)?;
             file.write_all(&header)?;
             file.write_all(&levels)?;
             file.write_all(values)?;
@@ -1073,6 +1081,23 @@ fn enlarge(buffer: &mut Vec<u8>, keep: usize, needed: usize) {
     *buffer = larger;
 }
 
+/// What a page of dictionary indices starts with, or a run in it: the bit
+/// width in one byte, then the header of the run as a varint. Returns the
+/// bytes and how many of them count; one more byte is free behind them.
+fn run_start(width: usize, header: u64) -> ([u8; 12], usize) {
+    let mut bytes = [0u8; 12];
+    bytes[0] = width as u8;
+    let mut length = 1;
+    let mut rest = header;
+    while rest >= 0x80 {
+        bytes[length] = (rest as u8) | 0x80;
+        rest >>= 7;
+        length += 1;
+    }
+    bytes[length] = rest as u8;
+    (bytes, length + 1)
+}
+
 /// Bits needed for dictionary indices below `entries` (at least one).
 fn index_width(entries: usize) -> usize {
     (usize::BITS - entries.saturating_sub(1).leading_zeros()).max(1) as usize
@@ -1180,8 +1205,9 @@ struct Pending {
     gzip: bool,
     /// Bytes the codec took off the pages of the chunk at hand.
     saved: i64,
-    /// Scratch for a compressed page.
+    /// Scratch for a compressed page, and for a page header.
     packed: Vec<u8>,
+    header: Vec<u8>,
 }
 
 impl Pending {
@@ -1219,8 +1245,9 @@ impl Pending {
     /// caller writes next and then hands to [`seal`](Self::seal).
     fn page(&mut self, page_type: i32, num_values: usize, size: usize, encoding: i32) -> io::Result<Page> {
         let start = self.used;
-        let header = page_header(page_type, num_values, size, size, encoding)?;
+        let header = page_header(std::mem::take(&mut self.header), page_type, num_values, size, size, encoding)?;
         self.put(&header);
+        self.header = header;
         Ok(Page { start, body: self.used, page_type, num_values, size, encoding })
     }
 
@@ -1238,9 +1265,11 @@ impl Pending {
             self.packed = vec![0; room.max(2 * self.packed.len())];
         }
         let length = gzip::member(&self.bytes[page.body..self.used], &mut self.packed);
-        let header = page_header(page.page_type, page.num_values, page.size, length, page.encoding)?;
+        let scratch = std::mem::take(&mut self.header);
+        let header = page_header(scratch, page.page_type, page.num_values, page.size, length, page.encoding)?;
         self.used = page.start;
         self.put(&header);
+        self.header = header;
         let end = self.used + length;
         if end > self.bytes.len() {
             enlarge(&mut self.bytes, self.used, end);
@@ -1284,6 +1313,8 @@ pub struct GroupWriter<'a> {
     /// The fields whose chunks are GZIP.
     gzip: Vec<bool>,
     out: Pending,
+    /// Where the open row group starts in the pending bytes.
+    group_start: usize,
     /// Nanoseconds spent inside the write calls so far.
     write_nanos: u64,
     /// `fields.len()` chunks per finished row group, then those of the open one.
@@ -1318,7 +1349,16 @@ impl<'a> GroupWriter<'a> {
             file: File::create(path)?,
             fields,
             gzip: vec![false; fields.len()],
-            out: Pending { bytes: Vec::new(), used: 0, written: 0, gzip: false, saved: 0, packed: Vec::new() },
+            out: Pending {
+                bytes: Vec::new(),
+                used: 0,
+                written: 0,
+                gzip: false,
+                saved: 0,
+                packed: Vec::new(),
+                header: Vec::with_capacity(32),
+            },
+            group_start: 0,
             write_nanos: 0,
             chunks: Vec::new(),
             groups: Vec::new(),
@@ -1360,11 +1400,13 @@ impl<'a> GroupWriter<'a> {
         if self.out.used >= FLUSH_BYTES {
             self.flush()?;
         }
-        // Usually enough for the whole row group, so the buffer is sized once.
-        let wanted = self.out.used + 16 * rows + (1 << 12);
+        // Enough for the row groups of both output tables (about 8 and 12
+        // bytes a row), so the buffer is sized once; it grows when it must.
+        let wanted = self.out.used + 12 * rows + (1 << 12);
         if self.out.bytes.len() < wanted {
             enlarge(&mut self.out.bytes, self.out.used, wanted);
         }
+        self.group_start = self.out.used;
         // Without a branch per row: every row is stored as the next head row
         // and as the next tail row, and only one of the two is kept.
         let (order, tails, behind) = (&mut *self.order, &mut *self.tails, &mut *self.by_row);
@@ -1381,6 +1423,15 @@ impl<'a> GroupWriter<'a> {
         self.head = head;
         self.groups.push(rows);
         Ok(())
+    }
+
+    /// Drops the open row group as if it had never begun: what to do when a
+    /// column method reported a value that does not fit. The file stays
+    /// valid and can be finished or go on with other row groups.
+    pub fn abandon(&mut self) {
+        self.groups.pop().expect("no open row group");
+        self.chunks.truncate(self.groups.len() * self.fields.len());
+        self.out.used = self.group_start;
     }
 
     /// Writes the footer and whatever is still pending.
@@ -1459,7 +1510,7 @@ impl<'a> GroupWriter<'a> {
         // One dictionary entry per run (PLAIN: length, then bytes), and its
         // rows as one RLE run among the head rows and one among the tail rows.
         if self.entries.len() < 13 * count + 32 {
-            self.entries = vec![0; 13 * count + 32];
+            self.entries = vec![0; (13 * count + 32).max(2 * self.entries.len())];
         }
         let (entries, head_runs, tail_runs, tails) =
             (&mut self.entries, &mut *self.head_runs, &mut *self.tail_runs, &*self.tails);
@@ -1604,12 +1655,12 @@ impl<'a> GroupWriter<'a> {
             }
             self.out.seal(page)?;
             data_page_offset = self.out.position();
-            let mut start = vec![width as u8];
-            put_varint(&mut start, ((groups as u64) << 1) | 1);
+            let (start, length) = run_start(width, ((groups as u64) << 1) | 1);
+            let start = &start[..length];
             let size = prefix.len() + start.len() + groups * width;
             let page = self.out.page(PAGE_DATA, rows, size, ENCODING_RLE_DICTIONARY)?;
             self.out.put(&prefix);
-            self.out.put(&start);
+            self.out.put(start);
             self.out.pack(present, |at| indices[usize::from(valued[at])] as u16, width);
             self.out.seal(page)?;
         } else {
@@ -1693,11 +1744,11 @@ impl<'a> GroupWriter<'a> {
             self.out.put(&[0u8; 8][..bytes]);
             self.out.seal(page)?;
             data_page_offset = self.out.position();
-            let mut run = vec![1u8]; // bit width of the index
-            put_varint(&mut run, (zeros as u64) << 1);
-            run.push(0);
+            // Bit width 1, a run of `zeros` rows, the index 0.
+            let (run, length) = run_start(1, (zeros as u64) << 1);
+            let run = &run[..length + 1];
             let page = self.out.page(PAGE_DATA, zeros, run.len(), ENCODING_RLE_DICTIONARY)?;
-            self.out.put(&run);
+            self.out.put(run);
             self.out.seal(page)?;
             done = zeros;
         }
@@ -1789,10 +1840,10 @@ impl<'a> GroupWriter<'a> {
         }
         self.out.seal(page)?;
         let data_page_offset = self.out.position();
-        let mut start = vec![width as u8];
-        put_varint(&mut start, ((groups as u64) << 1) | 1);
+        let (start, length) = run_start(width, ((groups as u64) << 1) | 1);
+        let start = &start[..length];
         let page = self.out.page(PAGE_DATA, rows, start.len() + groups * width, ENCODING_RLE_DICTIONARY)?;
-        self.out.put(&start);
+        self.out.put(start);
         let (order, by_row) = (&*self.order, &*self.by_row);
         self.out.pack(rows, |at| by_row[usize::from(order[at & ROW_MASK]) & ROW_MASK], width);
         self.out.seal(page)?;
@@ -2085,6 +2136,33 @@ mod tests {
         let fields = [("id", ColumnType::Int32), ("key", ColumnType::Str), ("label", ColumnType::OptStr)];
         GroupWriter::create(&directory.join("empty.parquet"), &fields).unwrap().finish().unwrap();
         std::fs::write(directory.join("empty.json"), "[]\n").unwrap();
+        // A row group that is abandoned leaves no trace: as the first of a
+        // file, and between two others after one of its columns was written.
+        let fields = [("id", ColumnType::Int32), ("key", ColumnType::Str)];
+        let mut writer = GroupWriter::create(&directory.join("abandoned.parquet"), &fields).unwrap();
+        let too_big = [1i64, i64::from(i32::MAX) + 1];
+        writer.begin(&too_big, |_| false).unwrap();
+        assert!(!writer.ints(&too_big).unwrap());
+        writer.abandon();
+        let key_text = |key: u64, slot: &mut [u8; SHORT_TEXT]| {
+            slot[..2].copy_from_slice(&[b'k', b'0' + key as u8]);
+            Text::Short(2)
+        };
+        for (ids, cut) in [(vec![1i64, 2, 3], false), (vec![4, 5], true), (vec![6, 7, 8, 9], false)] {
+            writer.begin(&ids, |&id| id % 2 == 0).unwrap();
+            assert!(writer.ints(&ids).unwrap());
+            if cut {
+                writer.abandon();
+                continue;
+            }
+            let keys: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+            writer.runs(&keys, key_text).unwrap();
+        }
+        let written = writer.finish().unwrap();
+        assert_eq!(written.row_groups, 2);
+        assert_eq!(written.bytes, std::fs::metadata(directory.join("abandoned.parquet")).unwrap().len());
+        let rows: Vec<String> = [1, 2, 3, 6, 7, 8, 9].iter().map(|id| format!("[{id}, \"k{id}\"]")).collect();
+        std::fs::write(directory.join("abandoned.json"), format!("[{}]\n", rows.join(", "))).unwrap();
         // A value that does not fit INT32 is reported, not written.
         let fields = [("count", ColumnType::Int32)];
         let path = directory.join("too_narrow.parquet");

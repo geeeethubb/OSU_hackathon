@@ -818,26 +818,129 @@ fn write_user_daily(
     Ok(true)
 }
 
-fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::io::Result<Written> {
-    let cells = ctx.campaign_ids.len() * ctx.day_count;
-    let mut totals = vec![[0i64; 4]; cells];
-    for worker in workers {
-        for (total, cell) in totals.iter_mut().zip(&worker.campaign_days) {
-            for at in 0..4 {
-                total[at] += cell[at];
+/// Rows per row group of campaign_daily. The table is small; small groups
+/// keep the buffer its rows are gathered in small too.
+const CAMPAIGN_ROWS: usize = 1 << 12;
+
+/// campaign_daily while its rows are produced: the file, and the rows
+/// gathered for its next row group, column by column.
+struct CampaignTable<'a> {
+    ctx: &'a Ctx,
+    folder: std::path::PathBuf,
+    gzip: &'a [&'a str],
+    /// The fields of a file with INT64 columns.
+    wide: &'a [(&'a str, ColumnType)],
+    writer: GroupWriter<'a>,
+    /// A count or sum did not fit INT32: `writer` is the second file.
+    is_wide: bool,
+    /// What the files finished so far hold.
+    written: Written,
+    campaign: Vec<u64>,
+    /// An index into the list of channels seen so far.
+    channel: Vec<u32>,
+    day: Vec<i32>,
+    /// sessions, purchasing_sessions, revenue_cents, assisted_sessions.
+    columns: [Vec<i64>; 4],
+}
+
+impl CampaignTable<'_> {
+    /// Adds the gathered rows to the file as one row group and forgets them.
+    fn flush(&mut self, channels: &[&[u8]]) -> std::io::Result<()> {
+        if self.day.is_empty() {
+            return Ok(());
+        }
+        if !self.group(channels)? {
+            // A count or sum over INT32: the file ends before this row group,
+            // and the rest of the table goes to one with INT64 columns.
+            if self.is_wide {
+                return Err(std::io::Error::other("campaign_daily: a value does not fit INT64"));
+            }
+            self.is_wide = true;
+            self.writer.abandon();
+            let next = GroupWriter::create(&self.folder.join("part-000-wide.parquet"), self.wide)?.gzip(self.gzip);
+            let finished = std::mem::replace(&mut self.writer, next).finish()?;
+            self.add(finished);
+            if !self.group(channels)? {
+                return Err(std::io::Error::other("campaign_daily: a value does not fit INT64"));
             }
         }
+        self.campaign.clear();
+        self.channel.clear();
+        self.day.clear();
+        self.columns.iter_mut().for_each(Vec::clear);
+        Ok(())
     }
-    // The rows, in (campaign, day) order, and every channel once.
-    let mut campaign: Vec<u64> = Vec::with_capacity(cells);
-    let mut channel: Vec<u32> = Vec::with_capacity(cells);
-    let mut day: Vec<i32> = Vec::with_capacity(cells);
-    let mut columns: [Vec<i64>; 4] = std::array::from_fn(|_| Vec::with_capacity(cells));
+
+    /// One row group of the gathered rows. `Ok(false)`: the file has INT32
+    /// columns and a value does not fit.
+    fn group(&mut self, channels: &[&[u8]]) -> std::io::Result<bool> {
+        let ctx = self.ctx;
+        self.writer.begin(&self.day, |_| false)?;
+        self.writer.runs(&self.campaign, |id, _| Text::Long(&ctx.campaign_ids[id as usize]))?;
+        self.writer.strings(channels, &self.channel, u32::MAX)?;
+        self.writer.dates(&self.day)?;
+        for column in &self.columns {
+            if !self.writer.ints(column)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn add(&mut self, file: Written) {
+        self.written.bytes += file.bytes;
+        self.written.row_groups += file.row_groups;
+        self.written.write_nanos += file.write_nanos;
+    }
+}
+
+/// Writes campaign_daily: the workers' cells summed campaign by campaign, the
+/// rows written a row group at a time. Returns what was written.
+fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::io::Result<Written> {
+    let fields = |integer: ColumnType| {
+        [
+            ("campaign_id", ColumnType::Str),
+            ("channel", ColumnType::Str),
+            ("day", ColumnType::Date),
+            ("sessions", integer),
+            ("purchasing_sessions", integer),
+            ("revenue_cents", integer),
+            ("assisted_sessions", integer),
+        ]
+    };
+    // The counts and sums are INT32 unless one of them does not fit.
+    let (narrow, wide) = (fields(ColumnType::Int32), fields(ColumnType::Int64));
+    let folder = output.join("campaign_daily");
+    let gzip = gzip_columns(&CAMPAIGN_DAILY_GZIP);
+    let mut table = CampaignTable {
+        ctx,
+        writer: GroupWriter::create(&folder.join("part-000.parquet"), &narrow)?.gzip(gzip),
+        folder,
+        gzip,
+        wide: &wide,
+        is_wide: false,
+        written: Written::default(),
+        campaign: Vec::with_capacity(CAMPAIGN_ROWS),
+        channel: Vec::with_capacity(CAMPAIGN_ROWS),
+        day: Vec::with_capacity(CAMPAIGN_ROWS),
+        columns: std::array::from_fn(|_| Vec::with_capacity(CAMPAIGN_ROWS)),
+    };
+    // Every channel once, in the order campaigns with rows first use them.
     let mut channels: Vec<&[u8]> = Vec::new();
     let mut channel_index: FastMap<&[u8], u32> = HashMap::default();
-    for (id, days) in totals.chunks_exact(ctx.day_count.max(1)).enumerate() {
+    let day_count = ctx.day_count.max(1);
+    let mut totals = vec![[0i64; 4]; day_count];
+    for id in 0..ctx.campaign_ids.len() {
+        totals.fill([0; 4]);
+        for worker in workers {
+            for (total, cell) in totals.iter_mut().zip(&worker.campaign_days[id * day_count..(id + 1) * day_count]) {
+                for at in 0..4 {
+                    total[at] += cell[at];
+                }
+            }
+        }
         let mut channel_of_campaign = None;
-        for (offset, total) in days.iter().enumerate() {
+        for (offset, total) in totals.iter().enumerate() {
             // A row exists when at least one session was credited to or assisted by the campaign.
             if total[0] == 0 && total[3] == 0 {
                 continue;
@@ -850,47 +953,24 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
                     next
                 })
             });
-            campaign.push(id as u64);
-            channel.push(index);
-            day.push((ctx.first_day + offset as i64) as i32);
-            for (column, value) in columns.iter_mut().zip(total) {
+            table.campaign.push(id as u64);
+            table.channel.push(index);
+            table.day.push((ctx.first_day + offset as i64) as i32);
+            for (column, value) in table.columns.iter_mut().zip(total) {
                 column.push(*value);
             }
-        }
-    }
-    let path = output.join("campaign_daily").join("part-000.parquet");
-    // `None`: a value does not fit INT32.
-    let write = |integer: ColumnType| -> std::io::Result<Option<Written>> {
-        let fields = [
-            ("campaign_id", ColumnType::Str),
-            ("channel", ColumnType::Str),
-            ("day", ColumnType::Date),
-            ("sessions", integer),
-            ("purchasing_sessions", integer),
-            ("revenue_cents", integer),
-            ("assisted_sessions", integer),
-        ];
-        let mut writer = GroupWriter::create(&path, &fields)?.gzip(gzip_columns(&CAMPAIGN_DAILY_GZIP));
-        let mut start = 0;
-        while start < day.len() {
-            let end = (start + GROUP_ROWS).min(day.len());
-            writer.begin(&day[start..end], |_| false)?;
-            writer.runs(&campaign[start..end], |id, _| Text::Long(&ctx.campaign_ids[id as usize]))?;
-            writer.strings(&channels, &channel[start..end], u32::MAX)?;
-            writer.dates(&day[start..end])?;
-            for column in &columns {
-                if !writer.ints(&column[start..end])? {
-                    return Ok(None);
-                }
+            if table.day.len() == CAMPAIGN_ROWS {
+                table.flush(&channels)?;
             }
-            start = end;
         }
-        writer.finish().map(Some)
-    };
-    match write(ColumnType::Int32)? {
-        Some(written) => Ok(written),
-        None => write(ColumnType::Int64)?.ok_or_else(|| std::io::Error::other("campaign_daily: a value does not fit INT64")),
     }
+    table.flush(&channels)?;
+    let CampaignTable { writer, mut written, .. } = table;
+    let last = writer.finish()?;
+    written.bytes += last.bytes;
+    written.row_groups += last.row_groups;
+    written.write_nanos += last.write_nanos;
+    Ok(written)
 }
 
 #[cfg(test)]
