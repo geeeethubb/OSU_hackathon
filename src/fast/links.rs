@@ -81,11 +81,6 @@ fn prefetch_line<T>(pointer: *const T) {
     let _ = pointer;
 }
 
-/// Low bits of a forest word: the slot of the ID's parent. The code is above.
-const PARENT_BITS: u32 = 64 - CODE_BITS;
-const PARENT_MASK: u64 = (1 << PARENT_BITS) - 1;
-/// The most slots a forest can have: a parent must fit in `PARENT_BITS`.
-const FOREST_MAX_SLOTS: usize = 1 << PARENT_BITS;
 /// How many pairs ahead of the one being joined the home slots are prefetched.
 const PAIR_LOOKAHEAD: usize = 16;
 /// How many slots ahead of the one being named its parent is prefetched.
@@ -93,23 +88,101 @@ const SCAN_LOOKAHEAD: usize = 24;
 /// Renamed IDs wait this many deep while their lookup-table slots load.
 const INSERT_BATCH: usize = 32;
 
-/// Union-find over the linked IDs, stored in one open-addressing table. A
-/// slot is `code << PARENT_BITS | parent slot`; a root is its own parent, and
-/// an empty slot is 0 (codes are never 0). Joining always puts the byte-wise
-/// smaller root on top, so the root of a tree is the name of its person.
-struct Forest<'a> {
-    slots: Vec<u64>,
+/// One slot of a forest: an ID's code and the slot of its parent. A root is
+/// its own parent, and the empty slot is all zero bits (codes are never 0).
+trait Node: Copy {
+    const EMPTY: Self;
+    /// The most slots a forest of these nodes can have.
+    const MAX_SLOTS: usize;
+    fn new(code: u64, parent: usize) -> Self;
+    fn is_empty(self) -> bool;
+    fn code(self) -> u64;
+    fn parent(self) -> usize;
+    fn with_parent(self, parent: usize) -> Self;
+}
+
+/// Parent bits of a narrow node; the code is above them.
+const NARROW_PARENT_BITS: u32 = 64 - CODE_BITS;
+const NARROW_PARENT_MASK: u64 = (1 << NARROW_PARENT_BITS) - 1;
+
+/// Eight bytes, `code << 22 | parent`: half the memory of a wide node, for
+/// forests of up to 2^22 slots (about 1.86M link lines).
+impl Node for u64 {
+    const EMPTY: Self = 0;
+    const MAX_SLOTS: usize = 1 << NARROW_PARENT_BITS;
+
+    #[inline(always)]
+    fn new(code: u64, parent: usize) -> Self {
+        (code << NARROW_PARENT_BITS) | parent as u64
+    }
+
+    #[inline(always)]
+    fn is_empty(self) -> bool {
+        self == 0
+    }
+
+    #[inline(always)]
+    fn code(self) -> u64 {
+        self >> NARROW_PARENT_BITS
+    }
+
+    #[inline(always)]
+    fn parent(self) -> usize {
+        (self & NARROW_PARENT_MASK) as usize
+    }
+
+    #[inline(always)]
+    fn with_parent(self, parent: usize) -> Self {
+        (self & !NARROW_PARENT_MASK) | parent as u64
+    }
+}
+
+/// Sixteen bytes, `[code, parent]`, for larger forests.
+impl Node for [u64; 2] {
+    const EMPTY: Self = [0, 0];
+    const MAX_SLOTS: usize = 1 << 32;
+
+    #[inline(always)]
+    fn new(code: u64, parent: usize) -> Self {
+        [code, parent as u64]
+    }
+
+    #[inline(always)]
+    fn is_empty(self) -> bool {
+        self[0] == 0
+    }
+
+    #[inline(always)]
+    fn code(self) -> u64 {
+        self[0]
+    }
+
+    #[inline(always)]
+    fn parent(self) -> usize {
+        self[1] as usize
+    }
+
+    #[inline(always)]
+    fn with_parent(self, parent: usize) -> Self {
+        [self[0], parent as u64]
+    }
+}
+
+/// Union-find over the linked IDs, stored in one open-addressing table of
+/// nodes. Joining always puts the byte-wise smaller root on top, so the root
+/// of a tree is the name of its person.
+struct Forest<'a, N: Node> {
+    slots: Vec<N>,
     /// Exotic IDs by index, to compare them by their bytes.
     exotic: &'a [Box<[u8]>],
 }
 
-impl Forest<'_> {
+impl<N: Node> Forest<'_, N> {
     /// Where the probe for `code` starts.
     #[inline(always)]
     fn home(&self, code: u64) -> usize {
-        // `mix` is below 2^CODE_BITS and the slot count at most 2^PARENT_BITS,
-        // so the product fits 64 bits and the result is below the slot count.
-        ((mix(code) * self.slots.len() as u64) >> CODE_BITS) as usize
+        // `mix` is below 2^CODE_BITS, so the result is below the slot count.
+        ((u128::from(mix(code)) * self.slots.len() as u128) >> CODE_BITS) as usize
     }
 
     /// The slot of `code`, which becomes a new root if it was not there.
@@ -118,13 +191,13 @@ impl Forest<'_> {
         let mut at = self.home(code);
         loop {
             // SAFETY: `at` is always below the slot count.
-            let word = unsafe { *self.slots.get_unchecked(at) };
-            if word >> PARENT_BITS == code {
+            let node = unsafe { *self.slots.get_unchecked(at) };
+            if node.code() == code {
                 return at;
             }
-            if word == 0 {
+            if node.is_empty() {
                 // SAFETY: as above.
-                unsafe { *self.slots.get_unchecked_mut(at) = (code << PARENT_BITS) | at as u64 };
+                unsafe { *self.slots.get_unchecked_mut(at) = N::new(code, at) };
                 return at;
             }
             at += 1;
@@ -140,17 +213,16 @@ impl Forest<'_> {
         loop {
             // SAFETY: `at` is an occupied slot and every parent is a slot.
             unsafe {
-                let word = *self.slots.get_unchecked(at);
-                let parent = (word & PARENT_MASK) as usize;
+                let node = *self.slots.get_unchecked(at);
+                let parent = node.parent();
                 if parent == at {
                     return at;
                 }
-                let above = *self.slots.get_unchecked(parent);
-                let grandparent = (above & PARENT_MASK) as usize;
+                let grandparent = self.slots.get_unchecked(parent).parent();
                 if grandparent == parent {
                     return parent;
                 }
-                *self.slots.get_unchecked_mut(at) = (word & !PARENT_MASK) | grandparent as u64;
+                *self.slots.get_unchecked_mut(at) = node.with_parent(grandparent);
                 at = grandparent;
             }
         }
@@ -163,8 +235,8 @@ impl Forest<'_> {
         if a == b {
             return;
         }
-        let (word_a, word_b) = (self.slots[a], self.slots[b]);
-        let (code_a, code_b) = (word_a >> PARENT_BITS, word_b >> PARENT_BITS);
+        let (node_a, node_b) = (self.slots[a], self.slots[b]);
+        let (code_a, code_b) = (node_a.code(), node_b.code());
         // Pattern codes order like their IDs; exotic IDs are compared by bytes.
         let a_is_smaller = if code_a < EXOTIC_BASE && code_b < EXOTIC_BASE {
             code_a < code_b
@@ -172,31 +244,38 @@ impl Forest<'_> {
             id_cmp(code_a, code_b, b'u', self.exotic) == Ordering::Less
         };
         if a_is_smaller {
-            self.slots[b] = (word_b & !PARENT_MASK) | a as u64;
+            self.slots[b] = node_b.with_parent(a);
         } else {
-            self.slots[a] = (word_a & !PARENT_MASK) | b as u64;
+            self.slots[a] = node_a.with_parent(b);
         }
     }
 }
 
 /// Joins every pair, names each group by its byte-wise smallest ID.
 pub fn build(pairs: &[Vec<(u64, u64)>], users: &Interner) -> LinkTable {
-    build_within(pairs, users, FOREST_MAX_SLOTS)
+    build_within(pairs, users, <u64 as Node>::MAX_SLOTS, <[u64; 2] as Node>::MAX_SLOTS)
 }
 
-/// `build`, with the forest limited to `max_slots` slots (a parameter so the
-/// tests can reach the path for inputs too large for a forest).
-fn build_within(pairs: &[Vec<(u64, u64)>], users: &Interner, max_slots: usize) -> LinkTable {
+/// `build`, with the two forest sizes limited to `narrow_max` and `wide_max`
+/// slots (parameters so the tests can reach every path with small inputs).
+fn build_within(pairs: &[Vec<(u64, u64)>], users: &Interner, narrow_max: usize, wide_max: usize) -> LinkTable {
     let pair_count: usize = pairs.iter().map(Vec::len).sum();
     // A pair brings at most two new IDs, so the forest stays under 8/9 full
     // and always has an empty slot to end a probe.
     let slot_count = pair_count * 2 + pair_count / 4 + 16;
-    if slot_count > max_slots {
-        return build_general(pairs, users);
+    if slot_count <= narrow_max {
+        build_in_forest::<u64>(pairs, users, slot_count)
+    } else if slot_count <= wide_max {
+        build_in_forest::<[u64; 2]>(pairs, users, slot_count)
+    } else {
+        build_general(pairs, users)
     }
+}
+
+fn build_in_forest<N: Node>(pairs: &[Vec<(u64, u64)>], users: &Interner, slot_count: usize) -> LinkTable {
     // Exotic IDs (upper case and the like) sort by their bytes, not their code.
     let exotic = users.snapshot();
-    let mut forest = Forest { slots: vec![0u64; slot_count], exotic: &exotic };
+    let mut forest = Forest { slots: vec![N::EMPTY; slot_count], exotic: &exotic };
     for list in pairs {
         for (at, &(a, b)) in list.iter().enumerate() {
             if let Some(&(later_a, later_b)) = list.get(at + PAIR_LOOKAHEAD) {
@@ -209,25 +288,21 @@ fn build_within(pairs: &[Vec<(u64, u64)>], users: &Interner, max_slots: usize) -
     }
 
     // Every ID that is not the root of its tree is renamed to the root.
-    let renamed = forest
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|&(at, &word)| word != 0 && (word & PARENT_MASK) as usize != at)
-        .count();
+    let renamed =
+        forest.slots.iter().enumerate().filter(|&(at, node)| !node.is_empty() && node.parent() != at).count();
     let mut table = LinkTable::with_capacity(renamed);
     let mut batch = [(0u64, 0u64); INSERT_BATCH];
     let mut waiting = 0;
     for at in 0..slot_count {
-        if let Some(&later) = forest.slots.get(at + SCAN_LOOKAHEAD) {
-            prefetch_line(forest.slots.as_ptr().wrapping_add((later & PARENT_MASK) as usize));
+        if let Some(later) = forest.slots.get(at + SCAN_LOOKAHEAD) {
+            prefetch_line(forest.slots.as_ptr().wrapping_add(later.parent()));
         }
-        let word = forest.slots[at];
-        if word == 0 || (word & PARENT_MASK) as usize == at {
+        let node = forest.slots[at];
+        if node.is_empty() || node.parent() == at {
             continue;
         }
         let root = forest.find(at);
-        let (user, name) = (word >> PARENT_BITS, forest.slots[root] >> PARENT_BITS);
+        let (user, name) = (node.code(), forest.slots[root].code());
         table.prefetch(user);
         batch[waiting] = (user, name);
         waiting += 1;
@@ -441,8 +516,9 @@ mod tests {
         let unlinked: Vec<Id> =
             (0..200).map(|_| random_id(random, 4)).filter(|id| !expected.contains_key(id)).collect();
         for (path, table) in [
-            ("forest", build_within(&lists, &users, FOREST_MAX_SLOTS)),
-            ("general", build_within(&lists, &users, 0)),
+            ("narrow forest", build_within(&lists, &users, usize::MAX, usize::MAX)),
+            ("wide forest", build_within(&lists, &users, 0, usize::MAX)),
+            ("general", build_within(&lists, &users, 0, 0)),
         ] {
             for (id, name) in &expected {
                 assert_eq!(
@@ -510,8 +586,9 @@ mod tests {
         let down: Vec<(u64, u64)> = (1..count).rev().map(|at| (code(at), code(at - 1))).collect();
         let up: Vec<(u64, u64)> = (1..count).map(|at| (code(count + at - 1), code(count + at))).collect();
         let hub: Vec<(u64, u64)> = (1..count).map(|at| (code(3 * count), code(2 * count + at))).collect();
-        for max_slots in [FOREST_MAX_SLOTS, 0] {
-            let table = build_within(&[down.clone(), Vec::new(), up.clone(), hub.clone()], &users, max_slots);
+        for (narrow_max, wide_max) in [(usize::MAX, usize::MAX), (0, usize::MAX), (0, 0)] {
+            let table =
+                build_within(&[down.clone(), Vec::new(), up.clone(), hub.clone()], &users, narrow_max, wide_max);
             for at in 0..count {
                 assert_eq!(table.person(code(at)), code(0));
                 assert_eq!(table.person(code(count + at)), code(count));
