@@ -172,7 +172,7 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
 
 /// Writes one surviving event to its person's partition.
 #[inline(always)]
-fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purchase: u64) {
+pub fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purchase: u64) {
     let mixed = mix(links.person(word1 >> 22));
     let part = (mixed >> out.person_shift) as usize;
     let is_purchase = word1 & 1;

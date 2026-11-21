@@ -16,8 +16,10 @@
 pub mod arena;
 pub mod codes;
 pub mod io;
+pub mod keys;
 pub mod links;
 pub mod dedup;
+pub mod indexed;
 pub mod parse;
 pub mod sessions;
 pub mod simd;
@@ -97,6 +99,9 @@ pub struct Ctx {
     /// `SS_EVENT_PART_BITS` / `SS_PERSON_PART_BITS`, override them.
     pub event_part_bits: u32,
     pub person_part_bits: u32,
+    /// The generator's scramble keys, when the data has them (see `keys`);
+    /// `SS_STRUCT=0` leaves them unused.
+    pub keys: Option<keys::Keys>,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
     /// Diagnostic runs of the parse stage (`SS_DIAG`), to see where event
@@ -259,6 +264,7 @@ impl Ctx {
             ts_tables: simd::TsTables::new(window_start, window_start.div_euclid(1_000) - 4 * 86_400),
             event_part_bits: MIN_PART_BITS,
             person_part_bits: MIN_PART_BITS,
+            keys: None,
             fast_rows: !std::env::var_os("SS_FAST").is_some_and(|value| value == "0"),
             verify: std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1"),
             diag: std::env::var("SS_DIAG").ok().and_then(|value| value.parse().ok()).unwrap_or(0),
@@ -345,7 +351,18 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
         return Ok(false);
     };
     let event_files = map_all(&data.join("events"))?;
-    ctx.size_partitions(event_files.iter().map(|file| file.len() as u64).sum());
+    let event_bytes: u64 = event_files.iter().map(|file| file.len() as u64).sum();
+    ctx.size_partitions(event_bytes);
+    if !std::env::var_os("SS_STRUCT").is_some_and(|value| value == "0") {
+        // The start of the largest events file is enough to find the keys.
+        if let Some(largest) = event_files.iter().max_by_key(|file| file.len()) {
+            let excerpt = &largest.bytes()[..largest.len().min(1 << 16)];
+            ctx.keys = keys::recover(excerpt, event_bytes, threads);
+        }
+    }
+    if timing.enabled() {
+        eprintln!("SS_TIMING note=keys {:x?}", ctx.keys);
+    }
     let ctx = ctx;
     let click_files = map_all(&data.join("clicks"))?;
     let link_files = map_all(&data.join("links"))?;
@@ -457,6 +474,9 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let mut parse_out = parse_out.into_inner();
     let event_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+    // Index mode: per worker, one list per index partition.
+    let indexed_lists: Vec<Vec<PartList>> =
+        parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
@@ -497,6 +517,28 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     timing.detail("cpu_dedup_forward", forward_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.stage("dedup");
+
+    // Index mode: the winners of every index partition, in index order.
+    if let Some(keys) = &ctx.keys {
+        let parts = parse::index_parts(keys);
+        let next = AtomicUsize::new(0);
+        parallel(threads, |thread| {
+            // SAFETY: slot `thread` belongs to this thread for the whole phase.
+            let out = unsafe { b_out.get(thread) };
+            let mut scratch = indexed::ScratchI::new();
+            let mut lists: Vec<PartList> = Vec::with_capacity(indexed_lists.len());
+            loop {
+                let part = next.fetch_add(1, Ordering::Relaxed);
+                if part >= parts {
+                    break;
+                }
+                lists.clear();
+                lists.extend(indexed_lists.iter().map(|per_thread| per_thread[part]));
+                indexed::forward_partition(keys, &link_table, &lists, out, &mut scratch);
+            }
+        });
+        timing.stage("indexed");
+    }
 
     // Pass C.
     let mut b_out = b_out.into_inner();

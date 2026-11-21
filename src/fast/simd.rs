@@ -14,7 +14,8 @@ use std::arch::x86_64::*;
 use std::hint::select_unpredictable;
 
 use super::codes::id_code;
-use super::parse::{emit_raw, ClickRecord, EventRow, ParseOut};
+use super::keys::{unscramble, MASK as NUMBER_MASK};
+use super::parse::{emit_indexed, emit_raw, ClickRecord, EventRow, ParseOut};
 use super::Ctx;
 use crate::util::{civil_from_days, parse_price, parse_ts, DAY_MS, LATE_MS, WEEK_MS};
 
@@ -30,6 +31,9 @@ pub const ROW_SLOW: u32 = 2;
 pub const ROW_LONG: u32 = 3;
 /// The row was parsed and already stored.
 pub const ROW_DONE: u32 = 4;
+/// Index mode only: the event ID is not one of the generator's (or its
+/// index is out of range), so the row belongs to the general path.
+pub const ROW_GENERIC: u32 = 5;
 
 /// What `event_row_fast` does with a parsed row.
 pub const MODE_STORE: u32 = 0;
@@ -318,6 +322,38 @@ unsafe fn two_codes(first: u64, second: u64) -> (u64, u64, u32) {
     (_mm_cvtsi128_si64(codes) as u64, _mm_extract_epi64(codes, 1) as u64, known)
 }
 
+/// The base-36 numbers of two texts at once. Each argument holds up to 8
+/// characters, right-aligned (the last character in the top byte, unused low
+/// bytes zero). Returns the two numbers and, per byte, whether it is in
+/// `[0-9a-z]` (bits 0..8 for the first text, 8..16 for the second).
+#[inline(always)]
+unsafe fn two_numbers36(first: u64, second: u64) -> (u64, u64, u32) {
+    let text = _mm_set_epi64x(second as i64, first as i64);
+    let as_digit = _mm_sub_epi8(text, _mm_set1_epi8(b'0' as i8));
+    let is_digit = _mm_cmpeq_epi8(_mm_min_epu8(as_digit, _mm_set1_epi8(9)), as_digit);
+    let as_letter = _mm_sub_epi8(text, _mm_set1_epi8(b'a' as i8));
+    let is_letter = _mm_cmpeq_epi8(_mm_min_epu8(as_letter, _mm_set1_epi8(25)), as_letter);
+    let values = _mm_or_si128(
+        _mm_and_si128(is_digit, as_digit),
+        _mm_and_si128(is_letter, _mm_add_epi8(as_letter, _mm_set1_epi8(10))),
+    );
+    let known = _mm_movemask_epi8(_mm_or_si128(is_digit, is_letter)) as u32;
+    // Base 36, most significant character first: pairs, fours, then eight.
+    let pairs = _mm_maddubs_epi16(values, _mm_set1_epi16(0x0124));
+    let fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510));
+    let numbers = _mm_add_epi64(_mm_mul_epu32(fours, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64(fours, 32));
+    (_mm_cvtsi128_si64(numbers) as u64, _mm_extract_epi64(numbers, 1) as u64, known)
+}
+
+/// Whether `chars` characters starting with the byte `first` and read as
+/// `number` are a canonical base-36 text: 1 to 8 known characters, no leading
+/// zero, below 2^40. `known` has one bit per byte of the right-aligned text.
+#[inline(always)]
+fn canonical36(chars: usize, first: u8, known: u32, number: u64) -> bool {
+    let need = (0xFFu32 << (8usize.wrapping_sub(chars) & 7)) & 0xFF;
+    (chars.wrapping_sub(1) < 8) & (known & need == need) & ((first != b'0') | (chars == 1)) & (number <= NUMBER_MASK)
+}
+
 const VIEW: u64 = u32::from_le_bytes(*b"view") as u64;
 const CART: u64 = u32::from_le_bytes(*b"cart") as u64;
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -331,8 +367,12 @@ unsafe fn mask(bytes: __m256i, byte: __m256i) -> u64 {
 /// bytes after it) and, in `MODE_STORE`, stores it in `out`. Returns the
 /// row's length and a `ROW_*` status. Only rows of 64 to 95 bytes take the
 /// fast path (99.9% of generated rows); the rest are declined.
+///
+/// With `INDEXED`, IDs are read as the generator's scrambled numbers
+/// (`ctx.keys` must be set): the event's dense index replaces its code and
+/// picks the partition, and a generated user ID is stored as its user number.
 #[inline(always)]
-pub unsafe fn event_row_fast<const MODE: u32>(
+pub unsafe fn event_row_fast<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     p: *const u8,
     out: &mut ParseOut,
@@ -442,12 +482,31 @@ pub unsafe fn event_row_fast<const MODE: u32>(
     let user_chars = user_length.wrapping_sub(1);
     let event_text = _bzhi_u64(read_u64(p.add(event_start + 1)), (event_chars as u32).wrapping_mul(8));
     let user_text = _bzhi_u64(read_u64(p.add(user_start + 1)), (user_chars as u32).wrapping_mul(8));
-    let (event_fast_code, user_fast_code, known) = two_codes(event_text, user_text);
-    let event_need = (1u32 << (event_chars & 15)) - 1;
-    let event_fast =
-        (event_chars.wrapping_sub(1) < 8) & (*p.add(event_start) == b'e') & (known & event_need == event_need);
-    let event_code =
-        if event_fast { event_fast_code } else { id_code(field(event_start, event_length), b'e', &ctx.event_ids) };
+    let (event_fast_code, user_fast_code, known) = if INDEXED {
+        two_numbers36(
+            event_text << ((8usize.wrapping_sub(event_chars) & 7) * 8),
+            user_text << ((8usize.wrapping_sub(user_chars) & 7) * 8),
+        )
+    } else {
+        two_codes(event_text, user_text)
+    };
+    let event_code = if INDEXED {
+        // The event's dense index, or the general path for any other ID.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let index = unscramble(event_fast_code, keys.event_key);
+        let generated = (*p.add(event_start) == b'e')
+            & canonical36(event_chars, event_text as u8, known, event_fast_code)
+            & (index < keys.index_bound);
+        if !generated {
+            return (length, ROW_GENERIC);
+        }
+        index
+    } else {
+        let event_need = (1u32 << (event_chars & 15)) - 1;
+        let event_fast =
+            (event_chars.wrapping_sub(1) < 8) & (*p.add(event_start) == b'e') & (known & event_need == event_need);
+        if event_fast { event_fast_code } else { id_code(field(event_start, event_length), b'e', &ctx.event_ids) }
+    };
     if MODE == 5 {
         row.event ^= event_code ^ user_fast_code;
         return (length, ROW_DROP);
@@ -497,26 +556,60 @@ pub unsafe fn event_row_fast<const MODE: u32>(
             None => valid = false,
         }
     }
-    let (user_code, ts) = if valid {
+    let (user_code, user_is_number, ts) = if !valid {
+        (0, false, 0)
+    } else if INDEXED {
+        // A generated user ID is stored as its user number; any other ID as its code.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let number = unscramble(user_fast_code, keys.user_key);
+        let generated = (*p.add(user_start) == b'u')
+            & canonical36(user_chars, user_text as u8, known >> 8, user_fast_code)
+            & ((number >> 9) < keys.user_bound);
+        if generated {
+            (number, true, (ts_ms - ctx.window_start) as u64)
+        } else {
+            let code = id_code(field(user_start, user_length), b'u', &ctx.user_ids);
+            (code, false, (ts_ms - ctx.window_start) as u64)
+        }
+    } else {
         let user_need = (1u32 << (user_chars & 15)) - 1;
         let user_fast = (user_chars.wrapping_sub(1) < 8)
             & (*p.add(user_start) == b'u')
             & ((known >> 8) & user_need == user_need);
         let user_code =
             if user_fast { user_fast_code } else { id_code(field(user_start, user_length), b'u', &ctx.user_ids) };
-        (user_code, (ts_ms - ctx.window_start) as u64)
-    } else {
-        (0, 0)
+        (user_code, false, (ts_ms - ctx.window_start) as u64)
     };
     if MODE == MODE_STORE {
-        emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        if INDEXED {
+            emit_indexed(
+                out,
+                event_code,
+                ts,
+                u64::from(valid),
+                user_code,
+                u64::from(user_is_number),
+                ingest_seconds as u64,
+                purchase,
+            );
+        } else {
+            emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        }
         return (length, ROW_DONE);
     }
     if MODE == 7 {
         row.event ^= event_code ^ user_code ^ ts ^ (ingest_seconds as u64);
         return (length, ROW_DROP);
     }
-    *row = EventRow { event: event_code, user: user_code, ts: ts as u32, ingest: ingest_seconds as u32, valid, purchase };
+    *row = EventRow {
+        event: event_code,
+        user: user_code,
+        user_is_number,
+        ts: ts as u32,
+        ingest: ingest_seconds as u32,
+        valid,
+        purchase,
+    };
     (length, ROW_EMIT)
 }
 
