@@ -277,7 +277,9 @@ pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
     let index_shift = std::env::var("SS_INDEX_SHIFT")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-        .map_or(DEFAULT_INDEX_SHIFT, |shift| shift.clamp(10, 16));
+        .map_or(if index_bound > (1 << 26) { DEFAULT_INDEX_SHIFT + 1 } else { DEFAULT_INDEX_SHIFT }, |shift| {
+            shift.clamp(10, 16)
+        });
     Some(Keys { event_key, user_key, index_bound, user_bound, index_shift })
 }
 
