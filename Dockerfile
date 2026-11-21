@@ -11,12 +11,16 @@ ENV RUSTFLAGS="-C target-feature=+crt-static"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && mkdir /out \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline \
-       target/x86_64-unknown-linux-gnu/release/reference /out/
+       target/x86_64-unknown-linux-gnu/release/reference \
+       target/x86_64-unknown-linux-gnu/release/chmod /out/
 
 FROM scratch
 # /pipeline is what gets scored. /reference is the simple, correct
 # implementation kept for cross-checking (docker run --entrypoint /reference).
 COPY --from=build /out/pipeline /pipeline
 COPY --from=build /out/reference /reference
+# The organizers' docker_run.sh runs `chmod -R a+rwX` inside the image to hand
+# the run's files back to the host user; an empty image needs its own.
+COPY --from=build /out/chmod /bin/chmod
 USER 1000:1000
 CMD ["/pipeline"]

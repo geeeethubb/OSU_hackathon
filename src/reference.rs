@@ -573,6 +573,21 @@ pub fn directories_from_environment() -> (PathBuf, PathBuf) {
     (data, output)
 }
 
+/// Makes everything the run creates writable by any user, so whoever owns the
+/// mounted output folder can delete it afterwards (the process runs as uid 1000).
+pub fn open_umask() {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        // SAFETY: umask only swaps the process's file mode creation mask.
+        unsafe {
+            umask(0);
+        }
+    }
+}
+
 pub fn thread_count() -> usize {
     std::env::var("NCPU")
         .ok()
