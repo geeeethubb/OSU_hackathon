@@ -38,7 +38,7 @@ use self::io::Mapped;
 use self::parse::ParseOut;
 use self::dedup::{PassBOut, ScratchB};
 use self::sessions::{PassCOut, ScratchC, NO_CATEGORY};
-use crate::parquet::{self, ColumnType, GroupWriter, Text};
+use crate::parquet::{self, ColumnType, GroupWriter, Text, Written};
 use crate::reference::{list_csv, FastHasher};
 use crate::util::{for_each_data_line, parse_manifest, split_fields, Timing, DAY_MS};
 
@@ -651,6 +651,24 @@ fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a [B
     Text::Short(1 + count)
 }
 
+/// What the output stage did, summed over its threads; times in nanoseconds.
+/// Printed as `SS_TIMING` details, so that a run shows where the stage's
+/// time goes on the machine at hand.
+#[derive(Default)]
+struct OutputStats {
+    /// Creating the user_daily files (with the writers' scratch memory).
+    create: AtomicU64,
+    /// Encoding and writing the user_daily row groups, footers included.
+    rows: AtomicU64,
+    /// Of `rows`, the time inside write calls.
+    write: AtomicU64,
+    /// The campaign table, all of it.
+    campaign: AtomicU64,
+    user_daily_bytes: AtomicU64,
+    campaign_daily_bytes: AtomicU64,
+    row_groups: AtomicU64,
+}
+
 /// Writes both tables. The threads share one list of work: the campaign
 /// table, then every worker's user_daily rows in row-group-sized pieces. A
 /// thread adds the pieces it takes to its own file, so the files come out
@@ -663,8 +681,12 @@ fn write_tables(
     workers: &[PassCOut],
     user_exotic: &[Box<[u8]>],
 ) -> std::io::Result<()> {
+    let timing = Timing::new();
+    let started = Instant::now();
     fs::create_dir_all(output.join("user_daily"))?;
     fs::create_dir_all(output.join("campaign_daily"))?;
+    timing.detail("output_mkdir", started.elapsed().as_secs_f64() * 1e3);
+    let stats = OutputStats::default();
     let mut pieces: Vec<(&PassCOut, usize, usize)> = Vec::new();
     for worker in workers {
         let mut start = 0;
@@ -691,17 +713,27 @@ fn write_tables(
         parallel(threads, |thread| {
             let work = || -> std::io::Result<()> {
                 let path = output.join("user_daily").join(format!("part-{thread:03}.parquet"));
+                let create = || -> std::io::Result<GroupWriter> {
+                    let started = Instant::now();
+                    let writer = GroupWriter::create(&path, &fields)?.gzip(gzip);
+                    stats.create.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok(writer)
+                };
                 // Thread 0 always writes a file, so the folder holds a table
                 // even with no rows; so does every thread of a second
                 // attempt, to replace what the first one left behind.
                 let mut writer = None;
                 if thread == 0 || integer == ColumnType::Int64 {
-                    writer = Some(GroupWriter::create(&path, &fields)?.gzip(gzip));
+                    writer = Some(create()?);
                 }
+                let mut spent = 0;
                 while !too_narrow.load(Ordering::Relaxed) {
                     let task = next.fetch_add(1, Ordering::Relaxed);
                     if task == 0 {
-                        write_campaign_daily(ctx, output, workers)?;
+                        let started = Instant::now();
+                        let written = write_campaign_daily(ctx, output, workers)?;
+                        stats.campaign.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stats.campaign_daily_bytes.fetch_add(written.bytes, Ordering::Relaxed);
                         continue;
                     }
                     let Some(&(rows, start, end)) = pieces.get(task - 1) else {
@@ -709,16 +741,26 @@ fn write_tables(
                     };
                     let writer = match &mut writer {
                         Some(writer) => writer,
-                        None => writer.insert(GroupWriter::create(&path, &fields)?.gzip(gzip)),
+                        None => writer.insert(create()?),
                     };
+                    let started = Instant::now();
                     if !write_user_daily(ctx, writer, rows, start, end, user_exotic)? {
                         too_narrow.store(true, Ordering::Relaxed);
                     }
+                    spent += started.elapsed().as_nanos() as u64;
                 }
-                match writer {
-                    Some(writer) if !too_narrow.load(Ordering::Relaxed) => writer.finish(),
-                    _ => Ok(()),
+                if let Some(writer) = writer {
+                    if !too_narrow.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        let written = writer.finish()?;
+                        spent += started.elapsed().as_nanos() as u64;
+                        stats.write.fetch_add(written.write_nanos, Ordering::Relaxed);
+                        stats.user_daily_bytes.fetch_add(written.bytes, Ordering::Relaxed);
+                        stats.row_groups.fetch_add(written.row_groups as u64, Ordering::Relaxed);
+                    }
                 }
+                stats.rows.fetch_add(spent, Ordering::Relaxed);
+                Ok(())
             };
             if let Err(error) = work() {
                 failure.lock().unwrap().get_or_insert(error);
@@ -733,6 +775,19 @@ fn write_tables(
     // every user_daily file is written again with INT64 columns.
     if !write(ColumnType::Int32, 0)? {
         write(ColumnType::Int64, 1)?;
+    }
+    if timing.enabled() {
+        let ms = |nanos: &AtomicU64| nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        timing.detail("cpu_output_create", ms(&stats.create));
+        timing.detail("cpu_output_encode", ms(&stats.rows) - ms(&stats.write));
+        timing.detail("cpu_output_write", ms(&stats.write));
+        timing.detail("cpu_output_campaign", ms(&stats.campaign));
+        eprintln!(
+            "SS_OUTPUT user_daily_bytes={} user_daily_row_groups={} campaign_daily_bytes={}",
+            stats.user_daily_bytes.load(Ordering::Relaxed),
+            stats.row_groups.load(Ordering::Relaxed),
+            stats.campaign_daily_bytes.load(Ordering::Relaxed),
+        );
     }
     Ok(())
 }
@@ -763,7 +818,7 @@ fn write_user_daily(
     Ok(true)
 }
 
-fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::io::Result<()> {
+fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::io::Result<Written> {
     let cells = ctx.campaign_ids.len() * ctx.day_count;
     let mut totals = vec![[0i64; 4]; cells];
     for worker in workers {
@@ -804,7 +859,8 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
         }
     }
     let path = output.join("campaign_daily").join("part-000.parquet");
-    let write = |integer: ColumnType| -> std::io::Result<bool> {
+    // `None`: a value does not fit INT32.
+    let write = |integer: ColumnType| -> std::io::Result<Option<Written>> {
         let fields = [
             ("campaign_id", ColumnType::Str),
             ("channel", ColumnType::Str),
@@ -824,18 +880,17 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
             writer.dates(&day[start..end])?;
             for column in &columns {
                 if !writer.ints(&column[start..end])? {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
             start = end;
         }
-        writer.finish()?;
-        Ok(true)
+        writer.finish().map(Some)
     };
-    if !write(ColumnType::Int32)? {
-        write(ColumnType::Int64)?;
+    match write(ColumnType::Int32)? {
+        Some(written) => Ok(written),
+        None => write(ColumnType::Int64)?.ok_or_else(|| std::io::Error::other("campaign_daily: a value does not fit INT64")),
     }
-    Ok(())
 }
 
 #[cfg(test)]

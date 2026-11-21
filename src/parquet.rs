@@ -1030,6 +1030,15 @@ impl ColumnType {
     }
 }
 
+/// What [`GroupWriter::finish`] reports about the file it has written.
+#[derive(Clone, Copy, Default)]
+pub struct Written {
+    pub bytes: u64,
+    pub row_groups: usize,
+    /// Nanoseconds spent inside the write calls.
+    pub write_nanos: u64,
+}
+
 /// The text of one run of [`GroupWriter::runs`].
 pub enum Text<'a> {
     /// The first so many bytes of the slot the callback was given.
@@ -1275,6 +1284,8 @@ pub struct GroupWriter<'a> {
     /// The fields whose chunks are GZIP.
     gzip: Vec<bool>,
     out: Pending,
+    /// Nanoseconds spent inside the write calls so far.
+    write_nanos: u64,
     /// `fields.len()` chunks per finished row group, then those of the open one.
     chunks: Vec<ChunkInfo>,
     /// Rows of every row group; the last one is open until the next `begin` or `finish`.
@@ -1308,6 +1319,7 @@ impl<'a> GroupWriter<'a> {
             fields,
             gzip: vec![false; fields.len()],
             out: Pending { bytes: Vec::new(), used: 0, written: 0, gzip: false, saved: 0, packed: Vec::new() },
+            write_nanos: 0,
             chunks: Vec::new(),
             groups: Vec::new(),
             order: zeroed(),
@@ -1372,7 +1384,7 @@ impl<'a> GroupWriter<'a> {
     }
 
     /// Writes the footer and whatever is still pending.
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish(mut self) -> io::Result<Written> {
         let width = self.fields.len();
         assert_eq!(self.chunks.len(), self.groups.len() * width, "the open row group lacks columns");
         let mut meta = file_metadata(self.fields.iter().map(|(name, kind)| (*name, kind.leaf())));
@@ -1387,11 +1399,14 @@ impl<'a> GroupWriter<'a> {
         self.out.put(&meta);
         self.out.put(&(meta.len() as u32).to_le_bytes());
         self.out.put(b"PAR1");
-        self.flush()
+        self.flush()?;
+        Ok(Written { bytes: self.out.written, row_groups: self.groups.len(), write_nanos: self.write_nanos })
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let started = std::time::Instant::now();
         self.file.write_all(&self.out.bytes[..self.out.used])?;
+        self.write_nanos += started.elapsed().as_nanos() as u64;
         self.out.written += self.out.used as u64;
         self.out.used = 0;
         Ok(())
