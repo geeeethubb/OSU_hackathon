@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::BuildHasherDefault;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use self::arena::{PartList, PartWriter};
@@ -171,17 +171,24 @@ impl Ctx {
         let products = fs::read(data.join("products.csv"))?;
         let mut category_names: Vec<Box<[u8]>> = Vec::new();
         let mut category_index: FastMap<Box<[u8]>, u32> = HashMap::default();
-        let mut product_category: FastMap<Box<[u8]>, u32> = HashMap::default();
+        // A product line is at least a dozen bytes: room for all of them at once.
+        let mut product_category: FastMap<Box<[u8]>, u32> =
+            HashMap::with_capacity_and_hasher(products.len() / 12, Default::default());
         for_each_data_line(&products, |line| {
             if let Some([product, category]) = split_fields::<2>(line) {
                 if product.is_empty() {
                     return;
                 }
-                let next = category_names.len() as u32;
-                let at = *category_index.entry(category.into()).or_insert_with(|| {
-                    category_names.push(category.into());
-                    next
-                });
+                // Categories are few: look one up before making a key of it.
+                let at = match category_index.get(category) {
+                    Some(&at) => at,
+                    None => {
+                        let next = category_names.len() as u32;
+                        category_index.insert(category.into(), next);
+                        category_names.push(category.into());
+                        next
+                    }
+                };
                 product_category.entry(product.into()).or_insert(at);
             }
         });
@@ -370,10 +377,19 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
 fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::io::Result<Attempt> {
     let mut timing = Timing::new();
     let threads = threads.max(1);
-    let Some(mut ctx) = Ctx::load(data)? else {
+    // The input files are mapped while the lookup tables are read.
+    let (ctx, event_files, click_files, link_files) = std::thread::scope(|scope| {
+        let events = scope.spawn(|| map_all(&data.join("events")));
+        let clicks = scope.spawn(|| map_all(&data.join("clicks")));
+        let links = scope.spawn(|| map_all(&data.join("links")));
+        let ctx = Ctx::load(data);
+        (ctx, events.join().unwrap(), clicks.join().unwrap(), links.join().unwrap())
+    });
+    let Some(mut ctx) = ctx? else {
         return Ok(Attempt::Declined);
     };
-    let event_files = map_all(&data.join("events"))?;
+    let (event_files, click_files, link_files) = (event_files?, click_files?, link_files?);
+    timing.detail("startup_loaded", timing.since_last());
     let event_bytes: u64 = event_files.iter().map(|file| file.len() as u64).sum();
     ctx.size_partitions(event_bytes);
     if indexed {
@@ -387,8 +403,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         eprintln!("SS_TIMING note=keys {:x?}", ctx.keys);
     }
     let ctx = ctx;
-    let click_files = map_all(&data.join("clicks"))?;
-    let link_files = map_all(&data.join("links"))?;
     timing.stage("startup");
 
     // Links first: they are small, and resolving them can then overlap the
@@ -447,7 +461,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let (link_table, link_summary) = std::thread::scope(|scope| {
+    let (link_table, summary_thread) = std::thread::scope(|scope| {
         let builder = scope.spawn(|| {
             let started = Instant::now();
             // Index mode sorts the link components by user index: a
@@ -458,9 +472,20 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 }
                 None => links::build(&link_pairs, &ctx.user_ids),
             };
-            // Index mode: what the table says per user index, flat.
-            let summary = ctx.keys.as_ref().map(|keys| indexed::Summary::build(keys, &table));
             link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let table = std::sync::Arc::new(table);
+            // Index mode: what the table says per user index, flat. Only the
+            // index pass reads it, so it gets a thread of its own that may run
+            // on after the parse has ended: with eight parse threads the
+            // builder would otherwise be the last to finish.
+            let summary = ctx.keys.map(|keys| {
+                let table = std::sync::Arc::clone(&table);
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let summary = indexed::Summary::build(&keys, &table);
+                    (summary, started.elapsed())
+                })
+            });
             (table, summary)
         });
         parallel(threads, |thread| {
@@ -489,6 +514,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         timing.detail("parse_workers_done", timing.since_last());
         builder.join().unwrap()
     });
+    let link_table: &links::LinkTable = &link_table;
     timing.detail("cpu_parse_events", event_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_parse_clicks", click_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("links_build", link_build_nanos.load(Ordering::Relaxed) as f64 / 1e6);
@@ -533,10 +559,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             if at < event_parts {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
-                dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
+                dedup::dedup_partition(link_table, &lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - event_parts) {
                 let started = measure.then(Instant::now);
-                dedup::map_clicks(&link_table, batch, out);
+                dedup::map_clicks(link_table, batch, out);
                 if let Some(started) = started {
                     clicks_spent += started.elapsed().as_nanos() as u64;
                 }
@@ -556,7 +582,22 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let index_state = match &ctx.keys {
         Some(keys) => {
             // The clicks of generated user IDs, grouped by user index.
-            let (builder, target) = indexed::ClickIndexBuilder::new(&user_click_lists);
+            // Counting walks every block of every list: all threads share it.
+            let ranges = user_click_lists.first().map_or(0, Vec::len);
+            let counts: Vec<AtomicU32> = (0..ranges).map(|_| AtomicU32::new(0)).collect();
+            let next = AtomicUsize::new(0);
+            parallel(threads, |_| loop {
+                let from = next.fetch_add(64, Ordering::Relaxed);
+                if from >= ranges {
+                    break;
+                }
+                for range in from..(from + 64).min(ranges) {
+                    let lists = user_click_lists.iter().map(|per_thread| per_thread[range]);
+                    counts[range].store(indexed::ClickIndexBuilder::count(lists), Ordering::Relaxed);
+                }
+            });
+            let counts: Vec<u32> = counts.into_iter().map(AtomicU32::into_inner).collect();
+            let (builder, target) = indexed::ClickIndexBuilder::new(&counts);
             let ranges = builder.ranges();
             let next = AtomicUsize::new(0);
             parallel(threads, |_| {
@@ -585,8 +626,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 .collect();
             // SAFETY: as above.
             let out = unsafe { b_out.get(0) };
-            let extras = indexed::Extras::collect(keys, &link_table, &odd_lists, out);
-            indexed::forward_complex_clicks(keys, &link_table, &click_index, out);
+            let extras = indexed::Extras::collect(keys, link_table, &odd_lists, out);
+            indexed::forward_complex_clicks(keys, link_table, &click_index, out);
             Some((click_index, extras))
         }
         None => None,
@@ -600,16 +641,21 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let kernels: Slots<Option<ScratchC>> = Slots::new(threads, || None);
 
     // Index mode: the winners of every index partition, in index order.
-    if let (Some(keys), Some(summary), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
+    let link_summary = summary_thread.map(|thread| thread.join().unwrap());
+    if let Some((_, spent)) = &link_summary {
+        timing.detail("links_summary", spent.as_secs_f64() * 1e3);
+        timing.detail("links_summary_joined", timing.since_last());
+    }
+    if let (Some(keys), Some((summary, _)), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
         let parts = parse::index_parts(keys);
         if std::env::var_os("SS_STATS").is_some() {
             let odd: usize = parse_out.iter().map(|out| out.odd_event_users.len()).sum();
             eprintln!("SS_STATS odd_event_users={odd} extras={} click_index={}", extras.len(), click_index.len());
-            indexed::stats(keys, &link_table, &indexed_lists, parts);
+            indexed::stats(keys, link_table, &indexed_lists, parts);
         }
         let shared = indexed::Shared {
             keys,
-            links: &link_table,
+            links: link_table,
             summary,
             clicks: click_index,
             extras,
