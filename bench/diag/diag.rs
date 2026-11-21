@@ -17,6 +17,19 @@
 //!         mmap-scan           mmap, count '\n' over every byte (default)
 //!         mmap-populate-scan  mmap, MADV_POPULATE_READ each chunk, then count '\n'
 //!
+//!   diag memtouch [--mb N] [--thp] [--populate] [--munmap] [--threads T]
+//!       Maps N MiB of fresh anonymous memory (default 1024), writes one byte
+//!       per 4 KiB page with T threads and exits without unmapping. In-process
+//!       time is the page-fault cost; container time minus in-process time
+//!       minus the noop floor is what the kernel needs to tear the memory down
+//!       at exit, which the scorer times and SS_TIMING cannot see.
+//!         --thp       start the region on a 2 MiB boundary and madvise(MADV_HUGEPAGE)
+//!                     before touching it
+//!         --populate  MAP_POPULATE instead of touching (the kernel faults it
+//!                     all in during mmap, on one thread)
+//!         --munmap    each thread munmaps its own part before the process
+//!                     exits (teardown in parallel, inside the process)
+//!
 //!   diag sysinfo
 //!       Prints what a process inside the container can see: CPUs, memory,
 //!       cgroup limits, transparent huge pages, mounts, environment.
@@ -43,6 +56,13 @@ fn main() {
                 1
             }
         },
+        Some("memtouch") => match memtouch(&args[2..], started) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("diag memtouch: {error}");
+                1
+            }
+        },
         Some("sysinfo") => {
             sysinfo();
             0
@@ -50,7 +70,8 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: diag noop | diag readthrough [--mode read|read-scan|mmap-touch|mmap-scan|mmap-populate-scan] \
-                 [--threads N] [--chunk-kb K] | diag sysinfo"
+                 [--threads N] [--chunk-kb K] | diag memtouch [--mb N] [--thp] [--populate] [--munmap] [--threads T] \
+                 | diag sysinfo"
             );
             2
         }
@@ -160,11 +181,16 @@ mod sys {
 
     unsafe extern "C" {
         pub fn mmap(address: *mut c_void, length: usize, protection: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+        pub fn munmap(address: *mut c_void, length: usize) -> c_int;
         pub fn madvise(address: *mut c_void, length: usize, advice: c_int) -> c_int;
     }
 
     pub const PROT_READ: c_int = 1;
+    pub const PROT_WRITE: c_int = 2;
     pub const MAP_PRIVATE: c_int = 2;
+    pub const MAP_ANONYMOUS: c_int = 0x20;
+    pub const MAP_POPULATE: c_int = 0x8000;
+    pub const MADV_HUGEPAGE: c_int = 14;
     /// Linux 5.14+: fault the range in for reading, in one call.
     pub const MADV_POPULATE_READ: c_int = 22;
 }
@@ -359,6 +385,122 @@ fn readthrough(args: &[String], started: Instant) -> io::Result<()> {
             format!("read {read} bytes, the files hold {expected}"),
         ));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// memtouch
+// ---------------------------------------------------------------------------
+
+const HUGE_PAGE: usize = 2 << 20;
+
+/// `length` bytes of zeroed anonymous memory. With `huge` the region starts on a 2 MiB boundary
+/// and transparent huge pages are requested for it; with `populate` the kernel faults all of it
+/// in during the mmap call (MAP_POPULATE). Returns the address and whether the madvise succeeded.
+#[cfg(unix)]
+fn anonymous(length: usize, huge: bool, populate: bool) -> io::Result<(*mut u8, bool)> {
+    let mapped = if huge { length + HUGE_PAGE } else { length };
+    let flags = sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | if populate { sys::MAP_POPULATE } else { 0 };
+    // SAFETY: a fresh private anonymous mapping.
+    let address = unsafe { sys::mmap(std::ptr::null_mut(), mapped, sys::PROT_READ | sys::PROT_WRITE, flags, -1, 0) };
+    if address as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if !huge {
+        return Ok((address as *mut u8, false));
+    }
+    let aligned = (address as usize).next_multiple_of(HUGE_PAGE);
+    // SAFETY: `aligned..aligned + length` lies inside the mapping, which is 2 MiB longer.
+    let advised = unsafe { sys::madvise(aligned as *mut _, length, sys::MADV_HUGEPAGE) == 0 };
+    Ok((aligned as *mut u8, advised))
+}
+
+#[cfg(not(unix))]
+fn anonymous(length: usize, _huge: bool, _populate: bool) -> io::Result<(*mut u8, bool)> {
+    // Not the Linux path: only so the tool runs natively elsewhere.
+    Ok((Box::leak(vec![0u8; length].into_boxed_slice()).as_mut_ptr(), false))
+}
+
+#[cfg(unix)]
+fn unmap(address: *mut u8, length: usize) -> bool {
+    // SAFETY: the caller owns this page-aligned part of the mapping and never touches it again.
+    unsafe { sys::munmap(address as *mut _, length) == 0 }
+}
+
+#[cfg(not(unix))]
+fn unmap(_address: *mut u8, _length: usize) -> bool {
+    false
+}
+
+/// Raw memory handed to several threads, each using its own disjoint part.
+#[derive(Clone, Copy)]
+struct Region(*mut u8);
+
+// SAFETY: every thread works on a disjoint range of the region.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+fn memtouch(args: &[String], started: Instant) -> io::Result<()> {
+    let flag = |name: &str| args.iter().any(|argument| argument == name);
+    let megabytes = option_value(args, "--mb").and_then(|text| text.parse::<usize>().ok()).unwrap_or(1024);
+    let (huge, populate, unmap_in_threads) = (flag("--thp"), flag("--populate"), flag("--munmap"));
+    let threads = option_value(args, "--threads")
+        .and_then(|text| text.parse::<usize>().ok())
+        .or_else(|| env::var("NCPU").ok().and_then(|text| text.parse::<usize>().ok()))
+        .filter(|&count| count > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let length = megabytes << 20;
+    let (address, advised) = anonymous(length, huge, populate)?;
+    let region = Region(address);
+    let unmapped = AtomicUsize::new(0);
+    // Whole 2 MiB blocks per thread, so no two threads fault inside the same huge page.
+    let share = (length / threads).next_multiple_of(HUGE_PAGE);
+    if !populate || unmap_in_threads {
+        std::thread::scope(|scope| {
+            for index in 0..threads {
+                let unmapped = &unmapped;
+                scope.spawn(move || {
+                    let region = region;
+                    let begin = (index * share).min(length);
+                    let end = ((index + 1) * share).min(length);
+                    if !populate {
+                        let mut at = begin;
+                        while at < end {
+                            // SAFETY: `at` lies in this thread's part of the mapping.
+                            unsafe { std::ptr::write_volatile(region.0.add(at), 1) };
+                            at += 4096;
+                        }
+                    }
+                    // SAFETY: this thread's own part, not used after this.
+                    if unmap_in_threads && end > begin && unmap(unsafe { region.0.add(begin) }, end - begin) {
+                        unmapped.fetch_add(end - begin, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    // How much the kernel really backed with huge pages. Only read when asked for huge pages:
+    // walking a gigabyte of 4 KiB page tables here would count towards the exit cost.
+    let huge_kb = if huge {
+        fs::read_to_string("/proc/self/smaps_rollup")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find(|line| line.starts_with("AnonHugePages:"))
+                    .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "unread".to_string()
+    };
+    println!(
+        "DIAG memtouch mb={megabytes} thp_requested={} thp_advised={} populate={} munmap_mb={} anon_huge_kb={huge_kb} threads={threads} ms={elapsed_ms:.3}",
+        u8::from(huge),
+        u8::from(advised),
+        u8::from(populate),
+        unmapped.load(Ordering::Relaxed) >> 20,
+    );
     Ok(())
 }
 

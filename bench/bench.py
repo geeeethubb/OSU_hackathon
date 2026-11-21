@@ -20,12 +20,14 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shlex
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -38,6 +40,15 @@ SCORER_CPUS = 8
 SCORER_MEM_G = 24
 HARD_CAP_S = 180.0
 READTHROUGH_MODES = ["mmap-scan", "mmap-populate-scan", "mmap-touch", "read-scan", "read"]
+# 1 GiB of fresh anonymous memory from NCPU threads, then exit: how it is faulted in and torn down.
+MEMTOUCH_VARIANTS = {
+    "4k": [],                    # plain 4 KiB pages, touched, left to the kernel at exit
+    "thp": ["--thp"],            # 2 MiB-aligned, madvise(MADV_HUGEPAGE) before touching
+    "4k-munmap": ["--munmap"],   # as 4k, but each thread munmaps its own part before exit
+    "populate": ["--populate"],  # MAP_POPULATE instead of touching
+}
+# What the image is built from (the Dockerfile and its build context, see .dockerignore).
+BUILD_INPUTS = ["Dockerfile", ".dockerignore", "Cargo.toml", "Cargo.lock", "src"]
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +246,7 @@ def hardware(data_dir):
         "mem_available_kb": memory.get("MemAvailable"),
         "swap_total_kb": memory.get("SwapTotal"),
         "kernel": platform.release(),
+        "arch": platform.machine(),
         "os": os_release.get("PRETTY_NAME", "").strip('"'),
         "runner_image": " ".join(filter(None, [os.environ.get("ImageOS"), os.environ.get("ImageVersion")])),
         "runner_name": os.environ.get("RUNNER_NAME", ""),
@@ -477,29 +489,31 @@ def docker_time_ns(text):
     return seconds * 1_000_000_000 + int(fraction)
 
 
-def parse_ss_timing(text):
-    """`SS_TIMING stage=<name> ms=<float>` lines, in the order printed. Stage names are not interpreted."""
-    stages = []
+def parse_ss_timing(text, kind="stage"):
+    """`SS_TIMING stage=<name> ms=<float>` lines, in the order printed. Stage names are not interpreted.
+    With kind="detail", the `SS_TIMING detail=<name> ms=<float>` lines instead: summed worker time or
+    work that overlaps a stage, so they are kept apart and never added to the wall-clock stages."""
+    found = []
     for line in text.splitlines():
-        match = re.match(r"^\s*SS_TIMING\s+stage=(\S+)\s+ms=([-+0-9.eE]+)\s*$", line)
+        match = re.match(rf"^\s*SS_TIMING\s+{kind}=(\S+)\s+ms=([-+0-9.eE]+)\s*$", line)
         if match:
             try:
-                stages.append([match.group(1), float(match.group(2))])
+                found.append([match.group(1), float(match.group(2))])
             except ValueError:
                 pass
-    return stages
+    return found
 
 
 def parse_diag(text):
-    """The `DIAG readthrough key=value ...` line of bench/diag."""
+    """The `DIAG readthrough key=value ...` or `DIAG memtouch key=value ...` line of bench/diag."""
     for line in text.splitlines():
-        if line.startswith("DIAG readthrough "):
+        if line.startswith(("DIAG readthrough ", "DIAG memtouch ")):
             fields = dict(part.split("=", 1) for part in line.split()[2:] if "=" in part)
-            for key in ("threads", "chunk_kb", "files", "bytes", "lines", "populate_failures"):
-                if key in fields:
-                    fields[key] = int(fields[key])
-            if "ms" in fields:
-                fields["ms"] = float(fields["ms"])
+            for key, value in list(fields.items()):
+                if key == "ms":
+                    fields[key] = float(value)
+                elif value.isdigit():
+                    fields[key] = int(value)
             return fields
     return None
 
@@ -661,6 +675,9 @@ class Harness:
         timing = parse_ss_timing(stderr)
         if timing:
             result["ss_timing"] = timing
+        detail = parse_ss_timing(stderr, kind="detail")
+        if detail:
+            result["ss_detail"] = detail
         diag = parse_diag(stdout)
         if diag:
             result["diag"] = diag
@@ -702,7 +719,21 @@ def summarize(runs):
     return summary
 
 
-def image_info(tag):
+def binary_sha256(image, path="/pipeline"):
+    """SHA-256 of one file inside an image: which exact binary was timed."""
+    name = "ss-copy-" + uuid.uuid4().hex[:8]
+    if run_cmd(["docker", "create", "--name", name, image]).returncode != 0:
+        return None
+    folder = tempfile.mkdtemp(prefix="ss-binary-")
+    try:
+        copied = run_cmd(["docker", "cp", f"{name}:{path}", os.path.join(folder, "binary")])
+        return file_sha256(os.path.join(folder, "binary")) if copied.returncode == 0 else None
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def image_info(tag, with_binary=False):
     done = run_cmd(["docker", "image", "inspect", "--format", "{{json .}}", tag])
     if done.returncode != 0:
         return None
@@ -710,7 +741,77 @@ def image_info(tag):
         data = json.loads(done.stdout)
     except ValueError:
         return None
-    return {"tag": tag, "id": data.get("Id"), "size_bytes": data.get("Size"), "created": data.get("Created")}
+    info = {"tag": tag, "id": data.get("Id"), "size_bytes": data.get("Size"), "created": data.get("Created")}
+    if with_binary:
+        info["pipeline_sha256"] = binary_sha256(tag)
+    return info
+
+
+# --------------------------------------------------------------------------
+# paired comparisons
+# --------------------------------------------------------------------------
+
+def pair_orders(pairs, key):
+    """A pre-shuffled order for `pairs` pairs, balanced between AB and BA. The shuffle is seeded by
+    `key`, so the same job on the same seed always uses the same order."""
+    orders = ["AB"] * (pairs // 2) + ["BA"] * (pairs - pairs // 2)
+    random.Random(key).shuffle(orders)
+    return orders
+
+
+def plan_pairs(requested, budget_s, per_run_s, has_prior):
+    """How many A/A pairs and prior-vs-candidate pairs fit in the time budget: (aa, ab).
+    Both get the same even number when at least four fit; otherwise the A/A check gives way to
+    the real comparison, which always gets at least two pairs."""
+    def fitting(comparisons):
+        count = min(requested, int(budget_s // (2 * per_run_s * comparisons))) if per_run_s > 0 else requested
+        return count - count % 2
+    both = fitting(2 if has_prior else 1)
+    if both >= 4 or requested < 4:
+        return both, (both if has_prior else 0)
+    return 0, (max(2, fitting(1)) if has_prior else 0)
+
+
+def analyse_pairs(samples, orders):
+    """Paired statistics on the container's own time. A minus B is positive when B was faster."""
+    def ms(value):
+        return None if value is None else value * 1e3
+    rows = []
+    for index, order in enumerate(orders, start=1):
+        row = {"pair": index, "order": order}
+        for letter in "AB":
+            sample = next((item for item in samples if item["pair"] == index and item["letter"] == letter), {})
+            row[f"{letter.lower()}_ms"] = ms(sample.get("docker_s"))
+            row[f"{letter.lower()}_wall_ms"] = ms(sample.get("wall_s"))
+            row[f"{letter.lower()}_ok"] = bool(sample.get("ok"))
+        if row["a_ms"] is not None and row["b_ms"] is not None:
+            row["a_minus_b_ms"] = row["a_ms"] - row["b_ms"]
+            first, second = (row["a_ms"], row["b_ms"]) if order == "AB" else (row["b_ms"], row["a_ms"])
+            row["first_minus_second_ms"] = first - second
+        if row["a_wall_ms"] is not None and row["b_wall_ms"] is not None:
+            row["a_minus_b_wall_ms"] = row["a_wall_ms"] - row["b_wall_ms"]
+        rows.append(row)
+    differences = [row["a_minus_b_ms"] for row in rows if "a_minus_b_ms" in row]
+    order_effects = [row["first_minus_second_ms"] for row in rows if "first_minus_second_ms" in row]
+    wall_differences = [row["a_minus_b_wall_ms"] for row in rows if "a_minus_b_wall_ms" in row]
+    return {
+        "orders": orders,
+        "pairs": rows,
+        "n": len(differences),
+        "median_a_ms": median([row["a_ms"] for row in rows]),
+        "median_b_ms": median([row["b_ms"] for row in rows]),
+        "median_a_wall_ms": median([row["a_wall_ms"] for row in rows]),
+        "median_b_wall_ms": median([row["b_wall_ms"] for row in rows]),
+        "median_a_minus_b_ms": median(differences),
+        "median_a_minus_b_wall_ms": median(wall_differences),
+        "median_abs_diff_ms": median([abs(value) for value in differences]),
+        "max_abs_diff_ms": max((abs(value) for value in differences), default=None),
+        "b_faster_pairs": sum(1 for value in differences if value > 0),
+        "a_faster_pairs": sum(1 for value in differences if value < 0),
+        "median_first_minus_second_ms": median(order_effects),
+        "second_faster_pairs": sum(1 for value in order_effects if value > 0),
+        "ok": all(item.get("ok") for item in samples) and len(differences) == len(orders),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -797,6 +898,35 @@ def output_summary(out):
 # commands
 # --------------------------------------------------------------------------
 
+def build_input_digest(revision):
+    """One hash over the Git objects of everything the image is built from, at a revision."""
+    parts = []
+    for path in BUILD_INPUTS:
+        parts.append(path + "=" + (output_of(["git", "-C", REPO, "rev-parse", "--verify", "--quiet", f"{revision}:{path}"]) or "absent"))
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def source_commit(head="HEAD", limit=300):
+    """The commit that introduced HEAD's build inputs: the nearest ancestor (or HEAD itself) with the
+    same Dockerfile, Cargo files and src/ whose parents all differ. Commits that only touch the
+    harness, and merges of such commits, build the very same image as that commit."""
+    if output_of(["git", "-C", REPO, "rev-parse", "--is-shallow-repository"]) != "false":
+        return None  # a shallow checkout cannot see the parents
+    wanted = build_input_digest(head)
+    cache = {}
+
+    def digest(revision):
+        if revision not in cache:
+            cache[revision] = build_input_digest(revision)
+        return cache[revision]
+
+    for line in output_of(["git", "-C", REPO, "rev-list", "--parents", f"--max-count={limit}", head]).splitlines():
+        commit, *parents = line.split()
+        if digest(commit) == wanted and all(digest(parent) != wanted for parent in parents):
+            return commit
+    return None
+
+
 def base_result(job):
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
@@ -805,6 +935,7 @@ def base_result(job):
         "schema": 1,
         "job": job,
         "sha": os.environ.get("BENCH_SHA") or os.environ.get("GITHUB_SHA") or output_of(["git", "-C", REPO, "rev-parse", "HEAD"]),
+        "source_sha": source_commit(),
         "ref": os.environ.get("GITHUB_REF_NAME", ""),
         "event": os.environ.get("GITHUB_EVENT_NAME", ""),
         "run_url": f"{server}/{repository}/actions/runs/{run_id}" if repository and run_id else "",
@@ -946,30 +1077,40 @@ def setup_harness(args, result):
                    "scorer": f"--cpus {SCORER_CPUS} --memory {SCORER_MEM_G}g, eight pinned hyperthreads"},
         "flag_parity": flag_parity(),
         "mode": "pipeline" if args.image else "stand-in",
-        "images": {"pipeline": image_info(args.image) if args.image else None, "diag": image_info(args.diag_image)},
+        "images": {"pipeline": image_info(args.image, with_binary=True) if args.image else None,
+                   "diag": image_info(args.diag_image)},
     })
     if not result["flag_parity"]["ok"]:
         result["errors"].append("the harness's docker flags differ from scripts/docker_run.sh: " + result["flag_parity"].get("detail", ""))
     return harness
 
 
-def diagnostics(harness, args, data, runs):
-    """Container start-up cost and the read-through floor, each from fresh containers."""
-    diag = {}
+def diagnostics(harness, args, data, runs, full=True):
+    """Container start-up cost and the read-through floor, each from fresh containers. The first
+    seed gets every diagnostic; later seeds only what depends on their input."""
+    diag = {"full": full}
     before = page_cache_state(data)
     with group("diagnostic (i): container start-up, `noop` in a fresh container"):
         diag["noop"] = harness.series(args.diag_image, "noop", data, runs, command=["noop"])
-        diag["noop_split"] = harness.series(args.diag_image, "noop-split", data, runs, command=["noop"], split=True)
+        if full:
+            diag["noop_split"] = harness.series(args.diag_image, "noop-split", data, runs, command=["noop"], split=True)
     with group("diagnostic (ii): read-through of every input byte"):
         diag["readthrough"] = {}
-        for mode in READTHROUGH_MODES:
+        for mode in (READTHROUGH_MODES if full else READTHROUGH_MODES[:1]):
             diag["readthrough"][mode] = harness.series(args.diag_image, f"readthrough-{mode}", data, runs,
                                                        command=["readthrough", "--mode", mode])
+    diag["cache"] = cache_label(before, page_cache_state(data))
+    if not full:
+        return diag
+    with group("diagnostic: 1 GiB of fresh anonymous memory, page faults and exit teardown"):
+        diag["memtouch"] = {}
+        for name, flags in MEMTOUCH_VARIANTS.items():
+            diag["memtouch"][name] = harness.series(args.diag_image, f"memtouch-{name}", data, runs,
+                                                    command=["memtouch", "--mb", "1024", *flags])
     with group("what a container sees (sysinfo)"):
         info = harness.run(args.diag_image, "sysinfo", data, command=["sysinfo"])
         diag["sysinfo"] = [line[len("SYSINFO "):] for line in info.get("stdout_tail", "").splitlines() if line.startswith("SYSINFO ")]
         log("\n".join(diag["sysinfo"]))
-    diag["cache"] = cache_label(before, page_cache_state(data))
     return diag
 
 
@@ -981,13 +1122,21 @@ def cmd_bench20m(args):
         work = Path(args.work)
         prior_image = args.prior_image or None
         result["prior"] = {"sha": args.prior_sha or None, "status": args.prior_status or ("built" if prior_image else "absent")}
-        if prior_image:
-            result["images"]["prior"] = image_info(prior_image)
-        for seed in [int(token) for token in re.split(r"[\s,]+", args.seeds.strip()) if token]:
+        if prior_image and args.image:
+            result["images"]["prior"] = image_info(prior_image, with_binary=True)
+            mine = (result["images"].get("pipeline") or {}).get("pipeline_sha256")
+            theirs = (result["images"].get("prior") or {}).get("pipeline_sha256")
+            # Identical source builds an identical binary: then there is nothing to compare.
+            result["prior"]["same_binary"] = bool(mine) and mine == theirs
+        seeds = [int(token) for token in re.split(r"[\s,]+", args.seeds.strip()) if token]
+        result["seed_list"] = seeds
+        for position, seed in enumerate(seeds):
             data = work / f"data-s{seed}"
             entry = prepare_dataset(args, seed, args.events, args.clicks, data)
+            # The first seed is the one experiments are tuned on; any further seed is a holdout.
+            entry["role"] = "tuning" if position == 0 else "holdout"
             result["seeds"].append(entry)
-            entry["diag"] = diagnostics(harness, args, data, args.runs)
+            entry["diag"] = diagnostics(harness, args, data, args.runs, full=position == 0)
             if not all(series["ok"] for series in [entry["diag"]["noop"], *entry["diag"]["readthrough"].values()]):
                 result["errors"].append(f"seed {seed}: a diagnostics container failed")
             if args.image:
@@ -1003,52 +1152,99 @@ def cmd_bench20m(args):
     return finish(args, result)
 
 
+def output_digest(out):
+    """One SHA-256 over both tables' Parquet files, names and bytes: equal digests are identical outputs."""
+    digest = hashlib.sha256()
+    for table in ("user_daily", "campaign_daily"):
+        for path in parquet_files(Path(out) / table):
+            digest.update(f"{table}/{Path(path).name}\t{file_sha256(path)}\n".encode())
+    return digest.hexdigest()
+
+
+def verify_outputs(outputs, reference_out):
+    """Both tables of every run against /reference's. The first output of each distinct byte content
+    goes through scripts/compare.py; an output with the very same bytes shares that verdict."""
+    seen, comparisons = {}, []
+    for label, (which, out) in outputs.items():
+        digest = output_digest(out)
+        if digest in seen:
+            comparison = dict(seen[digest], run=label, which=which, how=f"same bytes as the output of {seen[digest]['run']}")
+        else:
+            comparison = compare_outputs(out, reference_out)
+            comparison.update({"run": label, "which": which, "how": "scripts/compare.py"})
+            seen[digest] = comparison
+        comparison["output_sha256"] = digest
+        comparisons.append(comparison)
+        log(f"  {label} vs /reference: {'MATCH' if comparison['match'] else 'DIFFER'} ({comparison['how']})")
+        if not comparison["match"] and comparison["how"] == "scripts/compare.py":
+            log(comparison["output"])
+    return comparisons
+
+
 def bench_pipeline(harness, args, entry, data, prior_image, result):
-    """(iii) timed fresh-container runs, balanced with the prior best when there is one; (iv) every
-    output diffed against /reference on the same input; (v) one extra run with SS_TIMING=1."""
-    seed, work, runs = entry["seed"], harness.work, args.runs
-    images = {"new": args.image}
-    if prior_image:
-        images["prior"] = prior_image
-    outputs = {}  # label -> (which, folder)
-    samples = {which: [] for which in images}
-    order = []
-    cache_before = page_cache_state(data)
-    with group(f"seed {seed} (iii): {runs} timed fresh-container runs" + (" each, prior and new in balanced order" if prior_image else "")):
-        for index in range(runs):
-            pair = ["new"] if not prior_image else (["prior", "new"] if index % 2 == 0 else ["new", "prior"])
-            for which in pair:
-                label = f"{which}-{index + 1}"
-                out = work / f"out-{label}"
-                run = harness.run(images[which], f"s{seed}-{label}", data, out_dir=out)
-                run["sequence"] = len(order) + 1
-                run["outputs"] = output_summary(out)
-                order.append(which)
-                samples[which].append(run)
-                outputs[label] = (which, out)
-    pipeline = summarize(samples["new"])
-    pipeline["cache"] = cache_label(cache_before, page_cache_state(data))
-    pipeline["order"] = order
-    entry["pipeline"] = pipeline
-    if prior_image:
-        entry["prior"] = summarize(samples["prior"])
-        entry["prior"]["cache"] = pipeline["cache"]
-    with group(f"seed {seed} (v): one extra run with SS_TIMING=1"):
-        for which, image in images.items():
-            label = f"{which}-timing"
-            out = work / f"out-{label}"
-            run = harness.run(image, f"s{seed}-{label}", data, env={"SS_TIMING": "1"}, out_dir=out)
-            run["outputs"] = output_summary(out)
-            (pipeline if which == "new" else entry["prior"])["timing_run"] = run
-            outputs[label] = (which, out)
-    with group(f"seed {seed}: one extra run for peak memory and disk use"):
-        label = "new-memory"
+    """(iii) timed fresh-container runs; the A/A noise check and the prior-vs-candidate comparison as
+    shuffled AB/BA pairs through the same timing path; (v) one extra run with SS_TIMING=1; one for
+    peak memory; (iv) every output diffed against /reference on the same input."""
+    seed, work = entry["seed"], harness.work
+    outputs = {}  # label -> (which, folder), verified after the timed work is done
+
+    def timed(image, which, label, **options):
         out = work / f"out-{label}"
-        run = harness.run(args.image, f"s{seed}-{label}", data, out_dir=out, monitor=True)
-        run["outputs"] = output_summary(out)
-        pipeline["memory_run"] = run
-        outputs[label] = ("new", out)
-    with group(f"seed {seed} (iv): /reference on the same input, then compare.py on both tables of every run"):
+        run = harness.run(image, f"s{seed}-{label}", data, out_dir=out, **options)
+        run.update({"seed": seed, "which": which, "outputs": output_summary(out)})
+        outputs[label] = (which, out)
+        return run
+
+    def paired(title, tag, images, pairs):
+        """`pairs` AB/BA pairs in a pre-shuffled balanced order; images maps A and B to (image, which)."""
+        orders = pair_orders(pairs, f"{tag}-seed{seed}")
+        before = page_cache_state(data)
+        samples = []
+        with group(f"seed {seed}: {title}, {pairs} pairs in the order {' '.join(orders)}"):
+            for index, order in enumerate(orders, start=1):
+                for position, letter in enumerate(order, start=1):
+                    image, which = images[letter]
+                    run = timed(image, which, f"{tag}-p{index}-{letter}")
+                    run.update({"pair": index, "letter": letter, "position": position, "order": order})
+                    samples.append(run)
+        analysis = analyse_pairs(samples, orders)
+        analysis["samples"] = samples
+        analysis["cache"] = cache_label(before, page_cache_state(data))
+        return analysis
+
+    # (iii) The scorer's procedure: N fresh containers, the median counts.
+    cache_before = page_cache_state(data)
+    with group(f"seed {seed} (iii): {args.runs} timed fresh-container runs of this commit"):
+        runs = [timed(args.image, "new", f"new-{index + 1}") for index in range(args.runs)]
+    pipeline = summarize(runs)
+    pipeline["cache"] = cache_label(cache_before, page_cache_state(data))
+    entry["pipeline"] = pipeline
+
+    # The noise check and the comparison, sized to what a run costs here.
+    prior_differs = bool(prior_image) and not result.get("prior", {}).get("same_binary")
+    per_run = (pipeline.get("median_wall_s") or 0.0) + 1.5
+    aa_pairs, ab_pairs = plan_pairs(args.pairs, args.pair_budget_s, per_run, prior_differs)
+    entry["pair_plan"] = {"requested": args.pairs, "budget_s": args.pair_budget_s, "per_run_s": round(per_run, 2),
+                          "aa_pairs": aa_pairs, "ab_pairs": ab_pairs}
+    if args.pairs and aa_pairs < args.pairs:
+        result["warnings"].append(
+            f"seed {seed}: a run takes about {per_run:.0f} s here, so the {args.pair_budget_s:.0f} s pair budget allows "
+            f"{aa_pairs} A/A pairs and {ab_pairs} prior-vs-candidate pairs instead of {args.pairs}")
+    if aa_pairs:
+        entry["aa"] = paired("A/A noise check (this commit's image under both labels)", "aa",
+                             {"A": (args.image, "new"), "B": (args.image, "new")}, aa_pairs)
+    if prior_differs and ab_pairs:
+        entry["ab"] = paired("prior best (A) versus this commit (B)", "ab",
+                             {"A": (prior_image, "prior"), "B": (args.image, "new")}, ab_pairs)
+
+    with group(f"seed {seed} (v): one extra run with SS_TIMING=1"):
+        pipeline["timing_run"] = timed(args.image, "new", "new-timing", env={"SS_TIMING": "1"})
+        if prior_differs:
+            entry["prior_timing_run"] = timed(prior_image, "prior", "prior-timing", env={"SS_TIMING": "1"})
+    with group(f"seed {seed}: one extra run for peak memory and disk use"):
+        pipeline["memory_run"] = timed(args.image, "new", "new-memory", monitor=True)
+
+    with group(f"seed {seed} (iv): /reference on the same input, then both tables of every run against it"):
         reference_out = work / "out-reference"
         reference = harness.run(args.image, f"s{seed}-reference", data, entrypoint="/reference", out_dir=reference_out,
                                 timeout=3600)
@@ -1058,43 +1254,41 @@ def bench_pipeline(harness, args, entry, data, prior_image, result):
         if reference["ok"]:
             entry["person_skew"] = person_skew(reference_out)
             entry["reference_self_check"] = self_check(reference_out)
-            for label, (which, out) in outputs.items():
-                comparison = compare_outputs(out, reference_out)
-                comparison.update({"run": label, "which": which})
-                entry["compare"].append(comparison)
-                log(f"  {label} vs /reference: {'MATCH' if comparison['match'] else 'DIFFER'}")
-                if not comparison["match"]:
-                    log(comparison["output"])
+            entry["compare"] = verify_outputs(outputs, reference_out)
         else:
-            result["errors"].append(f"seed {seed}: /reference failed (exit {reference.get('exit_code')}), so the benchmark has no correctness check and is void")
+            result["errors"].append(f"seed {seed}: /reference failed (exit {reference.get('exit_code')}), so the "
+                                    "benchmark has no correctness check and is void")
+    for _, out in outputs.values():
+        remove_tree(out)
+    remove_tree(work / "out-reference")
+
     if args.cold_run:
         with group(f"seed {seed}: one run from a cold page cache (labelled, never mixed into the medians)"):
             if drop_page_cache():
                 before = page_cache_state(data)
-                run = harness.run(args.image, f"s{seed}-new-cold", data, out_dir=work / "out-new-cold")
+                run = harness.run(args.image, f"s{seed}-new-cold", data)
                 run["cache"] = {"condition": "cold (sync; echo 3 > /proc/sys/vm/drop_caches just before)",
                                 "resident_pct_before": before and before.get("resident_pct"),
                                 "resident_pct_after": (page_cache_state(data) or {}).get("resident_pct")}
                 pipeline["cold_run"] = run
-                remove_tree(work / "out-new-cold")
             else:
                 result["warnings"].append("could not drop the page cache (no sudo): the cold run was skipped")
-    # Verdicts: the new image must exit 0 and match on every run; the prior image is only reported.
-    new_runs = samples["new"] + [pipeline.get("timing_run"), pipeline.get("memory_run")]
-    for run in new_runs:
-        if run and not run["ok"]:
-            result["errors"].append(f"seed {seed}: pipeline run {run['label']} failed (exit {run.get('exit_code')}"
-                                    + (", OOM-killed" if run.get("oom_killed") else "") + ")")
+
+    # Verdicts: this commit must exit 0 and match on every run; the prior best is only reported.
+    everything = runs + [pipeline["timing_run"], pipeline["memory_run"]]
+    for analysis in (entry.get("aa"), entry.get("ab")):
+        everything += (analysis or {}).get("samples", [])
+    if entry.get("prior_timing_run"):
+        everything.append(entry["prior_timing_run"])
+    for run in everything:
+        if not run["ok"]:
+            message = (f"seed {seed}: run {run['label']} failed (exit {run.get('exit_code')}"
+                       + (", OOM-killed" if run.get("oom_killed") else "") + ")")
+            (result["errors"] if run["which"] == "new" else result["warnings"]).append(message)
     for comparison in entry["compare"]:
         if not comparison["match"]:
             message = f"seed {seed}: output of {comparison['run']} DIFFERS from /reference"
             (result["errors"] if comparison["which"] == "new" else result["warnings"]).append(message)
-    for run in samples.get("prior", []):
-        if not run["ok"]:
-            result["warnings"].append(f"seed {seed}: prior-best run {run['label']} failed (exit {run.get('exit_code')})")
-    for _, out in outputs.values():
-        remove_tree(out)
-    remove_tree(work / "out-reference")
 
 
 def cmd_bench60m(args):
@@ -1189,6 +1383,10 @@ def main():
     common(bench20, 20_000_000, 5_000_000)
     bench20.add_argument("--seeds", default="2", help="seed list, separated by spaces or commas")
     bench20.add_argument("--runs", type=int, default=3)
+    bench20.add_argument("--pairs", type=int, default=6,
+                         help="AB/BA pairs for the A/A noise check and for prior-vs-candidate (0 turns both off)")
+    bench20.add_argument("--pair-budget-s", type=float, default=300.0,
+                         help="time the paired runs may take per seed; slow pipelines get fewer pairs")
     bench20.add_argument("--prior-image", default="")
     bench20.add_argument("--prior-sha", default="")
     bench20.add_argument("--prior-status", default="")

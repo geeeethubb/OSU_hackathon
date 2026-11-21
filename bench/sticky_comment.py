@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 """One sticky pull-request comment per commit SHA, holding the reports of that commit's CI jobs.
 
-    sticky_comment.py --sha SHA --reports DIR --repo OWNER/NAME [--pr N | --branch NAME] [--dry-run]
+    sticky_comment.py --sha SHA --reports DIR --repo OWNER/NAME [--pr N | --branch NAME]
+                      [--dry-run] [--summary FILE]
 
-DIR holds the downloaded job artifacts (DIR/<artifact>/<job>.md, written by report.py). The
-comment is found again by a hidden marker naming the SHA, so a re-run or a later job updates it
-instead of adding another. Needs `gh` and a token with pull-requests: write in GH_TOKEN.
+DIR holds the downloaded job artifacts (DIR/<artifact>/<job>.json, written by bench.py). The
+comment starts with the SHA and the compact candidate line (bench/LEDGER.md format), now complete
+because every job's result is at hand, followed by each job's report. It is found again by a
+hidden marker naming the SHA, so a re-run updates it instead of adding another. Needs `gh` and a
+token with pull-requests: write in GH_TOKEN. --summary also appends the SHA line and the compact
+line to a file (the job's step summary).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import report  # noqa: E402
 
 ORDER = ["correctness", "bench-20m", "bench-60m"]
 LIMIT = 64000  # GitHub rejects comment bodies over 65536 characters
 
 
 def gh(*args, check=True):
-    done = subprocess.run(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    # GH names the GitHub CLI when it is not plain `gh` (a wrapper script, say: GH="bash path/to/ghx").
+    command = shlex.split(os.environ.get("GH", "gh")) + list(args)
+    done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
     if check and done.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args[:4])} ...: {done.stderr.strip()[:500]}")
     return done
@@ -33,29 +44,46 @@ def marker(sha):
     return f"<!-- ss-ci-evidence:{sha} -->"
 
 
+def load_results(reports_dir):
+    results = {}
+    for path in sorted(Path(reports_dir).rglob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("job"):
+            results[data["job"]] = data
+    return results
+
+
 def build_body(sha, reports_dir):
-    """The comment: the SHA first, then each job's report (its own first line carries the same SHA)."""
-    found = {path.stem: path for path in sorted(Path(reports_dir).rglob("*.md"))}
-    names = [name for name in ORDER if name in found] + sorted(name for name in found if name not in ORDER)
+    """SHA first, then the compact line, then each job's report without its own first line."""
+    results = load_results(reports_dir)
+    names = [name for name in ORDER if name in results] + sorted(name for name in results if name not in ORDER)
     if not names:
-        return None
-    sections, verdicts = [], []
+        return None, None
+    correctness, b20, b60 = results.get("correctness"), results.get("bench-20m"), results.get("bench-60m")
+    verdicts = " · ".join(f"{name} {report.verdict(results[name].get('ok'))}" for name in names)
+    run_url = next((results[name].get("run_url") for name in names if results[name].get("run_url")), "")
+    parts = [f"{sha} — CI evidence for this commit — {verdicts}" + (f" — [Actions run]({run_url})" if run_url else "")]
+    other = [results[name].get("sha") for name in names if results[name].get("sha") and results[name].get("sha") != sha]
+    if other:
+        parts.append(f"**Warning: these results say they belong to `{other[0]}`, not to this commit.**")
+    if b20:
+        table = report.compact_table(b20, correctness, b60)
+        if table:
+            parts.append("\n".join(table))
+    lead = "\n\n".join(parts)
     for name in names:
-        text = found[name].read_text(encoding="utf-8").strip()
-        first, _, rest = text.partition("\n")
-        fields = [field.strip() for field in first.split(" — ")]
-        verdicts.append(f"{name} {fields[2] if len(fields) > 2 else '?'}")
-        run_link = next((field for field in fields if field.startswith("[Actions run]")), "")
-        sections.append((name, rest.strip(), run_link))
-    run_link = next((link for _, _, link in sections if link), "")
-    head = f"{sha} — CI evidence for this commit — " + " · ".join(verdicts) + (f" — {run_link}" if run_link else "")
-    body = "\n\n".join([head] + [text for _, text, _ in sections] + [marker(sha)])
+        text = report.render(results[name], correctness, b60, with_line=False).strip()
+        parts.append(text.partition("\n")[2].strip())  # its first line repeats the SHA
+    body = "\n\n".join(parts + [marker(sha)])
     if len(body) > LIMIT:  # drop the collapsible extras first, then cut
         body = re.sub(r"<details>.*?</details>", "(details omitted here for length; see the Actions run summary)", body, flags=re.S)
     if len(body) > LIMIT:
         keep = LIMIT - len(marker(sha)) - 200
         body = body[:keep] + "\n\n(truncated for length; the full report is in the Actions run summary)\n\n" + marker(sha)
-    return body
+    return body, lead
 
 
 def open_pull_requests(repo, branch):
@@ -65,7 +93,7 @@ def open_pull_requests(repo, branch):
 
 def existing_comment(repo, number, sha):
     done = gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100",
-              "--jq", ".[] | {id, body, login: .user.login} | @json")
+              "--jq", ".[] | {id, body} | @json")
     for line in done.stdout.splitlines():
         try:
             comment = json.loads(line)
@@ -84,13 +112,17 @@ def main():
     parser.add_argument("--pr", type=int)
     parser.add_argument("--branch")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--summary", help="also write the comment body to this file")
     args = parser.parse_args()
 
-    body = build_body(args.sha, args.reports)
+    body, lead = build_body(args.sha, args.reports)
     if body is None:
-        print(f"no reports under {args.reports}: nothing to post")
+        print(f"no results under {args.reports}: nothing to post")
         return 0
     print(f"comment body: {len(body)} characters, first line: {body.splitlines()[0][:200]}")
+    if args.summary:  # the SHA and the completed compact line; the jobs' own summaries hold the rest
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write(lead + "\n")
     if args.pr:
         numbers = [args.pr]
     elif args.branch:

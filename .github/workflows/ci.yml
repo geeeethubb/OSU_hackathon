@@ -17,11 +17,17 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "bench-20m: generator seeds, separated by spaces or commas"
-        default: "2"
+        description: "bench-20m: generator seeds, first the tuning seed, then holdouts (empty: bench/SEEDS)"
+        default: ""
       runs:
         description: "bench-20m: timed fresh-container runs per image"
         default: "3"
+      pairs:
+        description: "bench-20m: AB/BA pairs for the A/A check and for prior-vs-candidate (0: none)"
+        default: "6"
+      pair_budget_s:
+        description: "bench-20m: seconds the paired runs may take per seed (slow pipelines get fewer pairs)"
+        default: "300"
       cold_run:
         description: "bench-20m: add one labelled run from a cold page cache"
         type: boolean
@@ -103,8 +109,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      SEEDS: ${{ inputs.seeds || vars.BENCH_SEEDS || '2' }}
+      INPUT_SEEDS: ${{ inputs.seeds }}
+      VAR_SEEDS: ${{ vars.BENCH_SEEDS }}
+      COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
       RUNS: ${{ inputs.runs || '3' }}
+      PAIRS: ${{ inputs.pairs || '6' }}
+      PAIR_BUDGET_S: ${{ inputs.pair_budget_s || '300' }}
       COLD_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.cold_run }}
     steps:
       - uses: actions/checkout@v7
@@ -145,16 +155,33 @@ jobs:
         run: |
           image=""; [ -f Dockerfile ] && image="$IMAGE"
           cold=""; [ "$COLD_RUN" = "true" ] && cold="--cold-run"
+          # Seeds: the run_workflow input, else [seeds=2,7] in the commit message, else the
+          # BENCH_SEEDS repository variable, else bench/SEEDS, else 2.
+          seeds="$INPUT_SEEDS"
+          [ -n "$seeds" ] || seeds=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[seeds=\([0-9 ,]*\)\].*/\1/p' | head -n 1)
+          [ -n "$seeds" ] || seeds="$VAR_SEEDS"
+          if [ -z "$seeds" ] && [ -f bench/SEEDS ]; then seeds=$(sed -e 's/#.*//' bench/SEEDS | tr '\n' ' '); fi
+          [ -n "$(printf '%s' "$seeds" | tr -d ' ,')" ] || seeds=2
+          echo "seeds: $seeds"
           python3 bench/bench.py bench20m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
             --out-json "$RUNNER_TEMP/evidence/bench-20m.json" \
-            --seeds "$SEEDS" --runs "$RUNS" $cold \
+            --seeds "$seeds" --runs "$RUNS" --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" $cold \
             --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
       - name: Report
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$RUNNER_TEMP/evidence"
-          python3 bench/report.py --job bench-20m "$RUNNER_TEMP/evidence/bench-20m.json" > "$RUNNER_TEMP/evidence/bench-20m.md"
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/siblings"
+          # The other jobs' results fill two cells of the compact line; here they are optional.
+          for job in correctness bench-60m; do
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "ss-$job" --dir "$RUNNER_TEMP/siblings/$job" 2>/dev/null \
+              || echo "no $job results to add (not finished, or not run)"
+          done
+          python3 bench/report.py --job bench-20m "$RUNNER_TEMP/evidence/bench-20m.json" \
+            --correctness-json "$RUNNER_TEMP/siblings/correctness/correctness.json" \
+            --bench60m-json "$RUNNER_TEMP/siblings/bench-60m/bench-60m.json" > "$RUNNER_TEMP/evidence/bench-20m.md"
           cat "$RUNNER_TEMP/evidence/bench-20m.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload results
         if: always()
@@ -264,4 +291,5 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/reports"
           python3 bench/sticky_comment.py --sha "$HEAD_SHA" --reports "$RUNNER_TEMP/reports" \
-            --repo "$GITHUB_REPOSITORY" ${PR_NUMBER:+--pr "$PR_NUMBER"} --branch "$BRANCH"
+            --repo "$GITHUB_REPOSITORY" ${PR_NUMBER:+--pr "$PR_NUMBER"} --branch "$BRANCH" \
+            --summary "$GITHUB_STEP_SUMMARY"
