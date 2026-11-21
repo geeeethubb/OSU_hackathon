@@ -849,6 +849,7 @@ pub struct ScratchC {
     tuning: Tuning,
     group: Group,
     work: Work,
+    batch: Batch,
 }
 
 impl Drop for ScratchC {
@@ -856,7 +857,8 @@ impl Drop for ScratchC {
         if PROFILE {
             self.work.profile.report();
             let staged = held(&self.group.staged) + held(&self.group.staged_purchases) + held(&self.group.staged_clicks);
-            eprintln!("SESSIONS_SCRATCH bytes={} staged={staged}", self.group.bytes() + self.work.bytes());
+            let bytes = self.group.bytes() + self.work.bytes() + self.batch.bytes();
+            eprintln!("SESSIONS_SCRATCH bytes={bytes} staged={staged}");
         }
     }
 }
@@ -882,7 +884,7 @@ impl ScratchC {
 
     fn with(params: Params, tuning: Tuning) -> Self {
         let work = Work::new(&params, tuning);
-        Self { params, tuning, group: Group::default(), work }
+        Self { params, tuning, group: Group::default(), work, batch: Batch::new() }
     }
 
     /// One whole person outside the partition pass: index mode sessionizes a
@@ -926,35 +928,87 @@ impl ScratchC {
         person_in_order(&self.params, self.tuning, &mut self.work, out, click_exotic, name, events, purchases, clicks);
     }
 
-    /// Where `Sessions` writes the sessions of the person under way: session
-    /// starts and event counts. Both have room for every session a person
-    /// can have while its timestamps are at most `TS_MASK`.
+    /// Starts a person whose events the caller reads in time order and does
+    /// not want to collect: `ts` is its first event. The person joins the
+    /// batch; its further events go to `Person::add` with the slices of
+    /// `batch_scratch`, and `end_person` or `abort_person` must follow
+    /// before the next person starts. Rows and cells are the ones
+    /// `one_person_in_order` gives for the same events; they reach `out`
+    /// when the batch is full or at `finish_batch`.
     #[inline(always)]
-    pub fn session_scratch(&mut self) -> (&mut [u32], &mut [u32]) {
-        (&mut self.work.start, &mut self.work.count)
+    pub fn begin_person(&mut self, out: &mut PassCOut, click_exotic: &[Box<[u8]>], ts: u32) -> Person {
+        if self.batch_is_full() {
+            self.finish_batch(out, click_exotic);
+        }
+        let batch = &mut self.batch;
+        let owner = (batch.persons as u64) << OWNER_SHIFT;
+        batch.start[batch.sessions] = ts;
+        batch.meta[batch.sessions] = owner | batch.events;
+        Person {
+            open: batch.sessions,
+            owner,
+            events: batch.events + 1,
+            latest: ts,
+            events_before: batch.events,
+            purchases_before: batch.purchases.len(),
+        }
     }
 
-    /// `one_person_in_order` for a person whose events the caller has fed to
-    /// `sessions` one at a time (all of them accepted), without ever
-    /// collecting the timestamps: the rows and cells are the same. The
-    /// assists stay pending until `flush`.
+    /// Whether the batch has no room for another person: `begin_person`
+    /// would finish it first.
+    #[inline(always)]
+    pub fn batch_is_full(&self) -> bool {
+        self.batch.persons == BATCH_PERSONS || self.batch.sessions + PERSON_SESSIONS > BATCH_SESSIONS
+    }
+
+    /// What `Person::add` and `Person::purchase` write to: the batch's
+    /// session starts, its session words and its purchases.
+    #[inline(always)]
+    pub fn batch_scratch(&mut self) -> (&mut [u32], &mut [u64], &mut Vec<[u64; 2]>) {
+        (&mut self.batch.start, &mut self.batch.meta, &mut self.batch.purchases)
+    }
+
+    /// Ends the person `begin_person` started: its name code and its clicks,
+    /// `[ts since seven days before the window, click code | campaign << 42]`.
+    #[inline(always)]
+    pub fn end_person(&mut self, person: Person, name: u64, clicks: impl Iterator<Item = [u64; 2]>) {
+        let batch = &mut self.batch;
+        let number = batch.persons;
+        let clicks_before = batch.clicks.len();
+        batch.clicks.extend(clicks);
+        let has_clicks = batch.clicks.len() != clicks_before;
+        batch.names[number] = name;
+        batch.organic[number] = i64::from(!has_clicks);
+        batch.first_session[number] = batch.sessions as u32;
+        batch.click_ends[number + 1] = batch.clicks.len() as u32;
+        // The persons with clicks: written every time, kept when there are any.
+        batch.clicked[batch.clicked_count] = number as u32;
+        batch.clicked_count += usize::from(has_clicks);
+        batch.persons = number + 1;
+        batch.sessions = person.open + 1;
+        batch.events = person.events;
+    }
+
+    /// Drops the person `begin_person` started, as if it had never begun:
+    /// its events were not in time order after all (`Person::add` said so),
+    /// or the caller will hand it over in another way.
     #[inline]
-    pub fn finish_sessions(
-        &mut self,
-        sessions: Sessions,
-        out: &mut PassCOut,
-        click_exotic: &[Box<[u8]>],
-        name: u64,
-        purchases: &[[u64; 2]],
-        clicks: &[[u64; 2]],
-    ) {
-        let count = sessions.close(&mut self.work.count);
-        self.work.profile.lap(3);
-        finish_person(&self.params, self.tuning, &mut self.work, out, click_exotic, name, count, purchases, clicks);
+    pub fn abort_person(&mut self, person: Person) {
+        self.batch.purchases.truncate(person.purchases_before);
+    }
+
+    /// Rows and cells of the persons in the batch. Must be called before
+    /// `flush` and before any use of the scratch for something else than
+    /// whole persons; the assists stay pending until `flush`.
+    pub fn finish_batch(&mut self, out: &mut PassCOut, click_exotic: &[Box<[u8]>]) {
+        if self.batch.persons != 0 {
+            finish_batch(&self.params, self.tuning, &mut self.work, &mut self.batch, out, click_exotic);
+        }
     }
 
     /// Adds the assists that `one_person` left pending to `out`.
     pub fn flush(&mut self, out: &mut PassCOut) {
+        assert_eq!(self.batch.persons, 0, "a batch of persons was left unfinished");
         apply_assists(&mut self.work.pending, &mut out.campaign_days);
     }
 
@@ -997,10 +1051,9 @@ fn starts_up_to(starts: &[u32], limit: u32) -> usize {
 }
 
 /// The sessions of one person while its events arrive one at a time in time
-/// order. `start` and `count` are the two slices of
-/// `ScratchC::session_scratch`, the same ones in every call for a person.
-#[derive(Clone, Copy, Default)]
-pub struct Sessions {
+/// order. `start` and `count` are the scratch's session starts and counts.
+#[derive(Clone, Copy)]
+struct Sessions {
     /// The number of the open session.
     open: usize,
     /// Events before the open session, and events so far.
@@ -1013,7 +1066,7 @@ pub struct Sessions {
 impl Sessions {
     /// Starts a person at its first event.
     #[inline(always)]
-    pub fn begin(start: &mut [u32], ts: u32) -> Self {
+    fn begin(start: &mut [u32], ts: u32) -> Self {
         start[0] = ts;
         Self { open: 0, first: 0, events: 1, latest: ts }
     }
@@ -1022,7 +1075,7 @@ impl Sessions {
     /// earlier than the one before it: the events are not in time order,
     /// and the person has to be done from all its timestamps instead.
     #[inline(always)]
-    pub fn add(&mut self, start: &mut [u32], count: &mut [u32], ts: u32) -> bool {
+    fn add(&mut self, start: &mut [u32], count: &mut [u32], ts: u32) -> bool {
         if ts < self.latest {
             return false;
         }
@@ -1038,12 +1091,6 @@ impl Sessions {
         true
     }
 
-    /// How many events the person has so far.
-    #[inline(always)]
-    pub fn events(&self) -> u32 {
-        self.events
-    }
-
     /// Ends the person: writes the last session's count and returns the
     /// number of sessions.
     #[inline(always)]
@@ -1051,6 +1098,289 @@ impl Sessions {
         count[self.open] = self.events - self.first;
         self.open + 1
     }
+}
+
+/// Most persons a batch holds, and most sessions.
+const BATCH_PERSONS: usize = 32;
+const BATCH_SESSIONS: usize = 2048;
+/// Most sessions of one person whose timestamps are in order and at most
+/// `TS_MASK`: every session but the first begins more than `GAP` later.
+const PERSON_SESSIONS: usize = BUCKETS;
+const _: () = assert!(PERSON_SESSIONS < BATCH_SESSIONS);
+/// A batch session's word: the person's number in the batch, above the
+/// number of the batch's events before the session.
+const OWNER_SHIFT: u32 = 48;
+const EVENTS_MASK: u64 = (1 << OWNER_SHIFT) - 1;
+
+/// Persons whose events arrive in time order (`ScratchC::begin_person`),
+/// kept until there are enough of them to do their rows together.
+///
+/// One person at a time costs a handful of loops that each run a few times
+/// and end in a mispredicted branch: over its sessions for the rows, over
+/// its rows for the output. Here the sessions of all persons of the batch
+/// stand one after the other, the person is one more field of a session,
+/// and the same work is three passes over the whole batch: sessions to
+/// rows, purchases, rows to output. Only attribution still goes person by
+/// person, for the persons that have clicks.
+struct Batch {
+    /// The batch's sessions, person after person: start, and
+    /// `person << OWNER_SHIFT | events of the batch before the session`.
+    /// Both have one entry more than `BATCH_SESSIONS`: the next session's
+    /// values are written before it is known to begin, and one more word
+    /// closes the last session.
+    start: Vec<u32>,
+    meta: Vec<u64>,
+    sessions: usize,
+    events: u64,
+    /// Per person: its name code, 1 if it has no clicks (its sessions are
+    /// organic) and 0 if it has, and its first session; where its clicks
+    /// end in `clicks` is at `person + 1`.
+    names: Vec<u64>,
+    organic: Vec<i64>,
+    first_session: Vec<u32>,
+    click_ends: Vec<u32>,
+    persons: usize,
+    /// The persons with clicks, and one spare entry.
+    clicked: Vec<u32>,
+    clicked_count: usize,
+    clicks: Vec<[u64; 2]>,
+    /// `[session, price | category << 32]`, in session order.
+    purchases: Vec<[u64; 2]>,
+    /// Per session: purchase cents, purchases, and its row.
+    revenue: Vec<i64>,
+    bought: Vec<u32>,
+    row_of: Vec<u32>,
+    /// Per row: its first session (one more entry closes the last row), its
+    /// day index and its person, each with a spare entry for values written
+    /// before the row is known to begin; purchase cents, sessions with a
+    /// purchase and top category.
+    row_first: Vec<u32>,
+    row_day: Vec<u32>,
+    row_owner: Vec<u32>,
+    row_revenue: Vec<i64>,
+    row_buying: Vec<i64>,
+    row_top: Vec<u32>,
+}
+
+impl Batch {
+    fn new() -> Self {
+        Self {
+            start: vec![0; BATCH_SESSIONS + 1],
+            meta: vec![0; BATCH_SESSIONS + 1],
+            sessions: 0,
+            events: 0,
+            names: vec![0; BATCH_PERSONS],
+            organic: vec![0; BATCH_PERSONS],
+            first_session: vec![0; BATCH_PERSONS + 1],
+            click_ends: vec![0; BATCH_PERSONS + 1],
+            persons: 0,
+            clicked: vec![0; BATCH_PERSONS + 1],
+            clicked_count: 0,
+            clicks: Vec::new(),
+            purchases: Vec::new(),
+            revenue: vec![0; BATCH_SESSIONS],
+            bought: vec![0; BATCH_SESSIONS],
+            row_of: vec![0; BATCH_SESSIONS],
+            row_first: vec![0; BATCH_SESSIONS + 1],
+            row_day: vec![0; BATCH_SESSIONS + 1],
+            row_owner: vec![0; BATCH_SESSIONS + 1],
+            row_revenue: vec![0; BATCH_SESSIONS],
+            row_buying: vec![0; BATCH_SESSIONS],
+            row_top: vec![0; BATCH_SESSIONS],
+        }
+    }
+
+    /// Bytes of scratch held.
+    fn bytes(&self) -> usize {
+        held(&self.start)
+            + held(&self.meta)
+            + held(&self.names)
+            + held(&self.organic)
+            + held(&self.first_session)
+            + held(&self.click_ends)
+            + held(&self.clicked)
+            + held(&self.clicks)
+            + held(&self.purchases)
+            + held(&self.revenue)
+            + held(&self.bought)
+            + held(&self.row_of)
+            + held(&self.row_first)
+            + held(&self.row_day)
+            + held(&self.row_owner)
+            + held(&self.row_revenue)
+            + held(&self.row_buying)
+            + held(&self.row_top)
+    }
+}
+
+/// A person of the batch while its events arrive, one at a time and in time
+/// order (`ScratchC::begin_person`).
+#[derive(Clone, Copy, Default)]
+pub struct Person {
+    /// The open session's place in the batch.
+    open: usize,
+    /// The person's number in the batch, as it stands in a session word.
+    owner: u64,
+    /// Events of the batch up to the person's latest one.
+    events: u64,
+    /// The latest timestamp.
+    latest: u32,
+    /// The batch's events and purchases before the person.
+    events_before: u64,
+    purchases_before: usize,
+}
+
+impl Person {
+    /// The person's next event; `start` and `meta` are the first two of
+    /// `ScratchC::batch_scratch`. `false`, with nothing changed, when it is
+    /// earlier than the one before it: the events are not in time order,
+    /// and the person has to be aborted and done from all its timestamps.
+    /// Timestamps must be at most `TS_MASK`.
+    #[inline(always)]
+    pub fn add(&mut self, start: &mut [u32], meta: &mut [u64], ts: u32) -> bool {
+        if ts < self.latest {
+            return false;
+        }
+        // The next session's start and word are written before the gap
+        // decides whether a session begins here.
+        let cut = ts - self.latest > GAP;
+        start[self.open + 1] = ts;
+        meta[self.open + 1] = self.owner | self.events;
+        self.open += usize::from(cut);
+        self.events += 1;
+        self.latest = ts;
+        true
+    }
+
+    /// The event just given is a purchase: `word` is `price | category << 32`
+    /// and `purchases` the third of `ScratchC::batch_scratch`.
+    #[inline(always)]
+    pub fn purchase(&self, purchases: &mut Vec<[u64; 2]>, word: u64) {
+        purchases.push([self.open as u64, word]);
+    }
+
+    /// How many events the person has so far.
+    #[inline(always)]
+    pub fn events(&self) -> u64 {
+        self.events - self.events_before
+    }
+}
+
+/// Rows and cells of the persons in the batch; the batch is empty afterwards.
+fn finish_batch(
+    params: &Params,
+    tuning: Tuning,
+    work: &mut Work,
+    batch: &mut Batch,
+    out: &mut PassCOut,
+    click_exotic: &[Box<[u8]>],
+) {
+    let (sessions, persons) = (batch.sessions, batch.persons);
+    batch.meta[sessions] = (persons as u64) << OWNER_SHIFT | batch.events;
+    batch.first_session[persons] = sessions as u32;
+
+    // Sessions to rows: one row per person and day with a session start.
+    // Every session writes the row it would begin; the write stays only
+    // where the person or the day changes.
+    let mut rows = 0;
+    let (mut previous_owner, mut previous_day) = (u32::MAX, u32::MAX);
+    for session in 0..sessions {
+        let owner = (batch.meta[session] >> OWNER_SHIFT) as u32;
+        let day = (batch.start[session] + params.day_offset) / DAY;
+        batch.row_first[rows] = session as u32;
+        batch.row_day[rows] = day;
+        batch.row_owner[rows] = owner;
+        rows += usize::from((owner != previous_owner) | (day != previous_day));
+        batch.row_of[session] = (rows - 1) as u32;
+        previous_owner = owner;
+        previous_day = day;
+    }
+    batch.row_first[rows] = sessions as u32;
+
+    // Purchases: per session for the campaign cells, per row for the output.
+    // They come in session order, so a row's purchases come together.
+    batch.row_revenue[..rows].fill(0);
+    batch.row_buying[..rows].fill(0);
+    batch.row_top[..rows].fill(NO_CATEGORY);
+    batch.revenue[..sessions].fill(0);
+    batch.bought[..sessions].fill(0);
+    let sums = &mut work.category_sums[..params.categories];
+    let (mut current_row, mut previous_session) = (usize::MAX, u64::MAX);
+    for &[session, word] in &batch.purchases {
+        let row = batch.row_of[session as usize] as usize;
+        if row != current_row {
+            if current_row != usize::MAX {
+                batch.row_top[current_row] = top_category(&params.category_rank, sums);
+            }
+            current_row = row;
+        }
+        let price = (word & 0xFFFF_FFFF) as i64;
+        sums[(word >> 32) as usize] += price;
+        batch.revenue[session as usize] += price;
+        batch.bought[session as usize] += 1;
+        batch.row_revenue[row] += price;
+        batch.row_buying[row] += i64::from(session != previous_session);
+        previous_session = session;
+    }
+    if current_row != usize::MAX {
+        batch.row_top[current_row] = top_category(&params.category_rank, sums);
+    }
+
+    // Attribution, for the persons with clicks: each one's sessions and rows
+    // are laid out the way one person's are, and its sessions go to the
+    // cells of the campaigns they are credited to.
+    for &person in &batch.clicked[..batch.clicked_count] {
+        let person = person as usize;
+        let (from, to) = (batch.first_session[person] as usize, batch.first_session[person + 1] as usize);
+        let count = to - from;
+        let (first_row, end_row) = (batch.row_of[from] as usize, batch.row_of[to - 1] as usize + 1);
+        let person_rows = end_row - first_row;
+        work.start[..count].copy_from_slice(&batch.start[from..to]);
+        work.start[count..count + LANES].fill(u32::MAX);
+        for row in 0..=person_rows {
+            work.row_first[row] = batch.row_first[first_row + row] - from as u32;
+        }
+        work.row_day[..person_rows].copy_from_slice(&batch.row_day[first_row..end_row]);
+        let clicks = &batch.clicks[batch.click_ends[person] as usize..batch.click_ends[person + 1] as usize];
+        if count <= 64 {
+            attribute_narrow(params, tuning, work, click_exotic, count, person_rows, clicks);
+        } else {
+            attribute_wide(params, work, click_exotic, count, person_rows, clicks);
+        }
+        for session in 0..count {
+            let day = batch.row_day[batch.row_of[from + session] as usize] as usize;
+            let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
+            cell[0] += 1;
+            cell[1] += i64::from(batch.bought[from + session] > 0);
+            cell[2] += batch.revenue[from + session];
+        }
+    }
+
+    // Rows to output, a column at a time.
+    let row_sessions = |row: usize| batch.row_first[row + 1] - batch.row_first[row];
+    let events_before = |row: usize| batch.meta[batch.row_first[row] as usize] & EVENTS_MASK;
+    out.names.extend((0..rows).map(|row| batch.names[batch.row_owner[row] as usize]));
+    out.days.extend((0..rows).map(|row| (params.first_day + i64::from(batch.row_day[row])) as i32));
+    out.sessions.extend((0..rows).map(|row| i64::from(row_sessions(row))));
+    out.events.extend((0..rows).map(|row| (events_before(row + 1) - events_before(row)) as i64));
+    out.revenue.extend_from_slice(&batch.row_revenue[..rows]);
+    out.top_category.extend_from_slice(&batch.row_top[..rows]);
+    // The sessions of a person without clicks are organic, a row at a time.
+    let organic = &mut out.campaign_days[params.organic * params.day_count..][..params.day_count];
+    for row in 0..rows {
+        let weight = batch.organic[batch.row_owner[row] as usize];
+        let cell = &mut organic[batch.row_day[row] as usize];
+        cell[0] += weight * i64::from(row_sessions(row));
+        cell[1] += weight * batch.row_buying[row];
+        cell[2] += weight * batch.row_revenue[row];
+    }
+
+    batch.sessions = 0;
+    batch.events = 0;
+    batch.persons = 0;
+    batch.clicked_count = 0;
+    batch.clicks.clear();
+    batch.purchases.clear();
 }
 
 /// Sessions of one person whose timestamps are already ascending, in one
@@ -1683,7 +2013,8 @@ fn partition_core(
     out: &mut PassCOut,
     scratch: &mut ScratchC,
 ) {
-    let ScratchC { params, tuning, group, work } = scratch;
+    let ScratchC { params, tuning, group, work, batch } = scratch;
+    assert_eq!(batch.persons, 0, "a batch of persons was left unfinished");
     // The first block of every list, while the lists are measured.
     for list in event_lists.iter().chain(click_lists) {
         if let Some(block) = list.blocks().next() {
@@ -2037,8 +2368,9 @@ mod tests {
         Sorted,
         /// All timestamps at once, as they come (the fallback, mostly).
         AsTheyCome,
-        /// One event at a time through `Sessions`, sorted or as they come;
-        /// a person that turns out not to be in order is handed over whole.
+        /// One event at a time into the batch, sorted or as they come; a
+        /// person that turns out not to be in order is taken out of the
+        /// batch again and handed over whole.
         Streamed(bool),
     }
 
@@ -2064,39 +2396,71 @@ mod tests {
             top_category: Vec::new(),
             campaign_days: vec![[0; 4]; world.campaigns * world.day_count],
         };
+        // Decides where a batch is finished early.
+        let mut rng = Rng(partitions.iter().map(|partition| partition.events.len() as u64).sum());
         for partition in partitions {
-            let mut people: BTreeMap<u32, (Vec<u32>, Vec<[u64; 2]>, Vec<[u64; 2]>)> = BTreeMap::new();
+            // Per person: its events with their purchase words, and its clicks.
+            let mut people: BTreeMap<u32, (Vec<(u32, Option<u64>)>, Vec<[u64; 2]>)> = BTreeMap::new();
             for event in &partition.events {
-                let person = people.entry(event.local).or_default();
-                person.0.push(event.ts);
-                if let Some((price, category)) = event.purchase {
-                    person.1.push([u64::from(event.ts), u64::from(price) | (u64::from(category) << 32)]);
-                }
+                let word = event.purchase.map(|(price, category)| u64::from(price) | (u64::from(category) << 32));
+                people.entry(event.local).or_default().0.push((event.ts, word));
             }
             for click in &partition.clicks {
                 if let Some(person) = people.get_mut(&click.local) {
-                    person.2.push([u64::from(click.ts), click.code | (u64::from(click.campaign) << 42)]);
+                    person.1.push([u64::from(click.ts), click.code | (u64::from(click.campaign) << 42)]);
                 }
             }
-            for (&local, (events, purchases, clicks)) in &mut people {
+            for (&local, (stream, clicks)) in &mut people {
                 if matches!(entry, Entry::Sorted | Entry::Streamed(true)) {
-                    events.sort_unstable();
+                    stream.sort_by_key(|&(ts, _)| ts);
                 }
                 let name = unmix(((partition.part as u64) << TEST_PERSON_SHIFT) | u64::from(local));
                 if let Entry::Streamed(_) = entry {
-                    let (start, count) = scratch.session_scratch();
-                    let mut sessions = Sessions::begin(start, events[0]);
-                    if events[1..].iter().all(|&ts| sessions.add(start, count, ts)) {
-                        assert_eq!(sessions.events() as usize, events.len());
-                        scratch.finish_sessions(sessions, &mut out, &world.exotic, name, purchases, clicks);
+                    if give_to_batch(&mut scratch, &mut out, &world.exotic, name, stream, clicks) {
+                        if rng.one_in(7) {
+                            scratch.finish_batch(&mut out, &world.exotic);
+                        }
                         continue;
                     }
                 }
-                scratch.one_person_in_order(&mut out, &world.exotic, name, events, purchases, clicks);
+                let events: Vec<u32> = stream.iter().map(|&(ts, _)| ts).collect();
+                let purchases: Vec<[u64; 2]> =
+                    stream.iter().filter_map(|&(ts, word)| word.map(|word| [u64::from(ts), word])).collect();
+                scratch.one_person_in_order(&mut out, &world.exotic, name, &events, &purchases, clicks);
             }
+            scratch.finish_batch(&mut out, &world.exotic);
             scratch.flush(&mut out);
         }
         tables_of(&out)
+    }
+
+    /// Hands one person to the batch, event by event. `false` when its
+    /// events are not in time order: the batch is then as it was before.
+    fn give_to_batch(
+        scratch: &mut ScratchC,
+        out: &mut PassCOut,
+        exotic: &[Box<[u8]>],
+        name: u64,
+        stream: &[(u32, Option<u64>)],
+        clicks: &[[u64; 2]],
+    ) -> bool {
+        let mut person = scratch.begin_person(out, exotic, stream[0].0);
+        let (start, meta, bought) = scratch.batch_scratch();
+        if let Some(word) = stream[0].1 {
+            person.purchase(bought, word);
+        }
+        for &(ts, purchase) in &stream[1..] {
+            if !person.add(start, meta, ts) {
+                scratch.abort_person(person);
+                return false;
+            }
+            if let Some(word) = purchase {
+                person.purchase(bought, word);
+            }
+        }
+        assert_eq!(person.events(), stream.len() as u64);
+        scratch.end_person(person, name, clicks.iter().copied());
+        true
     }
 
     fn expected(world: &World, partitions: &[Partition]) -> Tables {
@@ -2530,6 +2894,97 @@ mod tests {
             }
         }
         assert_eq!(sessions_of_case(MIDNIGHT, &events, &clicks), 168);
+    }
+
+    /// Batches against one person at a time, on shapes the random worlds
+    /// rarely have: persons with hundreds of sessions (more than a word of
+    /// session bits, and enough to fill a batch before it has its persons),
+    /// rows on every day, purchases in many sessions, persons taken out of
+    /// the batch again, and whole persons done in between.
+    #[test]
+    fn batches_match_one_person_at_a_time() {
+        let world = World::new(1_790_812_800_000 + 3_600_000, 21 * DAY, &["shoes", "books", "toys"], 6, &[]);
+        let params = || {
+            Params::new(
+                world.window_start,
+                world.first_day,
+                world.day_count,
+                world.campaigns,
+                world.campaigns - 1,
+                &world.category_names,
+                TEST_PERSON_SHIFT,
+            )
+        };
+        let new_out = || PassCOut {
+            names: Vec::new(),
+            days: Vec::new(),
+            sessions: Vec::new(),
+            events: Vec::new(),
+            revenue: Vec::new(),
+            top_category: Vec::new(),
+            campaign_days: vec![[0; 4]; world.campaigns * world.day_count],
+        };
+        let rounds = if cfg!(debug_assertions) { 6 } else { 60 };
+        for seed in 0..rounds {
+            let mut rng = Rng(1000 + seed);
+            let tuning = Tuning { lookup_min: rng.pick(&[0, 64, 2048, usize::MAX]), ..Tuning::DEFAULT };
+            let (mut batched, mut single) = (ScratchC::with(params(), tuning), ScratchC::with(params(), tuning));
+            let (mut out_batched, mut out_single) = (new_out(), new_out());
+            let mut serial = 0;
+            for number in 0..rng.range(1, 150) {
+                // A person: events in time order with purchases, and clicks.
+                let wanted = rng.pick(&[1, 1, 2, 3, 5, 8, 20, 70, 300, 1500]);
+                let mut stream: Vec<(u32, Option<u64>)> = Vec::new();
+                let steps: &[u32] = rng.pick(&[
+                    &[GAP + 1, GAP + 1, GAP + 2, 1, 60_000][..],
+                    &[0, 1, 60_000, GAP - 1, GAP, GAP + 1, GAP + 1, 3 * GAP, DAY / 3, DAY, 2 * DAY][..],
+                    &[0, 1, 1000, 60_000, GAP - 1, GAP][..],
+                ]);
+                let early = rng.pick(&[2, 50]);
+                let mut ts = rng.below(u64::from(world.length) / early) as u32;
+                let purchase_rate = rng.pick(&[2, 9, 50]);
+                while stream.len() < wanted && ts < world.length {
+                    let word = rng
+                        .one_in(purchase_rate)
+                        .then(|| rng.below(5000) | rng.below(world.category_names.len() as u64) << 32);
+                    stream.push((ts, word));
+                    ts += rng.pick(steps);
+                }
+                let mut clicks: Vec<[u64; 2]> = Vec::new();
+                for _ in 0..rng.pick(&[0, 0, 1, 2, 4, 12, 40]) {
+                    serial += 1;
+                    let click_ts = rng.below(u64::from(world.length) + u64::from(WEEK));
+                    clicks.push([click_ts, click_code(serial) | rng.below(world.campaigns as u64 - 1) << 42]);
+                }
+                let name = unmix(u64::from(number as u32));
+                let events: Vec<u32> = stream.iter().map(|&(ts, _)| ts).collect();
+                let purchases: Vec<[u64; 2]> =
+                    stream.iter().filter_map(|&(ts, word)| word.map(|word| [u64::from(ts), word])).collect();
+                single.one_person_in_order(&mut out_single, &world.exotic, name, &events, &purchases, &clicks);
+                match rng.below(10) {
+                    // Done whole, between the persons of the batch.
+                    0 => batched.one_person_in_order(&mut out_batched, &world.exotic, name, &events, &purchases, &clicks),
+                    // Begun in the batch with an event out of place, taken out again.
+                    1 if stream.len() > 1 && stream[stream.len() - 1].0 > 0 => {
+                        let mut broken = stream.clone();
+                        let last = broken.len() - 1;
+                        broken.insert(rng.range(1, last as u64) as usize, (broken[last].0, Some(77)));
+                        broken[last + 1].0 -= 1;
+                        assert!(!give_to_batch(&mut batched, &mut out_batched, &world.exotic, name, &broken, &clicks));
+                        batched.one_person_in_order(&mut out_batched, &world.exotic, name, &events, &purchases, &clicks);
+                    }
+                    _ => assert!(give_to_batch(&mut batched, &mut out_batched, &world.exotic, name, &stream, &clicks)),
+                }
+                if rng.one_in(40) {
+                    batched.finish_batch(&mut out_batched, &world.exotic);
+                    batched.flush(&mut out_batched);
+                }
+            }
+            batched.finish_batch(&mut out_batched, &world.exotic);
+            batched.flush(&mut out_batched);
+            single.flush(&mut out_single);
+            assert!(tables_of(&out_batched) == tables_of(&out_single), "seed {seed}");
+        }
     }
 
     /// The in-order pass against the sort path, for short and long persons
