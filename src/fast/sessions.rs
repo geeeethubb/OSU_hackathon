@@ -5,11 +5,12 @@
 //! are grouped by person with a counting sort (a small hash table gives every
 //! person of the partition a dense index). Then, per person:
 //!
-//! * Sessions. A few timestamps are sorted and scanned. Many timestamps are
-//!   summarized per half-hour bucket (min, max, count): two events of one
-//!   bucket are less than 30 minutes apart, so a bucket never holds a session
-//!   break, and walking the occupied buckets in order a new session starts
-//!   exactly where `bucket.min - previous_bucket.max` is over 30 minutes.
+//! * Sessions. Up to 16 timestamps are sorted by a fixed network of
+//!   compare-exchanges. More are summarized per half-hour bucket (min, max,
+//!   count): two events of one bucket are less than 30 minutes apart, so a
+//!   bucket never holds a session break, and walking the occupied buckets in
+//!   order a new session starts exactly where
+//!   `bucket.min - previous_bucket.max` is over 30 minutes.
 //! * Purchases go to the session that holds their timestamp: the last one
 //!   that starts at or before it.
 //! * Clicks. A click at `t` can credit or assist exactly the sessions with
@@ -20,6 +21,11 @@
 //!   A campaign assists the union of its clicks' runs, kept as one bit per
 //!   session and counted per day with popcounts. No click is ever paired
 //!   with every session it reaches.
+//!
+//! Most persons are small, and what they cost is mispredicted branches, so
+//! the per-person loops avoid data-dependent branches: values are written
+//! before the condition that keeps them is known, and counts are added
+//! whether or not they are zero.
 //!
 //! Rows of one person are emitted together, in day order; persons come in the
 //! order they first appear in the partition's lists.
@@ -38,13 +44,88 @@ const DAY: u32 = DAY_MS as u32;
 
 /// Half-hour buckets a 31-bit timestamp can fall into.
 const BUCKETS: usize = (TS_MASK / SESSION_GAP_MS as u64) as usize + 1;
-const BUCKET_WORDS: usize = BUCKETS.div_ceil(64);
 /// Days a 31-bit timestamp can fall on, for a window that starts late in a day.
 const MAX_ROWS: usize = ((TS_MASK + DAY_MS as u64) / DAY_MS as u64) as usize + 1;
 /// A bucket summary `[min, max, count, unused]` that no event has touched.
 const EMPTY_CELL: [u32; 4] = [u32::MAX, 0, 0, 0];
+/// Session starts are compared this many at a time.
+const LANES: usize = 8;
+/// The most events the sorting network takes.
+const NETWORK_MAX: usize = 2 * LANES;
+/// Spare words after the grouped events, so that a full network input can be
+/// read at any person's first event.
+const EVENT_PAD: usize = NETWORK_MAX;
 
 pub const NO_CATEGORY: u32 = u32::MAX;
+
+/// Development aid: `true` times the phases below with the CPU's time stamp
+/// counter, and every worker prints one line of totals when it ends.
+const PROFILE: bool = false;
+const PHASES: [&str; 11] = [
+    "read_events",
+    "read_clicks",
+    "scatter",
+    "sessions",
+    "rows",
+    "purchases",
+    "click_setup",
+    "clicks",
+    "credit",
+    "assists",
+    "emit",
+];
+
+struct Profile {
+    last: u64,
+    ticks: [u64; PHASES.len()],
+    born: (std::time::Instant, u64),
+}
+
+#[inline(always)]
+fn time_stamp() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reading the time stamp counter has no preconditions.
+    unsafe {
+        std::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
+impl Profile {
+    fn new() -> Self {
+        Self { last: 0, ticks: [0; PHASES.len()], born: (std::time::Instant::now(), time_stamp()) }
+    }
+
+    #[inline(always)]
+    fn start(&mut self) {
+        if PROFILE {
+            self.last = time_stamp();
+        }
+    }
+
+    /// Charges the time since the previous call to `phase`.
+    #[inline(always)]
+    fn lap(&mut self, phase: usize) {
+        if PROFILE {
+            let now = time_stamp();
+            self.ticks[phase] += now.wrapping_sub(self.last);
+            self.last = now;
+        }
+    }
+
+    fn report(&self) {
+        let ticks_per_ms = (time_stamp() - self.born.1) as f64 / (self.born.0.elapsed().as_secs_f64() * 1e3);
+        let mut line = String::from("SESSIONS_PROFILE");
+        let mut total = 0.0;
+        for (name, &ticks) in PHASES.iter().zip(&self.ticks) {
+            let ms = ticks as f64 / ticks_per_ms;
+            total += ms;
+            line += &format!(" {name}={ms:.2}");
+        }
+        eprintln!("{line} total={total:.2}");
+    }
+}
 
 /// What one worker produces in pass C.
 pub struct PassCOut {
@@ -122,16 +203,44 @@ impl Params {
 /// output; the tests run them all.
 #[derive(Clone, Copy)]
 struct Tuning {
-    /// A person with at most this many events is sorted; a bigger one goes
-    /// through the bucket summaries.
+    /// Sort up to `NETWORK_MAX` events with the fixed network (where the
+    /// target has one).
+    network: bool,
+    /// A person with at most this many events that the network does not take
+    /// is sorted by the standard library; a bigger one goes through the
+    /// bucket summaries.
     sort_max: usize,
-    /// Session starts are counted one by one for a click while
-    /// `sessions * clicks` is below this; above, a per-bucket table answers.
+    /// For a person with more than `2 * LANES` sessions, session starts are
+    /// compared one by one with every click while `sessions * clicks` is
+    /// below this; above, a per-bucket table answers.
     lookup_min: usize,
 }
 
 impl Tuning {
-    const DEFAULT: Tuning = Tuning { sort_max: 32, lookup_min: 512 };
+    const DEFAULT: Tuning = Tuning { network: true, sort_max: 0, lookup_min: 2048 };
+}
+
+/// Asks for every cache line of a block. The lists were written by other
+/// threads long ago and each block is only a few kilobytes, too short for the
+/// hardware prefetcher to get ahead of the reader.
+#[inline(always)]
+fn prefetch(block: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut at = 0;
+        while at < block.len() {
+            // SAFETY: a prefetch reads nothing; the address is inside the block.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(block.as_ptr().add(at) as *const i8) };
+            at += 8;
+        }
+        if let Some(last) = block.last() {
+            // SAFETY: as above.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(last as *const u64 as *const i8) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = block;
 }
 
 /// The persons of one partition and their rows, grouped.
@@ -152,7 +261,7 @@ struct Group {
     staged_purchases: Vec<[u64; 2]>,
     /// Clicks in list order: `[person index << 32 | ts, click code | campaign << 42]`.
     staged_clicks: Vec<[u64; 2]>,
-    /// Event timestamps, person after person.
+    /// Event timestamps, person after person, then `EVENT_PAD` spare words.
     events: Vec<u32>,
     /// `[ts, price | category << 32]`, person after person.
     purchases: Vec<[u64; 2]>,
@@ -246,7 +355,14 @@ impl Group {
         self.staged.clear();
         self.staged_purchases.clear();
         for list in lists {
-            for block in list.blocks() {
+            let mut blocks = list.blocks();
+            let mut following = blocks.next();
+            while let Some(block) = following {
+                // The block after this one arrives while this one is read.
+                following = blocks.next();
+                if let Some(next) = following {
+                    prefetch(next);
+                }
                 // At most one event per word.
                 self.staged.reserve(block.len());
                 let staged = self.staged.as_mut_ptr();
@@ -281,7 +397,13 @@ impl Group {
     fn read_clicks(&mut self, lists: &[PartList]) {
         self.staged_clicks.clear();
         for list in lists {
-            for block in list.blocks() {
+            let mut blocks = list.blocks();
+            let mut following = blocks.next();
+            while let Some(block) = following {
+                following = blocks.next();
+                if let Some(next) = following {
+                    prefetch(next);
+                }
                 // A block holds whole records: two words per click.
                 for click in block.chunks_exact(2) {
                     if let Some(index) = self.find((click[0] >> 32) as u32) {
@@ -304,10 +426,10 @@ impl Group {
                 totals[kind] += count;
             }
         }
-        // Every slot below the new lengths is written by the loops that
+        // Every slot below the staged lengths is written by the loops that
         // follow: the counts add up to the staged rows.
         self.events.clear();
-        self.events.resize(self.staged.len(), 0);
+        self.events.resize(self.staged.len() + EVENT_PAD, 0);
         self.purchases.clear();
         self.purchases.resize(self.staged_purchases.len(), [0; 2]);
         self.clicks.clear();
@@ -330,15 +452,163 @@ impl Group {
     }
 }
 
+/// The AVX2 kernels. The crate is compiled for x86-64-v3, so the intrinsics
+/// need no per-function feature attributes.
+#[cfg(target_arch = "x86_64")]
+mod wide {
+    use std::arch::x86_64::*;
+
+    use super::{GAP, LANES, NETWORK_MAX};
+
+    /// Keeps the smaller of each lane pair where `MASK` has a 0, the larger
+    /// where it has a 1: one layer of compare-exchanges.
+    #[inline(always)]
+    unsafe fn exchange<const MASK: i32>(lanes: __m256i, partners: __m256i) -> __m256i {
+        _mm256_blend_epi32::<MASK>(_mm256_min_epu32(lanes, partners), _mm256_max_epu32(lanes, partners))
+    }
+
+    /// Lanes `1 0 3 2 5 4 7 6`.
+    #[inline(always)]
+    unsafe fn swap_neighbours(lanes: __m256i) -> __m256i {
+        _mm256_shuffle_epi32::<0b10_11_00_01>(lanes)
+    }
+
+    /// Lanes `2 3 0 1 6 7 4 5`.
+    #[inline(always)]
+    unsafe fn swap_pairs(lanes: __m256i) -> __m256i {
+        _mm256_shuffle_epi32::<0b01_00_11_10>(lanes)
+    }
+
+    /// Lanes `3 2 1 0 7 6 5 4`.
+    #[inline(always)]
+    unsafe fn reverse_halves(lanes: __m256i) -> __m256i {
+        _mm256_shuffle_epi32::<0b00_01_10_11>(lanes)
+    }
+
+    /// Lanes `4 5 6 7 0 1 2 3`.
+    #[inline(always)]
+    unsafe fn swap_halves(lanes: __m256i) -> __m256i {
+        _mm256_permute2x128_si256::<0x01>(lanes, lanes)
+    }
+
+    /// Lanes `7 6 5 4 3 2 1 0`.
+    #[inline(always)]
+    unsafe fn reverse(lanes: __m256i) -> __m256i {
+        _mm256_permutevar8x32_epi32(lanes, _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0))
+    }
+
+    /// Sorts eight unsigned lanes: a bitonic sorter, six layers.
+    #[inline(always)]
+    unsafe fn sort8(mut lanes: __m256i) -> __m256i {
+        // Sorted pairs, then sorted halves.
+        lanes = exchange::<0b1010_1010>(lanes, swap_neighbours(lanes));
+        lanes = exchange::<0b1100_1100>(lanes, reverse_halves(lanes));
+        lanes = exchange::<0b1010_1010>(lanes, swap_neighbours(lanes));
+        // The two halves merged.
+        lanes = exchange::<0b1111_0000>(lanes, reverse(lanes));
+        lanes = exchange::<0b1100_1100>(lanes, swap_pairs(lanes));
+        exchange::<0b1010_1010>(lanes, swap_neighbours(lanes))
+    }
+
+    /// Sorts eight lanes that rise and then fall, or fall and then rise.
+    #[inline(always)]
+    unsafe fn merge8(mut lanes: __m256i) -> __m256i {
+        lanes = exchange::<0b1111_0000>(lanes, swap_halves(lanes));
+        lanes = exchange::<0b1100_1100>(lanes, swap_pairs(lanes));
+        exchange::<0b1010_1010>(lanes, swap_neighbours(lanes))
+    }
+
+    /// Sorts sixteen unsigned values, the smaller eight first.
+    ///
+    /// # Safety
+    /// Needs AVX2.
+    #[inline(always)]
+    pub unsafe fn sort16(low: __m256i, high: __m256i) -> (__m256i, __m256i) {
+        // Rising then falling: the smaller of each pair are the eight
+        // smallest, and both sets rise and fall again.
+        let (low, high) = (sort8(low), reverse(sort8(high)));
+        (merge8(_mm256_min_epu32(low, high)), merge8(_mm256_max_epu32(low, high)))
+    }
+
+    /// Sorts the first `count` (1 to 16) of the timestamps at `events` into
+    /// `sorted`, pads the rest with `u32::MAX`, and returns one bit per
+    /// position whose timestamp is more than 30 minutes after the one
+    /// before it. Bit 0 is never set.
+    ///
+    /// # Safety
+    /// Needs AVX2, and 16 readable words at `events`.
+    #[inline(always)]
+    pub unsafe fn sort_and_cut(events: *const u32, count: usize, sorted: &mut [u32; NETWORK_MAX]) -> u32 {
+        let last = _mm256_set1_epi32(count as i32 - 1);
+        // Lanes past the person's events become u32::MAX and sort to the end.
+        let low = _mm256_or_si256(
+            _mm256_loadu_si256(events as *const __m256i),
+            _mm256_cmpgt_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), last),
+        );
+        let high = _mm256_or_si256(
+            _mm256_loadu_si256(events.add(LANES) as *const __m256i),
+            _mm256_cmpgt_epi32(_mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15), last),
+        );
+        let (low, high) = sort16(low, high);
+        _mm256_storeu_si256(sorted.as_mut_ptr() as *mut __m256i, low);
+        _mm256_storeu_si256(sorted.as_mut_ptr().add(LANES) as *mut __m256i, high);
+        // Each lane next to the one before it in the order; lane 0 next to itself.
+        let shift = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+        let before_low = _mm256_permutevar8x32_epi32(low, shift);
+        let before_high = _mm256_blend_epi32::<0b0000_0001>(
+            _mm256_permutevar8x32_epi32(high, shift),
+            _mm256_permutevar8x32_epi32(low, _mm256_set1_epi32(7)),
+        );
+        // Timestamps have 31 bits, so their differences compare as signed.
+        let gap = _mm256_set1_epi32(GAP as i32);
+        let cut_low = _mm256_cmpgt_epi32(_mm256_sub_epi32(low, before_low), gap);
+        let cut_high = _mm256_cmpgt_epi32(_mm256_sub_epi32(high, before_high), gap);
+        let cuts = _mm256_movemask_ps(_mm256_castsi256_ps(cut_low)) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(cut_high)) as u32) << LANES;
+        cuts & ((1 << count) - 1)
+    }
+
+    /// Of `LANES * blocks` ascending starts padded with `u32::MAX`: how many
+    /// are below `floor`, and how many are at most `ts`.
+    ///
+    /// # Safety
+    /// Needs AVX2, and `LANES * blocks` readable words at `starts`.
+    #[inline(always)]
+    pub unsafe fn reach(starts: *const u32, blocks: usize, floor: u32, ts: u32) -> (usize, usize) {
+        let (floor_lanes, ts_lanes) = (_mm256_set1_epi32(floor as i32), _mm256_set1_epi32(ts as i32));
+        let (mut not_below, mut up_to) = (0, 0);
+        for block in 0..blocks {
+            let lanes = _mm256_loadu_si256(starts.add(LANES * block) as *const __m256i);
+            // Unsigned `start >= floor` and `start <= ts`; the padding is never below and never up to.
+            let above = _mm256_cmpeq_epi32(_mm256_max_epu32(lanes, floor_lanes), lanes);
+            let within = _mm256_cmpeq_epi32(_mm256_min_epu32(lanes, ts_lanes), lanes);
+            not_below += (_mm256_movemask_ps(_mm256_castsi256_ps(above)) as u32).count_ones();
+            up_to += (_mm256_movemask_ps(_mm256_castsi256_ps(within)) as u32).count_ones();
+        }
+        (LANES * blocks - not_below as usize, up_to as usize)
+    }
+
+    /// One bit per byte of the 32 flags that is `0xFF`.
+    ///
+    /// # Safety
+    /// Needs AVX2.
+    #[inline(always)]
+    pub unsafe fn flag_bits(flags: &[u8; 32]) -> u32 {
+        _mm256_movemask_epi8(_mm256_loadu_si256(flags.as_ptr() as *const __m256i)) as u32
+    }
+}
+
 /// Scratch for one person at a time.
 struct Work {
+    profile: Profile,
     /// Bucket summaries `[min, max, count, unused]`; all `EMPTY_CELL` between persons.
     cells: Vec<[u32; 4]>,
-    /// One bit per bucket with events; all zero between persons.
-    occupied: [u64; BUCKET_WORDS],
+    /// `0xFF` per bucket with events, in whole 32-byte groups; all zero between persons.
+    flags: Vec<u8>,
     /// Sort path: the index of each session's first event, and one past the last.
     first: Vec<u32>,
-    /// Sessions of the person in start order: start and event count.
+    /// Sessions of the person in start order: start and event count. After
+    /// the starts come `LANES` times `u32::MAX`.
     start: Vec<u32>,
     count: Vec<u32>,
     /// Purchase cents and purchase count per session.
@@ -346,47 +616,65 @@ struct Work {
     purchases: Vec<u32>,
     /// Row (day) number per session.
     row: Vec<u8>,
-    /// Per row: its first session (one extra entry closes the last row) and its day index.
+    /// Per row: its first session (one more entry closes the last row), its
+    /// day index and its events. One spare entry each for values written
+    /// before the row is known to start.
     row_first: [u32; MAX_ROWS + 1],
-    row_day: [u32; MAX_ROWS],
+    row_day: [u32; MAX_ROWS + 1],
+    row_events: [i64; MAX_ROWS + 1],
+    /// Per row, one bit per session of the row (persons of up to 64 sessions).
+    row_bits: [u64; MAX_ROWS],
     /// Purchase cents per `(row, category)`; all zero between persons.
     category_sums: Vec<i64>,
     /// Per session: `(click ts + 1) << 32 | click index` of the best click
-    /// among those whose reach begins at this session; 0 for none.
+    /// among those whose reach begins at this session; 0 for none. One more
+    /// entry takes the clicks after the last start.
     best: Vec<u64>,
     /// Credited campaign per session.
     credited: Vec<u32>,
     /// Per bucket: `starts before the bucket << 32 | the start inside it`
     /// (`u32::MAX` when it has none).
     lookup: Vec<u64>,
-    /// Campaign -> 1 + its slot for the current person; all zero between persons.
+    /// Campaign -> its slot for the current person, from 1; all zero between persons.
     slot_of: Vec<u32>,
+    /// Slot -> campaign; entry 0 is not used.
     slot_campaign: Vec<u32>,
-    /// Per slot, one bit per session the campaign assists.
+    /// Per slot, one bit per session the campaign assists; all zero between persons.
     masks: Vec<u64>,
+    /// Assists of the partition's persons so far that are not in the output
+    /// yet: `campaign_days index << 32 | sessions`.
+    pending: Vec<u64>,
+    /// The output columns have been given their room.
+    reserved: bool,
 }
 
 impl Work {
     fn new(params: &Params, tuning: Tuning) -> Self {
-        let sessions = BUCKETS.max(tuning.sort_max) + 1;
+        // A bucket holds at most one session start.
+        let sessions = BUCKETS.max(tuning.sort_max).max(NETWORK_MAX) + 1;
         Self {
+            profile: Profile::new(),
             cells: vec![EMPTY_CELL; BUCKETS],
-            occupied: [0; BUCKET_WORDS],
-            first: vec![0; tuning.sort_max + 2],
-            start: vec![0; sessions],
+            flags: vec![0; BUCKETS + 32],
+            first: vec![0; tuning.sort_max.max(NETWORK_MAX) + 2],
+            start: vec![0; sessions + LANES],
             count: vec![0; sessions],
             revenue: vec![0; sessions],
             purchases: vec![0; sessions],
             row: vec![0; sessions],
             row_first: [0; MAX_ROWS + 1],
-            row_day: [0; MAX_ROWS],
+            row_day: [0; MAX_ROWS + 1],
+            row_events: [0; MAX_ROWS + 1],
+            row_bits: [0; MAX_ROWS],
             category_sums: vec![0; MAX_ROWS * params.categories],
-            best: vec![0; sessions],
+            best: vec![0; sessions + 1],
             credited: vec![0; sessions],
             lookup: vec![0; BUCKETS + 1],
             slot_of: vec![0; params.campaigns],
             slot_campaign: Vec::new(),
             masks: Vec::new(),
+            pending: Vec::new(),
+            reserved: false,
         }
     }
 }
@@ -396,6 +684,14 @@ pub struct ScratchC {
     tuning: Tuning,
     group: Group,
     work: Work,
+}
+
+impl Drop for ScratchC {
+    fn drop(&mut self) {
+        if PROFILE {
+            self.work.profile.report();
+        }
+    }
 }
 
 impl ScratchC {
@@ -418,23 +714,23 @@ impl ScratchC {
     }
 }
 
-/// How many of the ascending `starts` are `<= limit`.
+/// The lowest `count` bits (`count` up to 64).
 #[inline(always)]
-fn starts_up_to(starts: &[u32], limit: u32) -> usize {
-    if starts.len() <= 16 {
-        starts.iter().filter(|&&start| start <= limit).count()
+fn low_bits(count: usize) -> u64 {
+    if count >= 64 {
+        u64::MAX
     } else {
-        starts.partition_point(|&start| start <= limit)
+        (1 << count) - 1
     }
 }
 
-/// How many of the ascending `starts` are `< limit`.
+/// How many of the ascending `starts` are `<= limit`.
 #[inline(always)]
-fn starts_before(starts: &[u32], limit: u32) -> usize {
-    if starts.len() <= 16 {
-        starts.iter().filter(|&&start| start < limit).count()
+fn starts_up_to(starts: &[u32], limit: u32) -> usize {
+    if starts.len() <= 2 * LANES {
+        starts.iter().filter(|&&start| start <= limit).count()
     } else {
-        starts.partition_point(|&start| start < limit)
+        starts.partition_point(|&start| start <= limit)
     }
 }
 
@@ -458,46 +754,93 @@ fn sessions_by_sort(events: &mut [u32], work: &mut Work) -> usize {
     sessions
 }
 
+/// Sessions of one person with at most `NETWORK_MAX` events, sorted by the
+/// fixed network. `events` is the person's first event and whatever follows
+/// it. Returns how many sessions.
+#[cfg(target_arch = "x86_64")]
+fn sessions_by_network(events: &mut [u32], count: usize, work: &mut Work) -> usize {
+    assert!((1..=NETWORK_MAX).contains(&count) && events.len() >= NETWORK_MAX);
+    let mut sorted = [0u32; NETWORK_MAX];
+    // SAFETY: 16 words are readable at `events`, as just checked.
+    let mut cuts = unsafe { wide::sort_and_cut(events.as_ptr(), count, &mut sorted) };
+    let mut session = 0;
+    let mut first = 0;
+    work.start[0] = sorted[0];
+    while cuts != 0 {
+        let at = cuts.trailing_zeros();
+        cuts &= cuts - 1;
+        work.count[session] = at - first;
+        session += 1;
+        work.start[session] = sorted[at as usize];
+        first = at;
+    }
+    work.count[session] = count as u32 - first;
+    session + 1
+}
+
+/// Where there is no fixed network, the standard sort does the same.
+#[cfg(not(target_arch = "x86_64"))]
+fn sessions_by_network(events: &mut [u32], count: usize, work: &mut Work) -> usize {
+    sessions_by_sort(&mut events[..count], work)
+}
+
+/// One bit per bucket of `flags[base..base + 32]` that has events; clears them.
+#[inline(always)]
+fn take_flags(flags: &mut [u8], base: usize) -> u32 {
+    let group: &mut [u8; 32] = (&mut flags[base..base + 32]).try_into().unwrap();
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the crate is built with AVX2.
+    let bits = unsafe { wide::flag_bits(group) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let bits = group.iter().enumerate().fold(0u32, |bits, (at, &flag)| bits | u32::from(flag >> 7) << at);
+    *group = [0; 32];
+    bits
+}
+
 /// Sessions of one person from half-hour bucket summaries. Returns how many.
 fn sessions_by_buckets(events: &[u32], work: &mut Work) -> usize {
     let (mut low, mut high) = (u32::MAX, 0u32);
     for &ts in events {
         let bucket = (ts / GAP) as usize;
-        // SAFETY: `ts` is a 31-bit value, so `bucket < BUCKETS`.
+        // SAFETY: `ts` is a 31-bit value, so `bucket < BUCKETS`, the length
+        // of `cells` and less than that of `flags`.
         unsafe {
             let cell = work.cells.get_unchecked_mut(bucket);
             cell[0] = cell[0].min(ts);
             cell[1] = cell[1].max(ts);
             cell[2] += 1;
-            *work.occupied.get_unchecked_mut(bucket >> 6) |= 1 << (bucket & 63);
+            *work.flags.get_unchecked_mut(bucket) = 0xFF;
         }
         low = low.min(ts);
         high = high.max(ts);
     }
-    let mut sessions = 0;
-    let mut previous_max = 0;
-    let mut count = 0;
-    for word in (low / GAP) as usize >> 6..=(high / GAP) as usize >> 6 {
-        let mut bits = std::mem::take(&mut work.occupied[word]);
+    // The earliest event's bucket opens the first session.
+    let (first, last) = ((low / GAP) as usize, (high / GAP) as usize);
+    let [min, max, cell_count, _] = std::mem::replace(&mut work.cells[first], EMPTY_CELL);
+    work.flags[first] = 0;
+    work.start[0] = min;
+    let (mut open, mut running, mut previous_max) = (0, cell_count, max);
+    let mut base = first;
+    while base <= last {
+        let mut bits = take_flags(&mut work.flags, base);
         while bits != 0 {
-            let bucket = word * 64 + bits.trailing_zeros() as usize;
+            let bucket = base + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let [min, max, cell_count, _] = std::mem::replace(&mut work.cells[bucket], EMPTY_CELL);
-            // Buckets come in time order, so `min >= previous_max`.
-            if sessions == 0 || min - previous_max > GAP {
-                if sessions != 0 {
-                    work.count[sessions - 1] = count;
-                }
-                work.start[sessions] = min;
-                sessions += 1;
-                count = 0;
-            }
-            count += cell_count;
+            // Buckets come in time order, so `min >= previous_max`. The count
+            // and the start are written before the gap decides whether the
+            // open session ends here.
+            let cut = min - previous_max > GAP;
+            work.count[open] = running;
+            work.start[open + 1] = min;
+            open += usize::from(cut);
+            running = if cut { cell_count } else { running + cell_count };
             previous_max = max;
         }
+        base += 32;
     }
-    work.count[sessions - 1] = count;
-    sessions
+    work.count[open] = running;
+    open + 1
 }
 
 /// Sets bits `from..to` (`from < to`) of a bit set of 64-bit words.
@@ -517,6 +860,20 @@ fn set_bits(words: &mut [u64], from: usize, to: usize) {
     }
 }
 
+/// How many of bits `from..to` (`from < to`) of a bit set are set.
+#[inline(always)]
+fn count_bits(words: &[u64], from: usize, to: usize) -> u32 {
+    let (first, last) = (from >> 6, (to - 1) >> 6);
+    let head = u64::MAX << (from & 63);
+    let tail = u64::MAX >> (63 - ((to - 1) & 63));
+    if first == last {
+        (words[first] & head & tail).count_ones()
+    } else {
+        let middle: u32 = words[first + 1..last].iter().map(|word| word.count_ones()).sum();
+        (words[first] & head).count_ones() + middle + (words[last] & tail).count_ones()
+    }
+}
+
 /// The category with the highest sum; a tie goes to the byte-wise smallest
 /// name. Clears the sums.
 fn top_category(rank: &[u32], sums: &mut [i64]) -> u32 {
@@ -532,37 +889,132 @@ fn top_category(rank: &[u32], sums: &mut [i64]) -> u32 {
     best as u32
 }
 
-/// Credit and assists of one person: fills `work.credited` and adds the
-/// assists to `out`. `clicks` is not empty.
-fn attribute(
+/// Fills `lookup` for the ascending `starts`: per bucket, how many starts
+/// come before it and the start inside it. Returns the index of the entry
+/// that stands for every later bucket.
+fn build_lookup(lookup: &mut [u64], starts: &[u32]) -> usize {
+    // Starts are more than a bucket apart, so a bucket holds at most one.
+    let mut limit = 0;
+    for (session, &start) in starts.iter().enumerate() {
+        let own = (start / GAP) as usize;
+        while limit < own {
+            lookup[limit] = (session as u64) << 32 | u64::from(u32::MAX);
+            limit += 1;
+        }
+        lookup[own] = (session as u64) << 32 | u64::from(start);
+        limit = own + 1;
+    }
+    lookup[limit] = (starts.len() as u64) << 32 | u64::from(u32::MAX);
+    limit
+}
+
+/// How many starts are below `floor` and how many are at most `ts`, from the table.
+#[inline(always)]
+fn reach_by_lookup(lookup: &[u64], limit: usize, floor: u32, ts: u32) -> (usize, usize) {
+    let low = lookup[((floor / GAP) as usize).min(limit)];
+    let high = lookup[((ts / GAP) as usize).min(limit)];
+    ((low >> 32) as usize + usize::from((low as u32) < floor), (high >> 32) as usize + usize::from(high as u32 <= ts))
+}
+
+/// How many of the `LANES * blocks` starts (padded with `u32::MAX`) are
+/// below `floor` and how many are at most `ts`, by comparing them all.
+#[inline(always)]
+fn reach_by_count(starts: &[u32], blocks: usize, floor: u32, ts: u32) -> (usize, usize) {
+    let starts = &starts[..LANES * blocks];
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `starts` has `LANES * blocks` words.
+    return unsafe { wide::reach(starts.as_ptr(), blocks, floor, ts) };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (mut below, mut up_to) = (0, 0);
+        for &start in starts {
+            below += usize::from(start < floor);
+            up_to += usize::from(start <= ts);
+        }
+        (below, up_to)
+    }
+}
+
+/// Records one click whose reach is sessions `from..to` as a candidate for
+/// crediting session `from`. Of the clicks that begin at one session the
+/// latest wins; in one millisecond, the byte-wise smallest click ID.
+///
+/// A click that reaches no session (`from == to`) is recorded too. It is
+/// older than every click that does reach session `from`, and when it is
+/// the only one there the carried click it hides is older still, out of
+/// reach like itself, so the sweep's own reach test gives the same answer.
+#[inline(always)]
+fn offer(best: &mut [u64], clicks: &[[u64; 2]], click_exotic: &[Box<[u8]>], at: usize, from: usize) {
+    let click = clicks[at];
+    let candidate = (click[0] + 1) << 32 | at as u64;
+    let current = best[from];
+    if current >> 32 == candidate >> 32 {
+        let other = clicks[(current & 0xFFFF_FFFF) as usize][1];
+        if id_cmp(click[1] & CODE_MASK, other & CODE_MASK, b'k', click_exotic) == Ordering::Less {
+            best[from] = candidate;
+        }
+    } else {
+        best[from] = current.max(candidate);
+    }
+}
+
+/// The slot of a click's campaign for the current person, a new one the
+/// first time. `slots` counts the slots given out.
+#[inline(always)]
+fn slot_for(slot_of: &mut [u32], slot_campaign: &mut [u32], slots: &mut u32, campaign: usize) -> usize {
+    let seen = slot_of[campaign];
+    *slots += u32::from(seen == 0);
+    let slot = if seen == 0 { *slots } else { seen };
+    slot_of[campaign] = slot;
+    // Written again each time: cheaper than asking whether the slot is new.
+    slot_campaign[slot as usize] = campaign as u32;
+    slot as usize
+}
+
+/// Credit per session from the best clicks: the click that credits a session
+/// is the latest one at or before its start, which is the best of the
+/// session's own or else the one carried over. It counts while
+/// `start - 7 days <= ts`; with `ts` counted from seven days before the
+/// window and `start` from the window, that is `start <= ts`.
+fn credit(work: &mut Work, clicks: &[[u64; 2]], sessions: usize, organic: u32) {
+    let mut carried = 0u64;
+    for session in 0..sessions {
+        let own = work.best[session];
+        carried = if own != 0 { own } else { carried };
+        // With nothing carried this reads click 0 and then keeps `organic`.
+        let campaign = (clicks[(carried & 0xFFFF_FFFF) as usize][1] >> 42) as u32;
+        work.credited[session] = if (carried >> 32) as u32 > work.start[session] { campaign } else { organic };
+    }
+}
+
+/// Credit and assists of a person with clicks and at most 64 sessions: one
+/// word of session bits per campaign.
+fn attribute_narrow(
     params: &Params,
     tuning: Tuning,
     work: &mut Work,
     out: &mut PassCOut,
     click_exotic: &[Box<[u8]>],
     sessions: usize,
+    rows: usize,
     clicks: &[[u64; 2]],
 ) {
-    let words = sessions.div_ceil(64);
-    let use_lookup = sessions > 64 || sessions * clicks.len() >= tuning.lookup_min;
-    let mut limit = 0;
-    if use_lookup {
-        // Starts are more than a bucket apart, so a bucket holds at most one.
-        for session in 0..sessions {
-            let start = work.start[session];
-            let own = (start / GAP) as usize;
-            while limit < own {
-                work.lookup[limit] = (session as u64) << 32 | u64::from(u32::MAX);
-                limit += 1;
-            }
-            work.lookup[own] = (session as u64) << 32 | u64::from(start);
-            limit = own + 1;
-        }
-        // One entry for every later time.
-        work.lookup[limit] = (sessions as u64) << 32 | u64::from(u32::MAX);
+    let most_slots = clicks.len().min(params.campaigns);
+    if work.masks.len() <= most_slots {
+        work.masks.resize(most_slots + 1, 0);
     }
-    work.best[..sessions].fill(0);
-    let starts = &work.start[..sessions];
+    if work.slot_campaign.len() <= most_slots {
+        work.slot_campaign.resize(most_slots + 1, 0);
+    }
+    work.best[..=sessions].fill(0);
+    for row in 0..rows {
+        work.row_bits[row] = low_bits(work.row_first[row + 1] as usize) & !low_bits(work.row_first[row] as usize);
+    }
+    let blocks = sessions.div_ceil(LANES);
+    let use_lookup = sessions > 2 * LANES && sessions * clicks.len() >= tuning.lookup_min;
+    let limit = if use_lookup { build_lookup(&mut work.lookup, &work.start[..sessions]) } else { 0 };
+    work.profile.lap(6);
+
     let mut slots = 0;
     for (at, click) in clicks.iter().enumerate() {
         // Both in ms: `ts` since `window_start - 7 days`, starts since
@@ -571,83 +1023,100 @@ fn attribute(
         let ts = click[0] as u32;
         let floor = ts.saturating_sub(WEEK);
         let (from, to) = if use_lookup {
-            let low = work.lookup[((floor / GAP) as usize).min(limit)];
-            let high = work.lookup[((ts / GAP) as usize).min(limit)];
-            (
-                (low >> 32) as usize + usize::from((low as u32) < floor),
-                (high >> 32) as usize + usize::from(high as u32 <= ts),
-            )
+            reach_by_lookup(&work.lookup, limit, floor, ts)
         } else {
-            (starts_before(starts, floor), starts_up_to(starts, ts))
+            reach_by_count(&work.start, blocks, floor, ts)
         };
-        if from >= to {
-            continue;
-        }
-        // Credit: session `from` is the first one this click can credit, and
-        // of the clicks that begin there the latest wins; in one millisecond,
-        // the byte-wise smallest click ID.
-        let candidate = (u64::from(ts) + 1) << 32 | at as u64;
-        let current = work.best[from];
-        if current >> 32 == candidate >> 32 {
-            let other = clicks[(current & 0xFFFF_FFFF) as usize][1];
-            if id_cmp(click[1] & CODE_MASK, other & CODE_MASK, b'k', click_exotic) == Ordering::Less {
-                work.best[from] = candidate;
-            }
-        } else if candidate > current {
-            work.best[from] = candidate;
-        }
-        // Assists: the campaign covers sessions `from..to`.
-        let campaign = (click[1] >> 42) as usize;
-        let mut slot = work.slot_of[campaign] as usize;
-        if slot == 0 {
-            slots += 1;
-            slot = slots;
-            work.slot_of[campaign] = slot as u32;
-            work.slot_campaign.push(campaign as u32);
-            work.masks.resize(slots * words, 0);
-        }
-        set_bits(&mut work.masks[(slot - 1) * words..slot * words], from, to);
+        offer(&mut work.best, clicks, click_exotic, at, from);
+        let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
+        work.masks[slot] |= low_bits(to) & !low_bits(from);
     }
+    work.profile.lap(7);
 
-    // The click that credits a session is the latest one at or before its
-    // start: the best of this session's own, else the one carried over. It
-    // counts while `start - 7 days <= ts`, which in these units is `start <= ts`.
-    let mut carried = 0u64;
-    for session in 0..sessions {
-        if work.best[session] != 0 {
-            carried = work.best[session];
-        }
-        work.credited[session] = if (carried >> 32) as u32 > starts[session] {
-            (clicks[(carried & 0xFFFF_FFFF) as usize][1] >> 42) as u32
-        } else {
-            params.organic as u32
-        };
-    }
+    credit(work, clicks, sessions, params.organic as u32);
+    work.profile.lap(8);
 
-    // Assists per campaign and day: the covered sessions of each row.
-    for slot in 0..slots {
+    // Assists per campaign and day, kept for the end of the partition. Every
+    // (campaign, row) pair is written; the write stays only if the count is not zero.
+    let _ = out;
+    work.pending.reserve(slots as usize * rows);
+    let mut length = work.pending.len();
+    let pending = work.pending.as_mut_ptr();
+    for slot in 1..=slots as usize {
+        let bits = std::mem::take(&mut work.masks[slot]);
         let campaign = work.slot_campaign[slot] as usize;
         work.slot_of[campaign] = 0;
-        let days = &mut out.campaign_days[campaign * params.day_count..(campaign + 1) * params.day_count];
-        for word in 0..words {
-            let mut bits = work.masks[slot * words + word];
-            let base = word * 64;
-            while bits != 0 {
-                let row = work.row[base + bits.trailing_zeros() as usize] as usize;
-                // The part of this row's sessions that lies in this word.
-                let from = (work.row_first[row] as usize).max(base) - base;
-                let to = (work.row_first[row + 1] as usize).min(base + 64) - base;
-                let piece = (u64::MAX >> (64 - (to - from))) << from;
-                days[work.row_day[row] as usize][3] += i64::from((bits & piece).count_ones());
-                bits &= !piece;
-            }
+        let base = (campaign * params.day_count) as u64;
+        for row in 0..rows {
+            let assisted = (bits & work.row_bits[row]).count_ones();
+            // SAFETY: at most `slots * rows` entries are written and that many are reserved.
+            unsafe { *pending.add(length) = (base + u64::from(work.row_day[row])) << 32 | u64::from(assisted) };
+            length += usize::from(assisted != 0);
         }
     }
-    work.slot_campaign.clear();
-    work.masks.clear();
+    // SAFETY: every entry below `length` was written above or earlier.
+    unsafe { work.pending.set_len(length) };
+    work.profile.lap(9);
+}
+
+/// Credit and assists of a person with clicks and more than 64 sessions:
+/// several words of session bits per campaign.
+fn attribute_wide(
+    params: &Params,
+    work: &mut Work,
+    out: &mut PassCOut,
+    click_exotic: &[Box<[u8]>],
+    sessions: usize,
+    rows: usize,
+    clicks: &[[u64; 2]],
+) {
+    let words = sessions.div_ceil(64);
+    let most_slots = clicks.len().min(params.campaigns);
+    if work.masks.len() < (most_slots + 1) * words {
+        work.masks.resize((most_slots + 1) * words, 0);
+    }
+    if work.slot_campaign.len() <= most_slots {
+        work.slot_campaign.resize(most_slots + 1, 0);
+    }
+    work.best[..=sessions].fill(0);
+    let limit = build_lookup(&mut work.lookup, &work.start[..sessions]);
+    work.profile.lap(6);
+
+    let mut slots = 0;
+    for (at, click) in clicks.iter().enumerate() {
+        let ts = click[0] as u32;
+        let (from, to) = reach_by_lookup(&work.lookup, limit, ts.saturating_sub(WEEK), ts);
+        offer(&mut work.best, clicks, click_exotic, at, from);
+        let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
+        if from < to {
+            set_bits(&mut work.masks[slot * words..(slot + 1) * words], from, to);
+        }
+    }
+    work.profile.lap(7);
+
+    credit(work, clicks, sessions, params.organic as u32);
+    work.profile.lap(8);
+
+    for slot in 1..=slots as usize {
+        let campaign = work.slot_campaign[slot] as usize;
+        work.slot_of[campaign] = 0;
+        let base = campaign * params.day_count;
+        let bits = &mut work.masks[slot * words..(slot + 1) * words];
+        for row in 0..rows {
+            let assisted = count_bits(bits, work.row_first[row] as usize, work.row_first[row + 1] as usize);
+            if assisted != 0 {
+                work.pending.push(((base + work.row_day[row] as usize) as u64) << 32 | u64::from(assisted));
+            }
+        }
+        bits.fill(0);
+    }
+    let _ = out;
+    work.profile.lap(9);
 }
 
 /// Everything for one person: its rows and its share of the campaign cells.
+/// `events` starts at the person's first event and runs to the end of the
+/// grouped events and their padding; the person has the first `count`.
 #[allow(clippy::too_many_arguments)]
 fn person(
     params: &Params,
@@ -657,29 +1126,36 @@ fn person(
     click_exotic: &[Box<[u8]>],
     name: u64,
     events: &mut [u32],
+    count: usize,
     purchases: &[[u64; 2]],
     clicks: &[[u64; 2]],
 ) {
-    let sessions = if events.len() <= tuning.sort_max {
-        sessions_by_sort(events, work)
+    let sessions = if tuning.network && count <= NETWORK_MAX {
+        sessions_by_network(events, count, work)
+    } else if count <= tuning.sort_max {
+        sessions_by_sort(&mut events[..count], work)
     } else {
-        sessions_by_buckets(events, work)
+        sessions_by_buckets(&events[..count], work)
     };
+    work.start[sessions..sessions + LANES].fill(u32::MAX);
+    work.profile.lap(3);
 
-    // One row per day with a session start.
+    // One row per day with a session start. Every session writes the row it
+    // would start; the write stays only where the day changes.
     let mut rows = 0;
     let mut previous_day = u32::MAX;
     for session in 0..sessions {
         let day = (work.start[session] + params.day_offset) / DAY;
-        if day != previous_day {
-            work.row_first[rows] = session as u32;
-            work.row_day[rows] = day;
-            rows += 1;
-            previous_day = day;
-        }
+        work.row_first[rows] = session as u32;
+        work.row_day[rows] = day;
+        work.row_events[rows] = 0;
+        rows += usize::from(day != previous_day);
+        work.row_events[rows - 1] += i64::from(work.count[session]);
         work.row[session] = (rows - 1) as u8;
+        previous_day = day;
     }
     work.row_first[rows] = sessions as u32;
+    work.profile.lap(4);
 
     let has_purchases = !purchases.is_empty();
     if has_purchases {
@@ -694,19 +1170,35 @@ fn person(
             work.category_sums[work.row[session] as usize * params.categories + (purchase[1] >> 32) as usize] += price;
         }
     }
+    work.profile.lap(5);
 
     let has_clicks = !clicks.is_empty();
     if has_clicks {
-        attribute(params, tuning, work, out, click_exotic, sessions, clicks);
+        if sessions <= 64 {
+            attribute_narrow(params, tuning, work, out, click_exotic, sessions, rows, clicks);
+        } else {
+            attribute_wide(params, work, out, click_exotic, sessions, rows, clicks);
+        }
+        for session in 0..sessions {
+            let day = work.row_day[work.row[session] as usize] as usize;
+            let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
+            cell[0] += 1;
+            if has_purchases {
+                cell[1] += i64::from(work.purchases[session] > 0);
+                cell[2] += work.revenue[session];
+            }
+        }
     }
 
+    out.names.reserve(rows);
+    out.days.reserve(rows);
+    out.sessions.reserve(rows);
+    out.events.reserve(rows);
+    out.revenue.reserve(rows);
+    out.top_category.reserve(rows);
     for row in 0..rows {
         let (from, to) = (work.row_first[row] as usize, work.row_first[row + 1] as usize);
         let day = work.row_day[row] as usize;
-        let mut event_count = 0i64;
-        for session in from..to {
-            event_count += i64::from(work.count[session]);
-        }
         let (mut revenue, mut bought, mut buying_sessions) = (0i64, 0u32, 0i64);
         if has_purchases {
             for session in from..to {
@@ -726,25 +1218,17 @@ fn person(
         out.names.push(name);
         out.days.push((params.first_day + day as i64) as i32);
         out.sessions.push((to - from) as i64);
-        out.events.push(event_count);
+        out.events.push(work.row_events[row]);
         out.revenue.push(revenue);
         out.top_category.push(top);
-        if has_clicks {
-            for session in from..to {
-                let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
-                cell[0] += 1;
-                if has_purchases {
-                    cell[1] += i64::from(work.purchases[session] > 0);
-                    cell[2] += work.revenue[session];
-                }
-            }
-        } else {
+        if !has_clicks {
             let cell = &mut out.campaign_days[params.organic * params.day_count + day];
             cell[0] += (to - from) as i64;
             cell[1] += buying_sessions;
             cell[2] += revenue;
         }
     }
+    work.profile.lap(10);
 }
 
 /// Sessions, attribution and daily rows for one person partition.
@@ -771,15 +1255,25 @@ fn partition_core(
     scratch: &mut ScratchC,
 ) {
     let ScratchC { params, tuning, group, work } = scratch;
+    // The first block of every list, while the table is cleared.
+    for list in event_lists.iter().chain(click_lists) {
+        if let Some(block) = list.blocks().next() {
+            prefetch(block);
+        }
+    }
+    work.profile.start();
     group.begin();
     group.read_events(event_lists);
+    work.profile.lap(0);
     if group.locals.is_empty() {
         return;
     }
     group.read_clicks(click_lists);
+    work.profile.lap(1);
     // Person indexes and slice ends are kept in 31 and 32 bits.
     assert!(group.staged.len() <= INDEX_MASK as usize && group.staged_clicks.len() <= u32::MAX as usize);
     group.scatter();
+    work.profile.lap(2);
 
     let mut starts = [0usize; 3];
     for index in 0..group.locals.len() {
@@ -792,12 +1286,47 @@ fn partition_core(
             out,
             click_exotic,
             name,
-            &mut group.events[starts[0]..ends[0]],
+            &mut group.events[starts[0]..],
+            ends[0] - starts[0],
             &group.purchases[starts[1]..ends[1]],
             &group.clicks[starts[2]..ends[2]],
         );
         starts = ends;
     }
+    apply_assists(&mut work.pending, &mut out.campaign_days);
+    work.profile.lap(9);
+    if !work.reserved {
+        // The first partition with rows tells how many rows a partition
+        // has. Room for half of all partitions' rows is asked for at once:
+        // growing the six columns step by step would copy them again and
+        // again, and memory that is reserved but never written costs nothing.
+        work.reserved = true;
+        let rows = out.names.len() << (super::codes::CODE_BITS - params.person_shift) >> 1;
+        out.names.reserve(rows);
+        out.days.reserve(rows);
+        out.sessions.reserve(rows);
+        out.events.reserve(rows);
+        out.revenue.reserve(rows);
+        out.top_category.reserve(rows);
+    }
+}
+
+/// Adds the pending assists to their cells. The cells are spread over a
+/// table bigger than the nearest caches, so each one is asked for a few
+/// entries before it is needed.
+fn apply_assists(pending: &mut Vec<u64>, cells: &mut [[i64; 4]]) {
+    const AHEAD: usize = 12;
+    for at in 0..pending.len() {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(&later) = pending.get(at + AHEAD) {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: a prefetch reads nothing, whatever the address.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(cells.as_ptr().wrapping_add((later >> 32) as usize) as *const i8) };
+        }
+        let entry = pending[at];
+        cells[(entry >> 32) as usize][3] += (entry & 0xFFFF_FFFF) as i64;
+    }
+    pending.clear();
 }
 
 #[cfg(test)]
@@ -905,11 +1434,11 @@ mod tests {
         campaign_days: Vec<[i64; 4]>,
     }
 
+    const TEST_PERSON_SHIFT: u32 = 32;
+
     /// rules.md read literally for one partition: sort each person's events,
     /// cut sessions at gaps over 30 minutes, and try every click of the
     /// person against every session.
-    const TEST_PERSON_SHIFT: u32 = 32;
-
     fn reference(world: &World, partition: &Partition, tables: &mut Tables) {
         let organic = world.campaigns - 1;
         let click_id = |code: u64| {
@@ -1276,6 +1805,7 @@ mod tests {
                 .collect();
             let want = expected(&world, &partitions);
             let tuning = Tuning {
+                network: rng.one_in(2),
                 sort_max: rng.pick(&[0, 1, 2, 5, 16, 32, 100, 100_000]),
                 lookup_min: rng.pick(&[0, 1, 64, 512, usize::MAX]),
             };
