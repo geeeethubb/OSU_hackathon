@@ -6,7 +6,7 @@
 
 use super::arena::{Arena, PartWriter};
 use super::codes::{id_code, mix};
-use super::keys::{base36_value, Keys};
+use super::keys::{base36_value, Keys, USER_NUMBER};
 use super::{Ctx, EVENT_BLOCK};
 use crate::util::{parse_price, parse_ts, split_fields, LATE_MS, WEEK_MS};
 
@@ -59,7 +59,12 @@ pub struct ParseOut {
     /// Valid clicks in parse order, three words each: user code, click code
     /// and campaign, ts. They live in the arena like the events do, so the
     /// list never reallocates and sits in huge pages where those exist.
+    /// Three words per click: user, click code and campaign, ts. In index
+    /// mode the user word of a generated ID is its user number with
+    /// `keys::USER_NUMBER` set; any other ID keeps its code.
     pub clicks: PartWriter,
+    /// The keys of index mode, for `emit_click`.
+    pub keys: Option<Keys>,
     pub links: Vec<(u64, u64)>,
 }
 
@@ -76,6 +81,7 @@ impl ParseOut {
             indexed: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| index_parts(&keys))],
             odd_event_users: Vec::new(),
             clicks: PartWriter::EMPTY,
+            keys: ctx.keys,
             links: Vec::new(),
         }
     }
@@ -83,10 +89,14 @@ impl ParseOut {
 
 #[inline(always)]
 pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
+    let user = match &out.keys {
+        Some(keys) => keys.user_number_of_code(click.user).map_or(click.user, |number| number | USER_NUMBER),
+        None => click.user,
+    };
     let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
     // SAFETY: `reserve` returned room for three words.
     unsafe {
-        *at = click.user;
+        *at = user;
         *at.add(1) = click.code_and_campaign;
         *at.add(2) = u64::from(click.ts);
     }

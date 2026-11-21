@@ -29,15 +29,22 @@ pub struct PassBOut {
     pub clicks: Vec<PartWriter>,
     /// `mixed code >> person_shift` is a person's partition.
     pub person_shift: u32,
+    /// Words per block of the event and click lists. Index mode sends few
+    /// records this way, spread over all partitions: small blocks then.
+    pub event_block: usize,
+    pub click_block: usize,
 }
 
 impl PassBOut {
     pub fn new(ctx: &Ctx) -> Self {
+        let sparse = ctx.keys.is_some();
         Self {
             arena: Arena::new(),
             events: vec![PartWriter::EMPTY; ctx.person_parts()],
             clicks: vec![PartWriter::EMPTY; ctx.person_parts()],
             person_shift: ctx.person_shift(),
+            event_block: if sparse { 32 } else { PERSON_BLOCK },
+            click_block: if sparse { 32 } else { CLICK_BLOCK },
         }
     }
 }
@@ -173,19 +180,40 @@ pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut
 /// Writes one surviving event to its person's partition.
 #[inline(always)]
 pub fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purchase: u64) {
-    let mixed = mix(links.person(word1 >> 22));
+    forward_named(out, links.person(word1 >> 22), word0, word1 & 1, purchase);
+}
+
+/// Writes one surviving event of the person named `name` (a name code) to
+/// that person's partition. `word0` holds the timestamp as `parse` stores it.
+#[inline(always)]
+pub fn forward_named(out: &mut PassBOut, name: u64, word0: u64, is_purchase: u64, purchase: u64) {
+    let mixed = mix(name);
     let part = (mixed >> out.person_shift) as usize;
-    let is_purchase = word1 & 1;
     // The local key: the low 32 bits hold every bit below the partition's.
     let key = (mixed << 32) | (word0 & (TS_MASK << 1)) | is_purchase;
     // SAFETY: a mixed code has `CODE_BITS` bits, so `part` is below the
     // number of writers; `reserve` returns room for the words written.
     unsafe {
-        let at = out.events.get_unchecked_mut(part).reserve(&mut out.arena, PERSON_BLOCK, 1 + is_purchase as usize);
+        let at = out.events.get_unchecked_mut(part).reserve(&mut out.arena, out.event_block, 1 + is_purchase as usize);
         *at = key;
         if is_purchase == 1 {
             *at.add(1) = purchase;
         }
+    }
+}
+
+/// Writes one click of the person named `name` to that person's partition.
+/// `ts` is in milliseconds since seven days before the window.
+#[inline(always)]
+pub fn forward_click(out: &mut PassBOut, name: u64, ts: u64, code_and_campaign: u64) {
+    let mixed = mix(name);
+    let part = (mixed >> out.person_shift) as usize;
+    // SAFETY: a mixed code has `CODE_BITS` bits, so `part` is below the
+    // number of writers; `reserve` returns room for two words.
+    unsafe {
+        let at = out.clicks.get_unchecked_mut(part).reserve(&mut out.arena, out.click_block, 2);
+        *at = (mixed << 32) | (ts << 1);
+        *at.add(1) = code_and_campaign;
     }
 }
 
@@ -197,15 +225,7 @@ pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
             if let Some(&later) = block.get((index + AHEAD) * RAW_CLICK_WORDS) {
                 links.prefetch(later);
             }
-            let mixed = mix(links.person(click[0]));
-            let part = (mixed >> out.person_shift) as usize;
-            // SAFETY: a mixed code has `CODE_BITS` bits, so `part` is below the
-            // number of writers; `reserve` returns room for two words.
-            unsafe {
-                let at = out.clicks.get_unchecked_mut(part).reserve(&mut out.arena, CLICK_BLOCK, 2);
-                *at = (mixed << 32) | (click[2] << 1);
-                *at.add(1) = click[1];
-            }
+            forward_click(out, links.person(click[0]), click[2], click[1]);
         }
     }
 }
