@@ -413,8 +413,8 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        event_lean_back, event_lean_front, event_lean_front_plain, event_lean_masks, lean_setup, LeanFront,
-        LeanSink, LeanTables, LEAN_PAD, ROW_DECLINE,
+        event_lean_back, event_lean_front, event_lean_front_plain, event_lean_masks, event_lean_step,
+        event_lean_store, lean_setup, LeanFrame, LeanFront, LeanSink, LeanTables, LEAN_PAD, ROW_DECLINE,
     };
     /// A row's first half, in assembly or as the compiler makes it.
     #[inline(always)]
@@ -453,17 +453,17 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
     // Two records, each row's first half in turn in one and in the other.
     // Their address goes through `black_box` so that they stay in memory:
     // the second half then takes its operands from there.
-    let mut records = [std::mem::MaybeUninit::<LeanFront>::uninit(); 2];
-    let record_a = std::hint::black_box(records.as_mut_ptr() as *mut LeanFront);
-    let record_b = record_a.wrapping_add(1);
+    let mut frame = LeanFrame::new(ctx);
+    let frame = std::hint::black_box(&mut frame as *mut LeanFrame);
+    let records = frame as *mut LeanFront;
     if MODE == 3 {
         // Diagnostic: first halves only.
         while position < stop {
             // SAFETY: as below.
             unsafe {
-                first_half::<INDEXED, PLAIN>(lean, base.add(position), record_a);
-                row.event ^= (*record_a).fold();
-                position += (*record_a).guess + 1;
+                first_half::<INDEXED, PLAIN>(lean, base.add(position), records);
+                row.event ^= (*records).fold();
+                position += (*records).guess + 1;
             }
         }
         std::hint::black_box(row.event);
@@ -473,19 +473,39 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
         // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
         // readable bytes after it and `position >= 8` eight before it; a
         // first half reads from 8 bytes before to 132 bytes after where it
-        // is run, which is `position` or at most 97 bytes past it.
-        // The sink is made anew after every use of `out`.
+        // is run, which is `position` or at most 97 bytes past it. The
+        // record of the row at `position` is the one the step reads. The
+        // sink is made anew after every use of `out`.
         let sink = LeanSink::new::<INDEXED>(out);
-        unsafe { first_half::<INDEXED, PLAIN>(lean, base.add(position), record_a) };
+        unsafe { first_half::<INDEXED, PLAIN>(lean, base.add(position), records) };
         loop {
-            // One row with its record in `$current`, the next row's in `$next`.
+            // One row with its record in place `$current`; the next row's
+            // first half goes to the other place.
             macro_rules! row {
-                ($current:expr, $next:expr) => {{
-                    let p = unsafe { base.add(position) };
-                    let guess = unsafe { (*$current).guess };
-                    let (length, status) = unsafe {
-                        first_half::<INDEXED, PLAIN>(lean, p.add(guess + 1), $next);
-                        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, $current, &sink, &mut row)
+                ($current:literal) => {{
+                    let (length, guess, status) = unsafe {
+                        let p = base.add(position);
+                        let current = records.add($current);
+                        let guess = (*current).guess;
+                        let common = if PLAIN {
+                            first_half::<INDEXED, true>(lean, p.add(guess + 1), records.add(1 - $current));
+                            None
+                        } else {
+                            // The next row's first half and, for the common
+                            // kind of row, this row's second half.
+                            let step = event_lean_step::<INDEXED, $current>(lean, p.add(guess + 1), frame);
+                            (step.rare == 0).then_some(step)
+                        };
+                        match common {
+                            Some(step) => {
+                                (guess, guess, event_lean_store::<MODE, INDEXED>(ctx, current, &step, &sink, &mut row))
+                            }
+                            None => {
+                                let (length, status) =
+                                    event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, current, &sink, &mut row);
+                                (length, guess, status)
+                            }
+                        }
                     };
                     if status == ROW_DECLINE {
                         position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
@@ -501,8 +521,8 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
                     }
                 }};
             }
-            row!(record_a, record_b);
-            row!(record_b, record_a);
+            row!(0);
+            row!(1);
         }
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
