@@ -253,6 +253,24 @@ pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
     let &(anchor, _) = samples.iter().min_by_key(|&&(_, user)| user_index(user))?;
     let events: Vec<u64> = samples.iter().map(|&(event, _)| event).collect();
     let event_key = first_key(anchor, &events, index_bound, MULTIPLIER_A & MASK, |index| index < index_bound)?;
+
+    // Index mode needs more than the keys: event indexes must be handed out
+    // user by user, so along the index order the user index never decreases.
+    // The engine checks that on every surviving event later and starts over
+    // if it fails; looking at the samples first means data that is laid out
+    // differently never gets that far. A few samples may break the order
+    // without harm (a late copy of an event can name another user and then
+    // loses the dedup), data without the layout breaks it at every other
+    // step: one in fifty is the line between the two.
+    let mut layout: Vec<(u64, u64)> = samples
+        .iter()
+        .map(|&(event, user)| ((event ^ event_key).wrapping_mul(INVERSE_A) & MASK, user_index(user)))
+        .collect();
+    layout.sort_unstable();
+    let backward = layout.windows(2).filter(|pair| pair[1].1 < pair[0].1).count();
+    if backward * 50 > layout.len() {
+        return None;
+    }
     Some(Keys { event_key, user_key, index_bound, user_bound })
 }
 
@@ -310,8 +328,9 @@ mod tests {
             out
         };
         for row in 0..40u64 {
-            let index = row * 7919 % 50_000;
-            let user = (row * 131 % 1_500) * 512 + if row % 3 == 0 { row % 5 } else { 0 };
+            let user_index = row * 131 % 1_500;
+            let index = user_index * 30 + row % 7;
+            let user = user_index * 512 + if row % 3 == 0 { row % 5 } else { 0 };
             text.extend_from_slice(b"e");
             text.extend_from_slice(&base36(scramble(index, event_key)));
             text.extend_from_slice(b",u");
@@ -321,6 +340,20 @@ mod tests {
         let keys = recover(&text, 4_000_000).unwrap();
         assert_eq!(keys.event_key, event_key);
         assert_eq!(keys.user_key, user_key);
+        // The same IDs with event indexes that do not follow the users: no index mode.
+        let mut shuffled = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+".to_vec();
+        for row in 0..40u64 {
+            let user_index = row * 131 % 1_500;
+            let index = row * 7919 % 50_000;
+            shuffled.extend_from_slice(b"e");
+            shuffled.extend_from_slice(&base36(scramble(index, event_key)));
+            shuffled.extend_from_slice(b",u");
+            shuffled.extend_from_slice(&base36(scramble(user_index * 512, user_key)));
+            shuffled.extend_from_slice(b",1,2026-10-03T23:58:10Z,view,p1,
+");
+        }
+        assert!(recover(&shuffled, 4_000_000).is_none());
         // IDs that do not come from one scramble have no key.
         let mut noise = b"h\n".to_vec();
         for row in 0..40u64 {
