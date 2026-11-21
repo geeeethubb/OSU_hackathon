@@ -249,3 +249,19 @@ official_receipt_and_score: not yet submitted
   index-mode event kernel within 1 ns per row of the general one (parser agent); P3, a session kernel
   entry for events that are already in time order (sessions agent, verified at 233 -> 191 ns per person);
   partition sizes 2^13 and 2^15 as same-image variants (runs on branches exp-shift-13 and exp-shift-15).
+
+### 19:41 UTC
+
+- **Official:** the team's submission watch reports a new best of **0.66 s** (index mode as the default;
+  commit as submitted from this PR's pointer, `4567e953`). Next submission possible in about one hour.
+- **Confirmations of `4567e953` since the last entry:** runs 44940838388 and 44940841473 measured the same
+  default path (plus a neutral parameter) against `2b2cccd1`: 63.9 / 62.0 / 58.8 ms and 48.8 / 55.0 / 59.1 ms
+  faster, 36/36 pairs. Partition size: 2^13 is 6 to 12 ms slower than 2^14 (3/18 pairs), 2^15 is 3 to 6 ms
+  faster (12/18 pairs).
+- **In CI now (this commit), candidate A for the next submission, paired against `4567e953`:** index
+  partitions of 2^15 events (variant: 2^14), compact link lookup table (links agent, `e33be28`), the
+  sessions agent's `3a44f65` and `be4f180`, startup with the inputs mapped while the lookup tables load
+  (laptop 14-18 -> 11-12.5 ms). Laptop checks with SS_VERIFY=1: 42 unit tests, 36/36, 43/43, dev and 20M
+  seeds 2 and 3 MATCH; SS_STRUCT=0: 36/36, 43/43, dev and seed 2 MATCH; 24 small generated datasets MATCH.
+- **Expected by 20:05 UTC from the agents, for candidate B:** index-mode click path without the
+  code-to-number round trip, a faster index-mode event kernel, a session kernel entry for events in time order.
