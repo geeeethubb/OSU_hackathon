@@ -101,10 +101,29 @@ fn clear_outputs(output: &Path) {
     }
 }
 
+/// Removes the `*.parquet` files already in the two table folders. Every
+/// Parquet file in a table's folder counts as part of the table, and the
+/// engine's file names differ from run to run (one file per worker that had
+/// rows), so a file left by an earlier run into the same folder would be read
+/// as rows of this one. A folder that does not exist costs one failed call.
+fn remove_earlier_tables(output: &Path) {
+    for table in ["user_daily", "campaign_daily"] {
+        if let Ok(entries) = std::fs::read_dir(output.join(table)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|extension| extension == "parquet") {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     ss::reference::open_umask();
     let (data, output) = ss::reference::directories_from_environment();
     let threads = ss::reference::thread_count();
+    remove_earlier_tables(&output);
     let use_reference = std::env::var_os("SS_ENGINE").is_some_and(|engine| engine == "reference");
     let fast = if use_reference { Ok(false) } else { ss::fast::run(&data, &output, threads) };
     let result = match fast {
