@@ -6,7 +6,7 @@
 //! one memory access, and the lines that the pairs coming up will need are
 //! prefetched while the current pair is joined.
 //!
-//! The lookup table (`LinkTable`) is written from the forest in one pass, in
+//! The lookup table (`Table`) is written from the forest in one pass, in
 //! the order of the IDs' hashes: a bitmap that says which IDs have an entry,
 //! and the entries packed with no gaps. It is about a quarter of the size of
 //! a hash table of the same IDs, and most IDs that have no entry never get
@@ -15,12 +15,23 @@
 //! A build can also be given a grouping of the IDs (`build_grouped`). A link
 //! component is then simple when all its members are in one group and complex
 //! otherwise, and `LinkTable::lookup` reports which with the name.
+//!
+//! Index mode (`build_indexed`) groups the IDs by their user index, and
+//! there nearly every line links two IDs of one user. Such lines need no
+//! table at all: the lines of a user are a handful, a union-find over the
+//! user's aliases settles them, and the user's summary entry (the name and
+//! the aliases of its one component) answers every lookup for its IDs. The
+//! users are done in shards of 4096 on as many threads as the caller gives.
+//! Only the lines that leave a user, and all lines of the users they touch
+//! or whose links one entry cannot describe, go through a forest and into a
+//! table, which is small.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
 use super::codes::{id_cmp, mix, unmix, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE};
+use super::keys::Keys;
 use crate::reference::FastHasher;
 
 /// Set in a name on its way into the table when the component is complex.
@@ -49,7 +60,7 @@ const MAX_DISPLACEMENT_BITS: u32 = 4;
 /// answered by one bit of a small bitmap, and an entry costs 8 bytes with no
 /// empty slots between. An entry sits at its home position or just after it,
 /// and says how far; the position and the hash bits it keeps identify its ID.
-pub struct LinkTable {
+struct Table {
     bits: Vec<u64>,
     /// For every 256 positions: the entries before them (from bit 24 up),
     /// and the entries of the block before its words 1, 2 and 3 (8 bits each).
@@ -68,7 +79,7 @@ pub struct LinkTable {
     simple_names: Vec<u64>,
 }
 
-impl LinkTable {
+impl Table {
     /// Starts loading what `lookup(user)` will read, so that a lookup a few
     /// records later finds it in the cache. Changes no result.
     ///
@@ -77,7 +88,7 @@ impl LinkTable {
     /// entry when there is one. It takes no branch on the bit, which is as
     /// good as random.
     #[inline(always)]
-    pub fn prefetch(&self, user: u64) {
+    fn prefetch(&self, user: u64) {
         let home = (mix(user) >> self.rem_bits) as usize;
         // SAFETY: `bits` has a word for every home position.
         let word = unsafe { *self.bits.get_unchecked(home >> 6) };
@@ -88,8 +99,8 @@ impl LinkTable {
     }
 
     /// The name code of the person `user` belongs to. Codes are never 0.
-    #[inline]
-    pub fn person(&self, user: u64) -> u64 {
+    #[cfg(test)]
+    fn person(&self, user: u64) -> u64 {
         self.lookup(user).0
     }
 
@@ -97,7 +108,7 @@ impl LinkTable {
     /// person's link component is complex. An ID that is in no link line
     /// names itself and is simple.
     #[inline(always)]
-    pub fn lookup(&self, user: u64) -> (u64, bool) {
+    fn lookup(&self, user: u64) -> (u64, bool) {
         // The same hash as the forest's, so the forest's order is the table's.
         let hash = mix(user);
         let home = (hash >> self.rem_bits) as usize;
@@ -149,7 +160,7 @@ impl LinkTable {
 
     /// The codes of all members of complex components, in no particular
     /// order, each once. Empty after a plain `build`.
-    pub fn complex_members(&self) -> &[u64] {
+    fn complex_members(&self) -> &[u64] {
         &self.complex
     }
 
@@ -159,7 +170,7 @@ impl LinkTable {
     /// `lookup` can return anything but `(itself, false)`, and the names of
     /// their components. An ID that is alone in a simple component (linked
     /// only to itself, and in a group) is not visited. In no particular order.
-    pub fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
+    fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
         let rem_mask = (1u64 << self.rem_bits) - 1;
         let mut rank = 0;
         for (index, &word) in self.bits.iter().enumerate() {
@@ -186,9 +197,164 @@ impl LinkTable {
     }
 }
 
-/// Fills a `LinkTable` from entries that come in the order of their hashes.
+/// Bits of a user number below the user index: which of the user's IDs it is.
+const ALIAS_BITS: u32 = 9;
+const ALIAS_MASK: u64 = (1 << ALIAS_BITS) - 1;
+/// User indexes per shard of an index-mode build, as a shift: the lines and
+/// the entries of a shard stay in the second-level cache.
+const SHARD_BITS: u32 = 12;
+const SHARD_USERS: usize = 1 << SHARD_BITS;
+/// Set in a user's summary: the user has one link component of two or more
+/// IDs, all of its own, named by the code in the low bits, and word 1 has a
+/// bit for the alias of each of its members.
+pub const SIMPLE: u64 = 1 << 63;
+/// A user's summary when its two words cannot describe the user's IDs: one
+/// of them is in a complex component, they are in two components, or a
+/// linked one has an alias of 64 or more. Each ID is then looked up.
+pub const SLOW: u64 = 1 << 62;
+
+/// What the links say, to look up: the person of an ID (`lookup`, `person`),
+/// and in index mode the summary of a user index (`summary`).
+///
+/// After `build` and `build_grouped` this is one table of all linked IDs.
+/// After `build_indexed` the summaries answer for the IDs of every user they
+/// can describe, and the table holds the rest: the IDs of the users whose
+/// summary is `SLOW`, and the linked IDs that are no user's.
+pub struct LinkTable {
+    table: Table,
+    indexed: Option<Indexed>,
+}
+
+/// The summaries of an index-mode build.
+struct Indexed {
+    keys: Keys,
+    /// The entries of every `SHARD_USERS` user indexes; no entries for a
+    /// shard none of whose users has links.
+    shards: Vec<Vec<[u64; 2]>>,
+}
+
+impl Indexed {
+    /// The summary of a user index below the keys' bound.
+    #[inline(always)]
+    fn entry(&self, user: u64) -> [u64; 2] {
+        match self.shards.get((user >> SHARD_BITS) as usize) {
+            Some(shard) => shard.get(user as usize & (SHARD_USERS - 1)).copied().unwrap_or([0, 0]),
+            None => [0, 0],
+        }
+    }
+
+    /// The answer of `lookup` when the summaries have it: for an ID of a
+    /// user whose entry is not `SLOW`.
+    #[inline(always)]
+    fn lookup(&self, code: u64) -> Option<(u64, bool)> {
+        let number = self.keys.user_number_of_code(code)?;
+        let [head, mask] = self.entry(number >> ALIAS_BITS);
+        if head & SLOW != 0 {
+            return None;
+        }
+        // In the user's one component, or linked to no other ID.
+        let alias = number & ALIAS_MASK;
+        let linked = head & SIMPLE != 0 && alias < 64 && (mask >> alias) & 1 != 0;
+        Some((if linked { head & CODE_MASK } else { code }, false))
+    }
+}
+
+impl LinkTable {
+    /// Starts loading what `lookup(user)` will read, so that a lookup a few
+    /// records later finds it in the cache. Changes no result.
+    #[inline(always)]
+    pub fn prefetch(&self, user: u64) {
+        let Some(indexed) = &self.indexed else {
+            return self.table.prefetch(user);
+        };
+        match indexed.keys.user_number_of_code(user) {
+            Some(number) => {
+                let user = number >> ALIAS_BITS;
+                match indexed.shards.get((user >> SHARD_BITS) as usize) {
+                    Some(shard) if !shard.is_empty() => {
+                        prefetch_line(shard.as_ptr().wrapping_add(user as usize & (SHARD_USERS - 1)));
+                    }
+                    _ => {}
+                }
+            }
+            None => self.table.prefetch(user),
+        }
+    }
+
+    /// The name code of the person `user` belongs to. Codes are never 0.
+    #[inline]
+    pub fn person(&self, user: u64) -> u64 {
+        self.lookup(user).0
+    }
+
+    /// The name code of the person `user` belongs to, and whether that
+    /// person's link component is complex. An ID that is in no link line
+    /// names itself and is simple.
+    #[inline(always)]
+    pub fn lookup(&self, user: u64) -> (u64, bool) {
+        if let Some(indexed) = &self.indexed {
+            if let Some(answer) = indexed.lookup(user) {
+                return answer;
+            }
+        }
+        self.table.lookup(user)
+    }
+
+    /// The codes of all members of complex components, in no particular
+    /// order, each once. Empty after a plain `build`.
+    pub fn complex_members(&self) -> &[u64] {
+        self.table.complex_members()
+    }
+
+    /// Calls `visit(member code, name code, complex)` once for every ID of
+    /// every link component that has two or more IDs or is complex, the ID
+    /// that names the component included. These are all the IDs for which
+    /// `lookup` can return anything but `(itself, false)`, and the names of
+    /// their components. An ID that is alone in a simple component (linked
+    /// only to itself, and in a group) is not visited. In no particular order.
+    ///
+    /// After `build_indexed` this is slow: an ID that only a summary knows
+    /// has to be worked out from its user index and alias.
+    pub fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
+        self.table.for_each_member(&mut visit);
+        let Some(indexed) = &self.indexed else {
+            return;
+        };
+        for (shard, entries) in indexed.shards.iter().enumerate() {
+            for (local, &[head, mask]) in entries.iter().enumerate() {
+                if head & SIMPLE == 0 {
+                    continue;
+                }
+                let user = (shard << SHARD_BITS | local) as u64;
+                let mut left = mask;
+                while left != 0 {
+                    let alias = u64::from(left.trailing_zeros());
+                    left &= left - 1;
+                    visit(indexed.keys.code_of_user_number(user << ALIAS_BITS | alias), head & CODE_MASK, false);
+                }
+            }
+        }
+    }
+
+    /// Index mode: what the links say about the IDs of user index `user`.
+    /// `[name code | SIMPLE, alias mask]` when the user has one link
+    /// component of two or more IDs, all the user's own and of aliases below
+    /// 64: the name of that component and a bit for the alias of each
+    /// member. `[0, 0]` when none of the user's IDs is in a component of two
+    /// or more. `[SLOW, 0]` for every other user, for a user index that is
+    /// out of range, and for every user after a build that is not indexed.
+    #[inline(always)]
+    pub fn summary(&self, user: u64) -> [u64; 2] {
+        match &self.indexed {
+            Some(indexed) if user < indexed.keys.user_bound => indexed.entry(user),
+            _ => [SLOW, 0],
+        }
+    }
+}
+
+/// Fills a `Table` from entries that come in the order of their hashes.
 struct TableWriter {
-    table: LinkTable,
+    table: Table,
     /// The first position after the last entry.
     next_free: usize,
 }
@@ -206,7 +372,7 @@ impl TableWriter {
         // A word of padding for the positions that entries of the last home
         // positions are displaced to, and one more so that the last block is whole.
         let words = (1usize << position_bits) / 64 + 4;
-        let table = LinkTable {
+        let table = Table {
             bits: vec![0; words],
             blocks: vec![0; words / 4],
             entries: Vec::with_capacity(entries),
@@ -241,7 +407,7 @@ impl TableWriter {
         self.next_free = at + 1;
     }
 
-    fn finish(self) -> LinkTable {
+    fn finish(self) -> Table {
         let mut table = self.table;
         let mut before = 0u64;
         for (block, packed) in table.blocks.iter_mut().enumerate() {
@@ -545,7 +711,27 @@ pub fn build_grouped(
     users: &Interner,
     group: &impl Fn(u64) -> Option<u64>,
 ) -> LinkTable {
-    build_within(pairs, users, group, Limits::NORMAL)
+    LinkTable { table: build_within(pairs, users, group, Limits::NORMAL), indexed: None }
+}
+
+/// The build of index mode. The generated IDs are grouped by their user
+/// index (`keys.user_number_of_code(code) >> 9`), every other ID is in no
+/// group, and beside names and flags the result has the `summary` of every
+/// user index. `helpers` is how many threads to use beside the caller's.
+///
+/// A line between two IDs of one user is INSIDE that user; any other line
+/// makes its component complex, and the users at its ends are TOUCHED. An
+/// untouched user's IDs are in no line but its own inside lines, so its
+/// components are found from those alone, per user and in parallel; when
+/// they are one component with aliases below 64, the summary entry says all
+/// there is to say about the user. Every other user (touched, or with links
+/// one entry cannot describe) is handed over whole: all its lines go, with
+/// the lines that are not inside a user, through the build that
+/// `build_grouped` does, into the one table. A component that touches such a
+/// user has all its lines there, since a line inside another user cannot
+/// reach it.
+pub fn build_indexed(pairs: &[Vec<(u64, u64)>], users: &Interner, keys: &Keys, helpers: usize) -> LinkTable {
+    build_indexed_within(pairs, users, keys, helpers, Limits::NORMAL)
 }
 
 /// What a build may use, so that the tests can reach every path.
@@ -566,7 +752,7 @@ fn build_within(
     users: &Interner,
     group: &impl Fn(u64) -> Option<u64>,
     limits: Limits,
-) -> LinkTable {
+) -> Table {
     let pair_count: usize = pairs.iter().map(Vec::len).sum();
     // Exotic IDs (upper case and the like) sort by their bytes, not their code.
     let exotic = users.snapshot();
@@ -595,7 +781,7 @@ fn build_in_forest(
     exotic: &[Box<[u8]>],
     group: &impl Fn(u64) -> Option<u64>,
     line_bits: u32,
-) -> Option<LinkTable> {
+) -> Option<Table> {
     let mut forest = Forest::new(line_bits, exotic);
     let mut located = [(0u32, 0u32); JOIN_DELAY];
     for list in pairs {
@@ -698,6 +884,273 @@ fn build_in_forest(
     Some(table)
 }
 
+/// Pairs per task when the lines are sorted into inside and across.
+const SORT_CHUNK: usize = 1 << 13;
+/// A user index must fit the 32 bits a touched user is noted in.
+const MAX_USER_BOUND: u64 = 1 << 32;
+/// A line inside a user, as two words: the code of each ID with its alias
+/// above (from `CODE_BITS`), and in the first word, above the alias, the
+/// user index within its shard.
+const LINE_LOCAL_SHIFT: u32 = CODE_BITS + ALIAS_BITS;
+
+/// What one thread makes of its share of the lines.
+struct Sorted {
+    /// The lines inside a user, by the shard of the user.
+    shards: Vec<Vec<[u64; 2]>>,
+    /// The lines that are not inside a user.
+    across: Vec<(u64, u64)>,
+    /// The users at the ends of those lines.
+    touched: Vec<u32>,
+}
+
+/// What one thread makes of its share of the shards.
+#[derive(Default)]
+struct Summarized {
+    /// The summary entries of each shard it did.
+    shards: Vec<(usize, Vec<[u64; 2]>)>,
+    /// The lines of the users that are handed over to the table.
+    handed_over: Vec<(u64, u64)>,
+}
+
+/// Runs `work` on up to `helpers` new threads and on this one, and returns
+/// what each returned. `work` shares out the tasks itself, so a thread the
+/// system does not give only leaves more for the others.
+fn on_threads<T: Send>(helpers: usize, work: impl Fn() -> T + Sync) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let threads: Vec<_> =
+            (0..helpers).filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, &work).ok()).collect();
+        let mut results = vec![work()];
+        results.extend(threads.into_iter().map(|thread| thread.join().expect("a link build thread")));
+        results
+    })
+}
+
+fn build_indexed_within(
+    pairs: &[Vec<(u64, u64)>],
+    users: &Interner,
+    keys: &Keys,
+    helpers: usize,
+    limits: Limits,
+) -> LinkTable {
+    let user_of = |code: u64| keys.user_index_of_code(code);
+    if keys.user_bound > MAX_USER_BOUND {
+        // More users than a line's words can say: every user is looked up.
+        return LinkTable { table: build_within(pairs, users, &user_of, limits), indexed: None };
+    }
+    let shard_count = (keys.user_bound >> SHARD_BITS) as usize + 1;
+
+    // Every line is inside a user or not; the lines inside go to the user's shard.
+    let tasks: Vec<(usize, usize)> = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(list, lines)| (0..lines.len()).step_by(SORT_CHUNK).map(move |start| (list, start)))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let sorted = on_threads(helpers, || {
+        let mut sorted = Sorted { shards: vec![Vec::new(); shard_count], across: Vec::new(), touched: Vec::new() };
+        while let Some(&(list, start)) = tasks.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            let lines = &pairs[list];
+            for &(code_a, code_b) in &lines[start..(start + SORT_CHUNK).min(lines.len())] {
+                let one = keys.user_number_of_code(code_a);
+                if code_a == code_b {
+                    // An ID linked to itself: nothing, unless it is no user's
+                    // ID, which is then a complex component of one.
+                    if one.is_none() {
+                        sorted.across.push((code_a, code_b));
+                    }
+                    continue;
+                }
+                let other = keys.user_number_of_code(code_b);
+                match (one, other) {
+                    (Some(one), Some(other)) if one >> ALIAS_BITS == other >> ALIAS_BITS => {
+                        let user = one >> ALIAS_BITS;
+                        let local = user & (SHARD_USERS as u64 - 1);
+                        sorted.shards[(user >> SHARD_BITS) as usize].push([
+                            code_a | (one & ALIAS_MASK) << CODE_BITS | local << LINE_LOCAL_SHIFT,
+                            code_b | (other & ALIAS_MASK) << CODE_BITS,
+                        ]);
+                    }
+                    _ => {
+                        sorted.across.push((code_a, code_b));
+                        for number in [one, other].into_iter().flatten() {
+                            sorted.touched.push((number >> ALIAS_BITS) as u32);
+                        }
+                    }
+                }
+            }
+        }
+        sorted
+    });
+
+    let mut touched = vec![0u64; (keys.user_bound >> 6) as usize + 1];
+    for &user in sorted.iter().flat_map(|sorted| &sorted.touched) {
+        touched[(user >> 6) as usize] |= 1 << (user & 63);
+    }
+
+    // The shards with lines, each done by one thread.
+    let busy: Vec<usize> =
+        (0..shard_count).filter(|&shard| sorted.iter().any(|sorted| !sorted.shards[shard].is_empty())).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let summarized = on_threads(helpers, || {
+        let mut scratch = ShardScratch::new();
+        let mut done = Summarized::default();
+        while let Some(&shard) = busy.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            let entries = scratch.summarize(shard, &sorted, &touched, &mut done.handed_over);
+            done.shards.push((shard, entries));
+        }
+        done
+    });
+
+    let mut shards: Vec<Vec<[u64; 2]>> = vec![Vec::new(); shard_count];
+    let mut rest: Vec<(u64, u64)> = Vec::new();
+    for done in summarized {
+        for (shard, entries) in done.shards {
+            shards[shard] = entries;
+        }
+        rest.extend(done.handed_over);
+    }
+    for sorted in &sorted {
+        rest.extend(&sorted.across);
+        // A touched user has an ID in a complex component.
+        for &user in &sorted.touched {
+            let shard = &mut shards[(user >> SHARD_BITS) as usize];
+            if shard.is_empty() {
+                *shard = vec![[0, 0]; SHARD_USERS];
+            }
+            shard[user as usize & (SHARD_USERS - 1)] = [SLOW, 0];
+        }
+    }
+    // The threads share out the work as it comes: sorted, the table does
+    // not depend on which did what.
+    rest.sort_unstable();
+    let table = build_within(&[rest], users, &user_of, limits);
+    LinkTable { table, indexed: Some(Indexed { keys: *keys, shards }) }
+}
+
+/// What a thread keeps from shard to shard.
+struct ShardScratch {
+    /// Where the lines of each user of the shard end in `lines`.
+    ends: Vec<u32>,
+    /// The lines of the shard, grouped by user.
+    lines: Vec<[u64; 2]>,
+    /// Union-find over the aliases of one user: the parent of each alias
+    /// that `stamp` says belongs to the user at hand.
+    parent: [u16; 1 << ALIAS_BITS],
+    stamp: [u32; 1 << ALIAS_BITS],
+    user_stamp: u32,
+}
+
+impl ShardScratch {
+    fn new() -> Self {
+        Self {
+            ends: vec![0; SHARD_USERS],
+            lines: Vec::new(),
+            parent: [0; 1 << ALIAS_BITS],
+            stamp: [0; 1 << ALIAS_BITS],
+            user_stamp: 0,
+        }
+    }
+
+    /// The summary entries of the users of `shard`. The lines of the users
+    /// that are touched, or whose links one entry cannot describe, are added
+    /// to `handed_over`.
+    fn summarize(
+        &mut self,
+        shard: usize,
+        sorted: &[Sorted],
+        touched: &[u64],
+        handed_over: &mut Vec<(u64, u64)>,
+    ) -> Vec<[u64; 2]> {
+        // Group the lines by user: count, then place.
+        let local_of = |line: &[u64; 2]| (line[0] >> LINE_LOCAL_SHIFT) as usize & (SHARD_USERS - 1);
+        self.ends.fill(0);
+        let mut count = 0;
+        for line in sorted.iter().flat_map(|sorted| &sorted.shards[shard]) {
+            self.ends[local_of(line)] += 1;
+            count += 1;
+        }
+        let mut before = 0;
+        for end in self.ends.iter_mut() {
+            (*end, before) = (before, before + *end);
+        }
+        self.lines.clear();
+        self.lines.resize(count, [0, 0]);
+        for line in sorted.iter().flat_map(|sorted| &sorted.shards[shard]) {
+            let at = &mut self.ends[local_of(line)];
+            self.lines[*at as usize] = *line;
+            *at += 1;
+        }
+
+        let mut entries = vec![[0u64; 2]; SHARD_USERS];
+        let mut start = 0;
+        for local in 0..SHARD_USERS {
+            let end = self.ends[local] as usize;
+            if start == end {
+                continue;
+            }
+            let user = shard << SHARD_BITS | local;
+            let is_touched = (touched[user >> 6] >> (user & 63)) & 1 != 0;
+            let one_component = if is_touched { None } else { self.one_component(start, end) };
+            match one_component {
+                Some((name, mask)) => entries[local] = [name | SIMPLE, mask],
+                None => {
+                    entries[local] = [SLOW, 0];
+                    let lines = self.lines[start..end].iter();
+                    handed_over.extend(lines.map(|line| (line[0] & CODE_MASK, line[1] & CODE_MASK)));
+                }
+            }
+            start = end;
+        }
+        entries
+    }
+
+    /// If the lines `start..end`, all inside one user, make one component of
+    /// IDs with aliases below 64: the smallest of its codes and the mask of
+    /// its aliases.
+    fn one_component(&mut self, start: usize, end: usize) -> Option<(u64, u64)> {
+        self.user_stamp = self.user_stamp.wrapping_add(1);
+        if self.user_stamp == 0 {
+            // Stamps of four billion users ago could pass for this user's.
+            self.stamp.fill(0);
+            self.user_stamp = 1;
+        }
+        let (mut ids, mut joins, mut smallest, mut mask, mut wide) = (0, 0, u64::MAX, 0u64, false);
+        for at in start..end {
+            let mut roots = [0usize; 2];
+            for side in 0..2 {
+                let word = self.lines[at][side];
+                let alias = (word >> CODE_BITS & ALIAS_MASK) as usize;
+                if self.stamp[alias] != self.user_stamp {
+                    self.stamp[alias] = self.user_stamp;
+                    self.parent[alias] = alias as u16;
+                    ids += 1;
+                    // Generated IDs have pattern codes, which order like the IDs.
+                    smallest = smallest.min(word & CODE_MASK);
+                    if alias < 64 {
+                        mask |= 1 << alias;
+                    } else {
+                        wide = true;
+                    }
+                }
+                let mut root = alias;
+                while self.parent[root] as usize != root {
+                    let above = self.parent[root] as usize;
+                    self.parent[root] = self.parent[above];
+                    root = above;
+                }
+                roots[side] = root;
+            }
+            if roots[0] != roots[1] {
+                self.parent[roots[0].max(roots[1])] = roots[0].min(roots[1]) as u16;
+                joins += 1;
+            }
+        }
+        // Every ID starts as a tree of its own and each join makes one tree
+        // of two: one component when the joins are one fewer than the IDs.
+        (!wide && joins + 1 == ids).then_some((smallest, mask))
+    }
+}
+
 fn find(parent: &mut [u32], mut at: u32) -> u32 {
     while parent[at as usize] != at {
         let grandparent = parent[parent[at as usize] as usize];
@@ -713,7 +1166,7 @@ fn build_general(
     pairs: &[Vec<(u64, u64)>],
     exotic: &[Box<[u8]>],
     group: &impl Fn(u64) -> Option<u64>,
-) -> LinkTable {
+) -> Table {
     let pair_count: usize = pairs.iter().map(Vec::len).sum();
     let mut index: HashMap<u64, u32, BuildHasherDefault<FastHasher>> =
         HashMap::with_capacity_and_hasher(pair_count * 2, BuildHasherDefault::default());
@@ -980,7 +1433,7 @@ mod tests {
                 .map(|(id, name)| (code(id), (code(name), with_groups && complex.contains(id))))
                 .collect()
         };
-        let visited = |table: &LinkTable, path: &str| -> HashMap<u64, (u64, bool)> {
+        let visited = |table: &Table, path: &str| -> HashMap<u64, (u64, bool)> {
             let mut seen = HashMap::new();
             table.for_each_member(|member, name, flag| {
                 assert!(seen.insert(member, (name, flag)).is_none(), "{path}: an ID visited twice");
@@ -1009,7 +1462,7 @@ mod tests {
             assert_eq!(table.lookup(code(id)), (code(name), false));
         }
         assert!(table.complex_members().is_empty());
-        assert_eq!(visited(&table, "plain build"), members(false), "plain build: for_each_member");
+        assert_eq!(visited(&table.table, "plain build"), members(false), "plain build: for_each_member");
     }
 
     #[test]
@@ -1118,6 +1571,233 @@ mod tests {
             assert_eq!(visited, expected_visits, "{path}");
         }
         check(&mut Random(7), &pairs, &groups);
+    }
+
+    /// Keys like the generator's, for user indexes below `user_bound`.
+    fn test_keys(random: &mut Random, user_bound: u64) -> Keys {
+        let key = random.next() & crate::fast::keys::MASK;
+        Keys { event_key: 1, user_key: key, index_bound: 1 << 20, user_bound, index_shift: 14 }
+    }
+
+    /// The summary of every user index below the keys' bound, read off a
+    /// table one member at a time, as index mode first did it. An entry
+    /// with `SLOW` says nothing else.
+    fn summary_from_members(table: &Table, keys: &Keys) -> Vec<[u64; 2]> {
+        let mut users = vec![[0u64; 2]; keys.user_bound as usize];
+        table.for_each_member(|member, name, complex| {
+            let Some(number) = keys.user_number_of_code(member) else {
+                return;
+            };
+            let entry = &mut users[(number >> ALIAS_BITS) as usize];
+            let alias = number & ALIAS_MASK;
+            if complex || alias >= 64 {
+                entry[0] |= SLOW;
+            } else if entry[0] & SIMPLE == 0 {
+                entry[0] |= SIMPLE | name;
+                entry[1] |= 1 << alias;
+            } else if entry[0] & CODE_MASK == name {
+                entry[1] |= 1 << alias;
+            } else {
+                entry[0] |= SLOW;
+            }
+        });
+        users.iter().map(|&entry| if entry[0] & SLOW != 0 { [SLOW, 0] } else { entry }).collect()
+    }
+
+    /// Link lines of generated IDs of the users below `users`, by code:
+    /// small trees and long chains inside a user, users whose links fall in
+    /// two components, aliases of 64 and more, lines to other users (some of
+    /// them the user's only link), lines to IDs that are no user's, repeats
+    /// either way round and self-links, shuffled over a few lists.
+    fn random_user_lines(random: &mut Random, keys: &Keys, exotic: &Interner, users: u64) -> Vec<Vec<(u64, u64)>> {
+        let id = |user: u64, alias: u64| keys.code_of_user_number(user << ALIAS_BITS | alias);
+        let mut lines: Vec<(u64, u64)> = Vec::new();
+        for user in 0..users {
+            if random.chance(4) {
+                continue;
+            }
+            let chain = random.chance(30);
+            let size = if chain { 20 + random.below(280) } else { 1 + random.below(8) } as u64;
+            // Aliases from 0 up, or from somewhere higher, across 64 at times.
+            let first = if random.chance(8) { random.below(512 - size as usize) as u64 } else { 0 };
+            let split = if random.chance(15) { 1 + random.below(size as usize) as u64 } else { size };
+            for at in 1..size {
+                // Leaving one line out makes two components of the user's IDs.
+                if at == split {
+                    continue;
+                }
+                let earlier = if chain { at - 1 } else { random.below(at as usize) as u64 };
+                lines.push((id(user, first + earlier), id(user, first + at)));
+            }
+            let mine = id(user, first + random.below(size as usize) as u64);
+            if size == 1 || random.chance(15) {
+                lines.push((mine, mine));
+            }
+            if random.chance(25) {
+                // To another user: sometimes to one of its linked IDs, sometimes not.
+                let other = random.below(users as usize) as u64;
+                lines.push((mine, id(other, random.below(10) as u64)));
+            }
+            if random.chance(40) {
+                let text = format!("X{}", random.below(50));
+                let other = id_code(text.as_bytes(), b'u', exotic);
+                lines.push(if random.chance(2) { (mine, other) } else { (other, mine) });
+                if random.chance(3) {
+                    lines.push((other, other));
+                }
+            }
+            if random.chance(60) {
+                // A line that only touches the user: from an ID with no other link.
+                lines.push((id(user, 511), id((user + 1) % users, 510)));
+            }
+        }
+        for at in 0..lines.len() {
+            if random.chance(12) {
+                let (a, b) = lines[at];
+                lines.push(if random.chance(2) { (a, b) } else { (b, a) });
+            }
+        }
+        random.shuffle(&mut lines);
+        let mut lists: Vec<Vec<(u64, u64)>> = vec![Vec::new(); 1 + random.below(9)];
+        for line in lines {
+            let list = random.below(lists.len());
+            lists[list].push(line);
+        }
+        lists
+    }
+
+    /// The sharded build against the single grouped build of the same lines
+    /// and the summary read off it: every ID of the lines, IDs of no line,
+    /// the complex members, the visits, and every user index.
+    fn check_shards(random: &mut Random, keys: &Keys, exotic: &Interner, lists: &[Vec<(u64, u64)>]) {
+        let single = build_within(lists, exotic, &|code| keys.user_index_of_code(code), Limits::NORMAL);
+        let summary = summary_from_members(&single, keys);
+        let mut codes: Vec<u64> = lists.iter().flatten().flat_map(|&(a, b)| [a, b]).collect();
+        // IDs of no line: of users in and out of range, and no user's.
+        for _ in 0..300 {
+            let user = random.below(keys.user_bound as usize * 2 + 2) as u64;
+            codes.push(keys.code_of_user_number(user << ALIAS_BITS | random.below(512) as u64));
+            codes.push(id_code(format!("Y{}", random.below(1000)).as_bytes(), b'u', exotic));
+        }
+        let visits = |visit: &dyn Fn(&mut dyn FnMut(u64, u64, bool))| -> HashMap<u64, (u64, bool)> {
+            let mut seen = HashMap::new();
+            visit(&mut |member, name, flag| {
+                assert!(seen.insert(member, (name, flag)).is_none(), "an ID visited twice");
+            });
+            seen
+        };
+        let expected_visits = visits(&|visit| single.for_each_member(visit));
+        let mut expected_complex: Vec<u64> = single.complex_members().to_vec();
+        expected_complex.sort_unstable();
+        for helpers in [0, 1, 3] {
+            for (path, limits) in PATHS {
+                let table = build_indexed_within(lists, exotic, keys, helpers, limits);
+                for &code in &codes {
+                    table.prefetch(code);
+                    assert_eq!(table.lookup(code), single.lookup(code), "{path}, {helpers} helpers: {code}");
+                    assert_eq!(table.person(code), single.lookup(code).0, "{path}, {helpers} helpers: {code}");
+                }
+                let mut complex: Vec<u64> = table.complex_members().to_vec();
+                complex.sort_unstable();
+                assert_eq!(complex, expected_complex, "{path}, {helpers} helpers");
+                assert_eq!(visits(&|visit| table.for_each_member(visit)), expected_visits, "{path}, {helpers} helpers");
+                for user in 0..keys.user_bound {
+                    assert_eq!(table.summary(user), summary[user as usize], "{path}, {helpers} helpers: user {user}");
+                }
+                assert_eq!(table.summary(keys.user_bound), [SLOW, 0], "{path}");
+                assert_eq!(table.summary(u64::MAX), [SLOW, 0], "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn shards_match_the_single_build() {
+        let mut random = Random(0xA076_1D64_78BD_642F);
+        for round in 0..40 {
+            // Users over one shard or several, some past the keys' bound.
+            let users = [1, 2, 7, 60, 700, 5000, 9000][round % 7];
+            let user_bound = [users, users + 5, users - users / 4, users / 2 + 1][round % 4];
+            let keys = test_keys(&mut random, user_bound);
+            let exotic = Interner::default();
+            let lists = random_user_lines(&mut random, &keys, &exotic, users);
+            check_shards(&mut random, &keys, &exotic, &lists);
+        }
+        // No lines at all.
+        let keys = test_keys(&mut random, 100);
+        check_shards(&mut random, &keys, &Interner::default(), &[]);
+    }
+
+    #[test]
+    fn shards_by_hand() {
+        let mut random = Random(5);
+        let keys = test_keys(&mut random, 11);
+        let exotic = Interner::default();
+        let id = |user: u64, alias: u64| keys.code_of_user_number(user << ALIAS_BITS | alias);
+        let no_users = id_code(b"Ux", b'u', &exotic);
+        let lines = vec![
+            // One component of three inside user 0.
+            (id(0, 0), id(0, 1)),
+            (id(0, 1), id(0, 2)),
+            // Two components inside user 1.
+            (id(1, 0), id(1, 1)),
+            (id(1, 2), id(1, 3)),
+            // Users 2 and 3 share a component; user 3 has one of its own too.
+            (id(2, 0), id(3, 0)),
+            (id(3, 4), id(3, 5)),
+            // A member with an alias of 64 or more in user 4.
+            (id(4, 0), id(4, 1)),
+            (id(4, 1), id(4, 70)),
+            // Linked only to itself in user 5.
+            (id(5, 9), id(5, 9)),
+            // A component of two and an ID linked only to itself in user 6.
+            (id(6, 63), id(6, 5)),
+            (id(6, 6), id(6, 6)),
+            // Linked to an ID that is no user's in user 7.
+            (id(7, 0), no_users),
+            (no_users, no_users),
+            // A cycle with repeats, either way round, in user 8.
+            (id(8, 0), id(8, 1)),
+            (id(8, 1), id(8, 2)),
+            (id(8, 2), id(8, 0)),
+            (id(8, 1), id(8, 0)),
+            (id(8, 0), id(8, 0)),
+            // The smallest alias that the mask has no bit for, in user 9.
+            (id(9, 3), id(9, 64)),
+            // User 12 is past the bound: its IDs are no user's.
+            (id(12, 0), id(12, 1)),
+        ];
+        let smallest = |codes: &[u64]| *codes.iter().min().unwrap();
+        let expected = [
+            [smallest(&[id(0, 0), id(0, 1), id(0, 2)]) | SIMPLE, 0b111],
+            [SLOW, 0],
+            [SLOW, 0],
+            [SLOW, 0],
+            [SLOW, 0],
+            [0, 0],
+            [smallest(&[id(6, 63), id(6, 5)]) | SIMPLE, 1 << 63 | 1 << 5],
+            [SLOW, 0],
+            [smallest(&[id(8, 0), id(8, 1), id(8, 2)]) | SIMPLE, 0b111],
+            [SLOW, 0],
+            [0, 0],
+        ];
+        for helpers in [0, 2] {
+            let table = build_indexed(&[lines.clone()], &exotic, &keys, helpers);
+            for (user, entry) in expected.iter().enumerate() {
+                assert_eq!(table.summary(user as u64), *entry, "user {user}");
+            }
+            assert_eq!(table.summary(11), [SLOW, 0]);
+            assert_eq!(table.lookup(id(0, 2)), (smallest(&[id(0, 0), id(0, 1), id(0, 2)]), false));
+            assert_eq!(table.lookup(id(0, 3)), (id(0, 3), false));
+            assert_eq!(table.lookup(id(1, 3)), (id(1, 2).min(id(1, 3)), false));
+            assert_eq!(table.lookup(id(2, 0)), (id(2, 0).min(id(3, 0)), true));
+            assert_eq!(table.lookup(id(3, 5)), (id(3, 4).min(id(3, 5)), false));
+            assert_eq!(table.lookup(id(4, 70)), (smallest(&[id(4, 0), id(4, 1), id(4, 70)]), false));
+            assert_eq!(table.lookup(id(5, 9)), (id(5, 9), false));
+            assert_eq!(table.lookup(id(7, 0)), (no_users, true));
+            assert_eq!(table.lookup(no_users), (no_users, true));
+            assert_eq!(table.lookup(id(12, 1)), (id(12, 0).min(id(12, 1)), true));
+        }
+        check_shards(&mut random, &keys, &exotic, &[lines]);
     }
 
     #[test]

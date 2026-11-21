@@ -219,7 +219,7 @@ CI gave 1,165 ms on a Xeon 8573C runner and about 620 ms on an EPYC 9V45 runner 
 ### 19:31 UTC
 
 ```text
-candidate_full_sha: 4567e9531dc58ed5eb43d0c3bcd7ebbf0c82f6ef  (index mode is the default)
+candidate_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (index mode is the default)
 baseline_full_sha: 2b2cccd1ba1cb12bc5a074a899ce54c868205b86  (official 0.71 s)
 default_command_and_env: /pipeline, no environment variable (SS_STRUCT=0 selects the general path)
 CPU_topology / limits / image_digest: GitHub runner, AMD EPYC 7763, 4 vCPU (2 cores x 2 threads), --cpus 4 --memory 13g; run 44940522202
@@ -249,3 +249,179 @@ official_receipt_and_score: not yet submitted
   index-mode event kernel within 1 ns per row of the general one (parser agent); P3, a session kernel
   entry for events that are already in time order (sessions agent, verified at 233 -> 191 ns per person);
   partition sizes 2^13 and 2^15 as same-image variants (runs on branches exp-shift-13 and exp-shift-15).
+
+### 19:41 UTC
+
+- **Official:** the team's submission watch reports a new best of **0.66 s** (index mode as the default;
+  commit as submitted from this PR's pointer, `4567e953`). Next submission possible in about one hour.
+- **Confirmations of `4567e953` since the last entry:** runs 44940838388 and 44940841473 measured the same
+  default path (plus a neutral parameter) against `2b2cccd1`: 63.9 / 62.0 / 58.8 ms and 48.8 / 55.0 / 59.1 ms
+  faster, 36/36 pairs. Partition size: 2^13 is 6 to 12 ms slower than 2^14 (3/18 pairs), 2^15 is 3 to 6 ms
+  faster (12/18 pairs).
+- **In CI now (this commit), candidate A for the next submission, paired against `4567e953`:** index
+  partitions of 2^15 events (variant: 2^14), compact link lookup table (links agent, `e33be28`), the
+  sessions agent's `3a44f65` and `be4f180`, startup with the inputs mapped while the lookup tables load
+  (laptop 14-18 -> 11-12.5 ms). Laptop checks with SS_VERIFY=1: 42 unit tests, 36/36, 43/43, dev and 20M
+  seeds 2 and 3 MATCH; SS_STRUCT=0: 36/36, 43/43, dev and seed 2 MATCH; 24 small generated datasets MATCH.
+- **Expected by 20:05 UTC from the agents, for candidate B:** index-mode click path without the
+  code-to-number round trip, a faster index-mode event kernel, a session kernel entry for events in time order.
+
+### 19:47 UTC
+
+- **Correction:** the previous entries and `bench/BEST_SHA` in commit `b32d77f` named the index-default
+  commit with a wrong full hash (typed from memory; the tail was invalid). The officially accepted
+  0.66 s commit is `4567e9532f4019fbfd0e92908fd01cc49f24f67d`; the ledger and `bench/BEST_SHA` now carry
+  it, and every 40-character hash in the ledger was checked against the repository. Because of the
+  invalid baseline, the CI run of `b32d77f` has no prior-versus-candidate pairs: this commit repeats
+  the comparison.
+- **Confirmation of `4567e953` on fresh seeds (run 44941343462, same SHA, seeds 7 and 11):** 51.9 and
+  59.0 ms faster than `2b2cccd1`, 12/12 pairs; 36/36, 43/43, dev MATCH, 29/29 runs MATCH per seed.
+- **In CI now (this commit), paired against the 0.66 s commit:** candidate A of the last entry plus two
+  small index-pass changes (click lists counted by all threads; "does this user have extra events"
+  answered by a bit test instead of a hash probe per run). Laptop checks with SS_VERIFY=1: 42 unit
+  tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH; 16 small generated datasets and three mutated
+  ones MATCH the reference pipeline.
+
+### 19:57 UTC
+
+- **In CI now (this commit), candidate B for the next submission, paired against the 0.66 s commit
+  `4567e9532f4019fbfd0e92908fd01cc49f24f67d`:** candidate A plus three agent steps, each verified by its
+  author and again on the merged tree:
+  - index-mode click path: the kernel reads the user number from the text and writes into the
+    per-user-range list (click agent, `4989f58`; laptop, one thread: 29.9 -> 21.2 ns per click row);
+  - lean event kernel v2: row end from the decode, range compares for the canonical-ID checks, a store
+    loop without a call on the common path (parser agent, `82182bb`; laptop, one thread, index mode:
+    25.3 -> 23.4 ns per row), with a whole-file differential test of the store loops in both modes;
+  - sessions from events in time order in one pass (sessions agent, `5cb6ad0`; about 20% of the
+    per-person kernel in its replay), called from the index pass.
+- **Laptop checks on the merged tree:** 43 unit tests; with SS_VERIFY=1 and without it: 36/36, 43/43, dev
+  and 20M seed 2 MATCH (seed 3 too, both ways); 24 small generated datasets and three mutated ones MATCH
+  the reference pipeline in the scored configuration.
+
+### 20:11 UTC
+
+```text
+candidate_full_sha: 75b2600374845cd51890684f9fcf12b008a968e8  (candidate B)
+baseline_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (official 0.66 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, AMD EPYC 9V74, 4 vCPU, --cpus 4 --memory 13g; run 44943649309
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 43 unit tests incl. 9 differential parser tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 14/18 pairs won on a noisy runner; +68.8 / +71.1 / +57.3 ms (medians 762.4 -> 694.9, 770.3 -> 698.0, 792.9 -> 734.2); seed 3 larger than every A/A difference, seeds 2 and 5 larger than the median A/A difference but inside its range
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,437.5 ms / 2.08 GiB; 241.8 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: parse 413 -> 365 ms (events 1,327 -> 1,189, clicks 320 -> 270 CPU-ms), index pass 211 -> 197 ms (kernel in one ordered pass); in-process 676 -> 614 ms
+decision: keep; commit to submit for the next window unless the 2^14 variant below measures better
+official_receipt_and_score: not yet submitted
+```
+
+- **Candidate A alone (`4641345`, run 44942802240, Xeon 6975P-C) was neutral** against the 0.66 s commit
+  (+1.1 / -0.6 / +3.5 ms; 60M -27.5 ms paired), as the audit notes; in the same run 2^14-event partitions
+  beat 2^15 by 7.3 / 12.3 / 16.8 ms (17/18 pairs), the opposite of the EPYC 7763 result. The scorer is a
+  Xeon, so the default goes back to 2^14.
+- **In CI now (this commit):** candidate B with 2^14-event partitions as the default (variant: 2^15) and
+  the purchase plane written only for purchases (the audit's suggestion; every reader is gated by the
+  winner's purchase bit). Laptop checks in the scored configuration: 43 unit tests, 36/36, 43/43, dev
+  and 20M seeds 2 and 3 MATCH.
+- **Sessions agent, target 2 (attribution overhead):** three exact variants measured, none faster
+  (within 0.5%); dropped. The remaining kernel cost is spread over five short per-person loops.
+
+### 20:20 UTC
+
+```text
+candidate_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (candidate B2; the commit to submit)
+baseline_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (official 0.66 s, receipt BB-898B1D4A)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, AMD EPYC 7763, 4 vCPU (2 cores x 2 threads), --cpus 4 --memory 13g; run 44944919924
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 43 unit tests incl. 9 differential parser tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 18/18 pairs won; +74.0 / +77.1 / +80.6 ms (medians 892.2 -> 818.2, 906.5 -> 830.4, 889.5 -> 808.0); each larger than every A/A difference of its seed
+same-image variant (SS_INDEX_SHIFT=15): +5.2 / -0.7 / +5.8 ms: no clear difference on this CPU (2^14 was 7 to 17 ms better on a Xeon)
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,055.2 ms / 2.12 GiB; 214.0 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: fewer instructions in the event and click parsers, sessions in one ordered pass, purchase plane written only for purchases
+decision: keep; named as the commit to submit in the PR at 20:20 UTC
+official_receipt_and_score: not yet submitted
+```
+
+- **Correctness agent, on `4567e953` in the default (index) mode, exact comparison of both tables with the
+  reference pipeline (and its own independent Python reference):** 56 mutated datasets x 4 environments,
+  13 further mutations, 61 "handful of odd rows" datasets, 406 single-edit inputs, 36 plain 1K datasets,
+  136 extra fixtures: 0 disagreements. Index mode stayed engaged or backed out to the general path as
+  designed (restarts on moved events, cross-user copies and swapped event IDs). The same lists are being
+  re-run on this commit.
+- **`bench/build_prior.sh` now fails the job** when the baseline cannot be found or built.
+
+### 20:34 UTC
+
+- **Architectural experiment, rejected on its kill test: partition-owned (direct) winner construction.**
+  Hypothesis: letting the parsers hand each record to the owner of its index partition, which keeps the
+  winning copy directly, removes the intermediate partition lists and the placement pass. Smallest
+  experiment that could disprove it: `bench/experiments/scatter.rs` on branch `exp-scatter` moves 20M
+  (and 60M) records that arrive in random index order, plus 3% second copies, without any parsing,
+  (a) the engine's way: per-thread block lists by 2^14-index partition, then placement in a slot table
+  that stays in the cache, then a read in order; (b) the best case of an owner design: no queues, no
+  batches, every producer writes straight into the final slot of one array (one atomic maximum per
+  record, huge pages), then a read in order. Linux runner (run 44946867096, EPYC 9V74, 4 vCPU, huge
+  pages granted on request): 20M, 4 threads: (a) 104 to 125 ms, (b) 229 to 276 ms; 20M, 2 threads:
+  139 to 178 against 223 to 252 ms; 60M, 4 threads: 432 to 443 against 747 to 761 ms. Laptop, 8 threads:
+  41 to 118 against 108 to 168 ms. The direct scheme pays a cache miss per record where the lists scheme
+  pays a sequential write and an in-cache placement; queues and a completion protocol could only add to
+  it. Decision: reject; keep lists and placement.
+- **What the same numbers suggest instead:** in (a), writing the lists is 82 of the 104 ms: about 16 ns per
+  record of thread time, mostly the read-for-ownership of fresh list memory. Next experiment in the same
+  harness: write-combining buffers flushed with non-temporal stores for the partition lists.
+
+### 20:37 UTC
+
+- **Write-combining lists with non-temporal stores: rejected in the same harness.** A 64-byte buffer per
+  partition, flushed with non-temporal stores, against plain appends to the block lists. Linux runner
+  (run 44947126383, Xeon 6975P-C, 4 vCPU): 20M, 4 threads: 108 to 111 ms against 111 to 141 ms (steady
+  rounds 108 against 111 to 114: about 3%); 20M, 2 threads: 157 to 159 against 149 to 155 ms (worse);
+  60M, 4 threads: 402 to 465 against 415 to 451 ms (no difference). The direct scheme lost on this CPU as
+  well (199 to 222 ms at 20M, 755 to 777 ms at 60M). Decision: reject; the partition lists stay as they are.
+- **Read of both experiments:** the movement of event records (lists, placement, ordered read) is close
+  to its efficient form for records of this size; the remaining cost is computing the records (parsing)
+  and the per-person session work, plus the link builder thread once the parse gets shorter.
+
+### 20:55 UTC
+
+- **Official:** `2dae9298f4e1e0a5259eec54c400501b00fae26f` scored **0.64 s** (relayed by the user; the
+  record on the board is 0.29 s). CI had shown 8.5% against the 0.66 s commit on 4 vCPUs; the 8-thread
+  scorer gave 3%.
+- **Reading, to be tested by the next submission:** at 8 threads the parse workers are no longer the
+  last to finish in the parse stage; the single-threaded link builder is. Laptop, 20M seed 2, input
+  pre-faulted, index mode: parse workers 687 / 375 / 243 / 122 ms at 1 / 2 / 4 / 8 threads, link builder
+  (table plus per-user summary) 85 / 89 / 117 / 125 ms. A 4-vCPU runner cannot show this (parse 365 ms,
+  builder 146 ms there), which is why CI over-predicted the official gain of parser work.
+- **In CI now (this commit), candidate C:** the per-user summary on its own thread (`bf0f767`), the
+  lookup tables, file mapping and link parse overlapped at startup so the builder starts earlier
+  (`1d6110e`), and the parser agent's lean kernel in two halves run out of step with its own store
+  loop (`c890351`; 3 to 5% of event parsing on the laptop). Laptop checks in the scored configuration:
+  43 unit tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH. On 4 vCPUs the expected gain is small;
+  the point of submitting it is the 8-thread answer.
+- **If the reading holds, next:** links resolved per user range in parallel in index mode (pairs inside
+  one user index never need the global union-find; only the few pairs that cross users do), and the
+  click index built before the builder is waited for.
+
+### 21:11 UTC
+
+- **Official:** candidate C (`9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e`) scored **0.64 s**, the same as
+  `2dae9298` (relayed by the user). CI run 44948826448 (Xeon 8573C) had it at -1.4 / -13.3 / -0.8 ms
+  against `2dae9298` at 20M (within noise, 5/18 pairs) and 59.8 ms slower at 60M; all outputs MATCH.
+- **Hypothesis refuted:** "at 8 threads the link builder is the last to finish". The laptop's 8 threads
+  are 8 cores; the scorer's 8 hyperthreads are 4 cores, so its parse is about twice as fast as on a
+  4-vCPU runner, not four times, and the builder stays behind it. The summary thread and the overlapped
+  startup stay in the tree (they cost nothing), but they were not the limit.
+- **Model from the official scores so far** (0.71, 0.66, 0.64 s against 940, 890, 818 ms on the EPYC 7763
+  runner): official is about 0.17 s plus 0.57 of the CI container time; in other words a fixed part of
+  roughly 0.17 to 0.25 s (container lifecycle plus serial steps) and about half of the CI parallel work.
+  A CI gain of 74 ms arrived as 0.02 s.
+- **Checked and discarded:** rows inside an events file are not in event-index order (the index goes
+  back on half of the rows in every file looked at), so there is no order to use at parse time.
+- **Open experiments:** branch `cand-t1` (candidate C2 without the parser step `c890351`, to see whether
+  that step is the small Intel regression); candidate C2 (`a67dad3`, click index before the builder is
+  waited for); 2^15-event partitions at the 60M scale only (branch `exp-shift60`).
+- **Next, by expected size:** session work fused into the winner scan (sessions agent), fewer
+  instructions per row in the event and click parsers (two agents), links resolved per user range in
+  parallel (links agent), fixed costs (exit without teardown work, output overlapped with the index pass).

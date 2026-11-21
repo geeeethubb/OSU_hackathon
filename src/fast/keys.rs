@@ -281,7 +281,11 @@ pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
     Some(Keys { event_key, user_key, index_bound, user_bound, index_shift })
 }
 
-/// 16,384 events per index partition: two words per slot make 256 KiB.
+/// 16,384 events per index partition: two words per slot make 256 KiB. The
+/// CI runs disagree by CPU about the neighbours: on an EPYC 7763 2^15 was 3 to
+/// 6 ms faster and 2^13 6 to 12 ms slower (runs 44940841473, 44940838388), on
+/// a Xeon 6975P-C 2^14 was 7 to 17 ms faster than 2^15 (run 44942802240). The
+/// scorer is a Xeon, and 2^14 is what the accepted 0.66 s commit used.
 pub const DEFAULT_INDEX_SHIFT: u32 = 14;
 
 #[cfg(test)]
