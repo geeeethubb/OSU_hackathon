@@ -281,17 +281,23 @@ jobs:
         with:
           pattern: ss-*
           path: ${{ runner.temp }}/reports
-      - name: Reports of this commit's push run (pull_request events from this repository)
-        if: needs.correctness.result == 'skipped'
+      - name: Reports of other runs for this commit
+        # A commit can be tested by more than one run: its push, a 60M run started by hand, and
+        # the pull_request event, which runs no tests of its own for a branch of this repository.
+        # The comment is one per commit, so it gathers what all of them found.
+        continue-on-error: true
         run: |
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$HEAD_SHA" --limit 20 \
-            --json databaseId,event,status \
-            --jq '[.[] | select(.event != "pull_request" and .status == "completed")][0].databaseId // empty')
-          if [ -n "$run_id" ]; then
-            echo "taking the reports of run $run_id"
-            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --pattern 'ss-*' --dir "$RUNNER_TEMP/reports"
-          else
-            echo "::notice::the push run for $HEAD_SHA has not finished; it posts the comment itself when it does"
+          mkdir -p "$RUNNER_TEMP/reports"
+          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$HEAD_SHA" --limit 20 \
+            --json databaseId,status --jq '.[] | select(.status == "completed") | .databaseId')
+          for run_id in $others; do
+            [ "$run_id" = "$GITHUB_RUN_ID" ] && continue
+            echo "adding the reports of run $run_id"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --pattern 'ss-*' --dir "$RUNNER_TEMP/reports/run-$run_id" \
+              || echo "run $run_id has no reports to add"
+          done
+          if [ -z "$(find "$RUNNER_TEMP/reports" -name '*.json' -print -quit)" ]; then
+            echo "::notice::no finished run has results for $HEAD_SHA yet; the run that tests it posts the comment when it finishes"
           fi
       - name: Sticky pull-request comment
         run: |

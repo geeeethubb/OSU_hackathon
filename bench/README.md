@@ -146,7 +146,9 @@ wall is kept for every sample.
   minus 1 GiB, plus the swap); if it still does not finish, the report says that correctness at
   this scale rests on the self-check alone.
 - **report**: one sticky pull-request comment per commit SHA, found again by a hidden marker and
-  updated in place.
+  updated in place. When several runs tested the same commit (its push, then a 60M run started
+  by hand), the comment gathers them: for bench-20m the result with the most paired evidence,
+  for the other jobs the latest, each with a link to its run.
 
 A pull request from a branch of this repository is tested by its push event; the pull_request
 event only syncs the comment. Without a root `Dockerfile` the pipeline steps are skipped and only

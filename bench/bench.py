@@ -533,7 +533,7 @@ class Monitor(threading.Thread):
                            f"/sys/fs/cgroup/docker/{container_id}"]
         self.scratch, self.out, self.interval = scratch, out, interval
         self.halt = threading.Event()
-        self.memory_peak = self.max_current = self.max_anon = self.max_file = None
+        self.memory_peak = self.max_current = self.max_anon = self.max_file = self.max_anon_thp = None
         self.max_scratch = self.max_out = 0
         self.samples = 0
         self.cgroup = None
@@ -551,12 +551,15 @@ class Monitor(threading.Thread):
                 try:
                     self.max_current = self._bigger(self.max_current, int(read_file(self.cgroup + "/memory.current")))
                     self.samples += 1
-                    for line in read_file(self.cgroup + "/memory.stat").splitlines()[:2]:
+                    for line in read_file(self.cgroup + "/memory.stat").splitlines():
                         key, _, value = line.partition(" ")
                         if key == "anon":
                             self.max_anon = self._bigger(self.max_anon, int(value))
                         elif key == "file":
                             self.max_file = self._bigger(self.max_file, int(value))
+                        elif key == "anon_thp":  # anonymous memory backed by transparent huge pages
+                            self.max_anon_thp = self._bigger(self.max_anon_thp, int(value))
+                            break
                     self.memory_peak = self._bigger(self.memory_peak, int(read_file(self.cgroup + "/memory.peak")))
                 except (OSError, ValueError):
                     pass
@@ -573,6 +576,7 @@ class Monitor(threading.Thread):
             "max_memory_current_bytes": self.max_current,
             "max_anon_bytes": self.max_anon,
             "max_file_bytes": self.max_file,
+            "max_anon_thp_bytes": self.max_anon_thp,
             "peak_scratch_bytes": self.max_scratch,
             "peak_output_bytes": self.max_out,
             "samples": self.samples,
@@ -993,7 +997,7 @@ def cmd_correctness(args):
         if not result["flag_parity"]["ok"]:
             result["errors"].append("the harness's docker flags differ from scripts/docker_run.sh: " + result["flag_parity"].get("detail", ""))
         if not args.image:
-            result["skipped"] = "no root Dockerfile at this commit: the fixture and dev checks were skipped"
+            result["skipped"] = "no pipeline image (no root Dockerfile at this commit, or the stand-in self-test was requested): the fixture and dev checks were skipped"
             return finish(args, result)
         result["image"] = image_info(args.image)
         # The organizers' own commands, run their way; the scripts read these from the environment.
@@ -1158,7 +1162,7 @@ def cmd_bench20m(args):
                 entry["pipeline"] = None
             remove_tree(data)
         if not args.image:
-            result["skipped"] = "no root Dockerfile at this commit: only the diagnostics ran"
+            result["skipped"] = "no pipeline image (no root Dockerfile at this commit, or the stand-in self-test was requested): only the diagnostics ran"
     except Exception as error:  # noqa: BLE001 - always leave a report behind
         traceback.print_exc()
         result["errors"].append(f"harness error: {type(error).__name__}: {error}")
@@ -1315,7 +1319,7 @@ def cmd_bench60m(args):
         result["seeds"] = [entry]
         result["disk_after_generation"] = {"free_bytes": shutil.disk_usage(work).free}
         if not args.image:
-            result["skipped"] = "no root Dockerfile at this commit: only the dataset was generated"
+            result["skipped"] = "no pipeline image (no root Dockerfile at this commit, or the stand-in self-test was requested): only the dataset was generated"
             remove_tree(data)
             return finish(args, result)
         cache_before = page_cache_state(data)

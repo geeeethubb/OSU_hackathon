@@ -406,9 +406,11 @@ def monitor_text(run):
         return "not measured"
     if monitor_peak(run) is None:
         return "not captured (the container's cgroup was not found while it ran)"
+    huge = monitor.get("max_anon_thp_bytes")
     return (f"{size(monitor_peak(run))} (cgroup `memory.peak`, which also counts page cache charged to the container; sampled anonymous "
-            f"memory peaked at {size(monitor.get('max_anon_bytes'))}, file cache at {size(monitor.get('max_file_bytes'))}; "
-            f"{num(monitor.get('samples'))} samples)")
+            f"memory peaked at {size(monitor.get('max_anon_bytes'))}"
+            + (f", of which {size(huge)} in transparent huge pages" if huge is not None else "")
+            + f", file cache at {size(monitor.get('max_file_bytes'))}; {num(monitor.get('samples'))} samples)")
 
 
 def compare_text(entry):
@@ -596,7 +598,7 @@ def render_bench20m(result, correctness=None, b60=None, with_line=True):
     images = result.get("images") or {}
     prior = result.get("prior") or {}
     if result.get("mode") == "stand-in":
-        lines += ["", "**Stand-in mode**: this commit has no root `Dockerfile`, so there are no pipeline numbers; only the diagnostics ran."]
+        lines += ["", "**Stand-in mode**: no pipeline image was built (no root `Dockerfile` at this commit, or the `standin` self-test was requested), so there are no pipeline numbers; only the diagnostics ran."]
     elif images.get("pipeline"):
         image = images["pipeline"]
         same = ""
