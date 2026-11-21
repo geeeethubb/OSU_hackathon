@@ -8,7 +8,7 @@
 use super::arena::{Arena, PartList, PartWriter};
 use super::codes::mix;
 use super::links::LinkTable;
-use super::parse::ClickRecord;
+use super::parse::RAW_CLICK_WORDS;
 use super::{CLICK_BLOCK, LOCAL_BITS, LOCAL_MASK, PARTS, PERSON_BLOCK};
 
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -175,20 +175,23 @@ fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purcha
     }
 }
 
-/// Map a batch of parsed clicks to their persons' partitions.
-pub fn map_clicks(links: &LinkTable, clicks: &[ClickRecord], out: &mut PassBOut) {
-    for (index, click) in clicks.iter().enumerate() {
-        if let Some(later) = clicks.get(index + AHEAD) {
-            links.prefetch(later.user);
-        }
-        let mixed = mix(links.person(click.user));
-        let part = (mixed >> LOCAL_BITS) as usize;
-        // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
-        // number of writers; `reserve` returns room for two words.
-        unsafe {
-            let at = out.clicks.get_unchecked_mut(part).reserve(&mut out.arena, CLICK_BLOCK, 2);
-            *at = ((mixed & LOCAL_MASK) << 32) | (u64::from(click.ts) << 1);
-            *at.add(1) = click.code_and_campaign;
+/// Map a batch of parsed clicks (blocks of `[user, click code and campaign,
+/// ts]` triples) to their persons' partitions.
+pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
+    for block in blocks {
+        for (index, click) in block.chunks_exact(RAW_CLICK_WORDS).enumerate() {
+            if let Some(&later) = block.get((index + AHEAD) * RAW_CLICK_WORDS) {
+                links.prefetch(later);
+            }
+            let mixed = mix(links.person(click[0]));
+            let part = (mixed >> LOCAL_BITS) as usize;
+            // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
+            // number of writers; `reserve` returns room for two words.
+            unsafe {
+                let at = out.clicks.get_unchecked_mut(part).reserve(&mut out.arena, CLICK_BLOCK, 2);
+                *at = ((mixed & LOCAL_MASK) << 32) | (click[2] << 1);
+                *at.add(1) = click[1];
+            }
         }
     }
 }

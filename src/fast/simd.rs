@@ -539,6 +539,56 @@ unsafe fn small_number(p: *const u8, digits: usize) -> Option<usize> {
     Some((fours.wrapping_mul(10_000) + (fours >> 32)) as u32 as usize)
 }
 
+/// Parses the link row starting at `p` (with `ROW_PAD` readable bytes after
+/// it). Only rows shorter than 32 bytes take the fast path.
+#[inline(always)]
+pub unsafe fn link_row_fast(ctx: &Ctx, p: *const u8, pair: &mut (u64, u64)) -> (usize, u32) {
+    let block = _mm256_loadu_si256(p as *const __m256i);
+    let newlines = mask(block, _mm256_set1_epi8(b'\n' as i8));
+    if newlines == 0 {
+        return (0, ROW_LONG);
+    }
+    let length = newlines.trailing_zeros() as usize;
+    let below = (1u64 << length) - 1;
+    let commas = mask(block, _mm256_set1_epi8(b',' as i8)) & below;
+    let quotes = mask(block, _mm256_set1_epi8(b'"' as i8)) & below;
+    // Two fields and a first field that is not empty (an empty side drops
+    // the line just as a wrong field count does).
+    if commas.count_ones() != 1 || commas & 1 != 0 {
+        return (length, ROW_DROP);
+    }
+    // Same quote rule as for events, in one word.
+    let separators = commas | (1u64 << length);
+    let starts = (separators << 1) | 1;
+    let ends = separators >> 1;
+    let opened = _pext_u64(quotes, starts);
+    if ((quotes & !(starts | ends)) | (quotes & starts & ends) | (opened ^ _pext_u64(quotes, ends))) != 0 {
+        return (length, ROW_DROP);
+    }
+    let c0 = commas.trailing_zeros() as usize;
+    let q0 = (opened & 1) as usize;
+    let q1 = ((opened >> 1) & 1) as usize;
+    let (s0, e0) = (q0, c0 - q0);
+    let (s1, e1) = (c0 + 1 + q1, length - q1);
+    if e0 == s0 || e1 == s1 {
+        return (length, ROW_DROP);
+    }
+    let field = |start: usize, end: usize| std::slice::from_raw_parts(p.add(start), end - start);
+    let a_chars = e0 - s0 - 1;
+    let b_chars = e1 - s1 - 1;
+    let a_text = _bzhi_u64(read_u64(p.add(s0 + 1)), (a_chars as u32).wrapping_mul(8));
+    let b_text = _bzhi_u64(read_u64(p.add(s1 + 1)), (b_chars as u32).wrapping_mul(8));
+    let (a_fast_code, b_fast_code, known) = two_codes(a_text, b_text);
+    let a_need = (1u32 << (a_chars & 15)) - 1;
+    let a_fast = (a_chars.wrapping_sub(1) < 8) & (*p.add(s0) == b'u') & (known & a_need == a_need);
+    let b_need = (1u32 << (b_chars & 15)) - 1;
+    let b_fast = (b_chars.wrapping_sub(1) < 8) & (*p.add(s1) == b'u') & ((known >> 8) & b_need == b_need);
+    let a = if a_fast { a_fast_code } else { id_code(field(s0, e0), b'u', &ctx.user_ids) };
+    let b = if b_fast { b_fast_code } else { id_code(field(s1, e1), b'u', &ctx.user_ids) };
+    *pair = (a, b);
+    (length, ROW_EMIT)
+}
+
 /// `c_<number>` as its number; `None` for any other text.
 #[inline(always)]
 unsafe fn campaign_number(p: *const u8, length: usize) -> Option<usize> {

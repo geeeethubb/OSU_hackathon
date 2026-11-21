@@ -43,13 +43,36 @@ pub struct ParseOut {
     /// word 1 = user code (42) | ingest seconds (21) | is purchase (1);
     /// then, for purchases only, word 2 = price (32 low) | category (32 high).
     pub events: Vec<PartWriter>,
-    pub clicks: Vec<ClickRecord>,
+    /// Valid clicks in parse order, three words each: user code, click code
+    /// and campaign, ts. They live in the arena like the events do, so the
+    /// list never reallocates and sits in huge pages where those exist.
+    pub clicks: PartWriter,
     pub links: Vec<(u64, u64)>,
 }
 
+/// Words per block of a worker's click list, and words per click in it.
+pub const RAW_CLICK_BLOCK: usize = 512;
+pub const RAW_CLICK_WORDS: usize = 3;
+
 impl ParseOut {
     pub fn new() -> Self {
-        Self { arena: Arena::new(), events: vec![PartWriter::EMPTY; PARTS], clicks: Vec::new(), links: Vec::new() }
+        Self {
+            arena: Arena::new(),
+            events: vec![PartWriter::EMPTY; PARTS],
+            clicks: PartWriter::EMPTY,
+            links: Vec::new(),
+        }
+    }
+}
+
+#[inline(always)]
+pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
+    let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
+    // SAFETY: `reserve` returned room for three words.
+    unsafe {
+        *at = click.user;
+        *at.add(1) = click.code_and_campaign;
+        *at.add(2) = u64::from(click.ts);
     }
 }
 
@@ -285,14 +308,14 @@ pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
             // SAFETY: at least ROW_PAD readable bytes follow `position`.
             let (length, status) = unsafe { click_row_fast(ctx, buffer.as_ptr().add(position), &mut click) };
             if status == ROW_EMIT && !verify {
-                out.clicks.push(click);
+                emit_click(out, &click);
                 position += length + 1;
                 continue;
             }
             if status == ROW_LONG {
                 let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
                 if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
-                    out.clicks.push(click);
+                    emit_click(out, &click);
                 }
                 position = line_end + 1;
                 continue;
@@ -314,20 +337,66 @@ pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
                 );
             }
             if let Some(click) = fast {
-                out.clicks.push(click);
+                emit_click(out, &click);
             }
             position += length + 1;
         }
     }
     lines_from(buffer, position, end, |line| {
         if let Some(click) = click_row_slow(ctx, line) {
-            out.clicks.push(click);
+            emit_click(out, &click);
         }
     });
 }
 
 pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
-    let position = first_line_start(buffer, start);
+    #[allow(unused_mut)]
+    let mut position = first_line_start(buffer, start);
+    #[cfg(target_arch = "x86_64")]
+    if ctx.fast_rows {
+        use super::simd::{link_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+        let limit = end.min(buffer.len());
+        let safe = buffer.len().saturating_sub(ROW_PAD);
+        let verify = ctx.verify;
+        let mut pair = (0u64, 0u64);
+        while position < limit && position < safe {
+            // SAFETY: at least ROW_PAD readable bytes follow `position`.
+            let (length, status) = unsafe { link_row_fast(ctx, buffer.as_ptr().add(position), &mut pair) };
+            if status == ROW_EMIT && !verify {
+                out.links.push(pair);
+                position += length + 1;
+                continue;
+            }
+            if status == ROW_LONG {
+                let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
+                if let Some(pair) = link_row_slow(ctx, &buffer[position..line_end]) {
+                    out.links.push(pair);
+                }
+                position = line_end + 1;
+                continue;
+            }
+            let line = &buffer[position..position + length];
+            let fast = match status {
+                ROW_EMIT => Some(pair),
+                ROW_DROP => None,
+                _ => link_row_slow(ctx, line),
+            };
+            if verify && (status == ROW_EMIT || status == ROW_DROP) {
+                let slow = link_row_slow(ctx, line);
+                assert!(
+                    slow == fast,
+                    "link row mismatch on {:?}: fast {:?}, slow {:?}",
+                    String::from_utf8_lossy(line),
+                    fast,
+                    slow
+                );
+            }
+            if let Some(pair) = fast {
+                out.links.push(pair);
+            }
+            position += length + 1;
+        }
+    }
     lines_from(buffer, position, end, |line| {
         if let Some(pair) = link_row_slow(ctx, line) {
             out.links.push(pair);

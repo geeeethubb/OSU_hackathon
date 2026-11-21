@@ -33,7 +33,7 @@ use std::time::Instant;
 use self::arena::PartList;
 use self::codes::Interner;
 use self::io::Mapped;
-use self::parse::{ClickRecord, ParseOut};
+use self::parse::ParseOut;
 use self::dedup::{PassBOut, ScratchB};
 use self::sessions::{PassCOut, ScratchC, NO_CATEGORY};
 use crate::parquet::{self, Column, OptStrColumn, StrColumn};
@@ -52,7 +52,8 @@ pub const CLICK_BLOCK: usize = 256;
 
 const EVENT_CHUNK: usize = 2 << 20;
 const LINK_CHUNK: usize = 1 << 20;
-const CLICK_BATCH: usize = 1 << 16;
+/// Blocks of parsed clicks (about 170 clicks each) per click-mapping task.
+const CLICK_BATCH: usize = 64;
 
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
@@ -407,10 +408,9 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let mut parse_out = parse_out.into_inner();
     let event_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
-    let mut click_batches: Vec<&[ClickRecord]> = Vec::new();
-    for out in &parse_out {
-        click_batches.extend(out.clicks.chunks(CLICK_BATCH));
-    }
+    let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
+    let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
+    let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
     let b_out: Slots<PassBOut> = Slots::new(threads, PassBOut::new);
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {
