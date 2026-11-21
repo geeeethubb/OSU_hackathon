@@ -556,3 +556,21 @@ official_receipt_and_score: not yet submitted
   does not support a fixed-cost estimate for the scorer, and none is assumed from here on.
 - **Unknown:** the scorer's container lifecycle cost, its CPU model and SMT behaviour, and how much its
   runs vary. Candidate E has not been scored yet; CI says it is 56 to 67 ms faster than `2dae9298`.
+
+### 21:52 UTC
+
+- **Fast exit, kept (small):** `b89089509140f293879be2130fc308dbaec38004` = candidate E plus leaving the
+  process as soon as both tables are written. Run 44953146558 (EPYC 9V45): against candidate E +1.1 /
+  +6.7 / +2.9 ms (12/18 pairs, inside the A/A range); the same image with the ordinary return
+  (`SS_EXIT=drop`) is 3.5 / 4.9 / 4.2 ms slower (lost 14/18 pairs). About 4 ms; candidate E stays the
+  named commit until something larger is confirmed on top of it.
+- **In CI:** the sessions agent's first step alone (`9a2b760` on branch `exp-ci-sessions-1`: sessions
+  built while the slots are read, no timestamp vector), paired against candidate E; and a dispatch run of
+  the pipeline head with `NCPU=2` as the variant on seeds 2 and 3, to measure what the second hardware
+  thread per core is worth on a 2-core runner (SMT sensitivity; the scorer is 4 cores x 2 threads).
+- **Agents:** parser (one assembly block per event row on the in-step structure, about 240 instructions
+  per row counted by hand against 351 today; its three assembly commits on the out-of-step structure are
+  dropped with the revert), sessions (batch kernel and slot tags, steps 2 and 3), links (bucketing and
+  packed summary of the sharded build; equality with the single build confirmed on 20M seed 3 and 60M),
+  clicks (table-driven kernel), output (resumed: row groups drained during the index pass),
+  correctness (mutation sets on the named candidates; 0 disagreements so far).
