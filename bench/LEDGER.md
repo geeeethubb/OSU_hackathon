@@ -383,3 +383,23 @@ official_receipt_and_score: not yet submitted
 - **Read of both experiments:** the movement of event records (lists, placement, ordered read) is close
   to its efficient form for records of this size; the remaining cost is computing the records (parsing)
   and the per-person session work, plus the link builder thread once the parse gets shorter.
+
+### 20:55 UTC
+
+- **Official:** `2dae9298f4e1e0a5259eec54c400501b00fae26f` scored **0.64 s** (relayed by the user; the
+  record on the board is 0.29 s). CI had shown 8.5% against the 0.66 s commit on 4 vCPUs; the 8-thread
+  scorer gave 3%.
+- **Reading, to be tested by the next submission:** at 8 threads the parse workers are no longer the
+  last to finish in the parse stage; the single-threaded link builder is. Laptop, 20M seed 2, input
+  pre-faulted, index mode: parse workers 687 / 375 / 243 / 122 ms at 1 / 2 / 4 / 8 threads, link builder
+  (table plus per-user summary) 85 / 89 / 117 / 125 ms. A 4-vCPU runner cannot show this (parse 365 ms,
+  builder 146 ms there), which is why CI over-predicted the official gain of parser work.
+- **In CI now (this commit), candidate C:** the per-user summary on its own thread (`bf0f767`), the
+  lookup tables, file mapping and link parse overlapped at startup so the builder starts earlier
+  (`1d6110e`), and the parser agent's lean kernel in two halves run out of step with its own store
+  loop (`c890351`; 3 to 5% of event parsing on the laptop). Laptop checks in the scored configuration:
+  43 unit tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH. On 4 vCPUs the expected gain is small;
+  the point of submitting it is the 8-thread answer.
+- **If the reading holds, next:** links resolved per user range in parallel in index mode (pairs inside
+  one user index never need the global union-find; only the few pairs that cross users do), and the
+  click index built before the builder is waited for.
