@@ -10,7 +10,9 @@
 //!   count): two events of one bucket are less than 30 minutes apart, so a
 //!   bucket never holds a session break, and walking the occupied buckets in
 //!   order a new session starts exactly where
-//!   `bucket.min - previous_bucket.max` is over 30 minutes.
+//!   `bucket.min - previous_bucket.max` is over 30 minutes. The occupied
+//!   buckets are put in order by the same network when there are at most
+//!   16, and read back from flag bytes otherwise.
 //! * Purchases go to the session that holds their timestamp: the last one
 //!   that starts at or before it.
 //! * Clicks. A click at `t` can credit or assist exactly the sessions with
@@ -273,9 +275,22 @@ const INDEX_MASK: u64 = 0x7FFF_FFFF;
 const HASH: u32 = 0x9E37_79B1;
 
 impl Group {
+    /// Bytes of scratch held, the high-water mark over the partitions so far.
+    fn bytes(&self) -> usize {
+        held(&self.table)
+            + held(&self.locals)
+            + held(&self.ends)
+            + held(&self.staged)
+            + held(&self.staged_purchases)
+            + held(&self.staged_clicks)
+            + held(&self.events)
+            + held(&self.purchases)
+            + held(&self.clicks)
+    }
+
     /// Empties the table, sized for about as many persons as the previous partition had.
     fn begin(&mut self) {
-        let capacity = (self.locals.len() * 4).clamp(256, 1 << 24).next_power_of_two();
+        let capacity = (self.locals.len() * 8).clamp(256, 1 << 24).next_power_of_two();
         self.table.clear();
         self.table.resize(capacity, 0);
         self.shift = 32 - capacity.trailing_zeros();
@@ -568,6 +583,31 @@ mod wide {
         cuts & ((1 << count) - 1)
     }
 
+    /// Puts the first `count` (1 to 16) of the bucket numbers at `buckets`
+    /// in order: `order` gets `bucket << 4 | position` ascending, then
+    /// `u32::MAX` for the rest.
+    ///
+    /// # Safety
+    /// Needs AVX2, and 16 readable words at `buckets`.
+    #[inline(always)]
+    pub unsafe fn order_buckets(buckets: *const u32, count: usize, order: &mut [u32; NETWORK_MAX]) {
+        let last = _mm256_set1_epi32(count as i32 - 1);
+        let (first_half, second_half) =
+            (_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15));
+        // Lanes past the person's buckets become u32::MAX and sort to the end.
+        let low = _mm256_or_si256(
+            _mm256_or_si256(_mm256_slli_epi32::<4>(_mm256_loadu_si256(buckets as *const __m256i)), first_half),
+            _mm256_cmpgt_epi32(first_half, last),
+        );
+        let high = _mm256_or_si256(
+            _mm256_or_si256(_mm256_slli_epi32::<4>(_mm256_loadu_si256(buckets.add(LANES) as *const __m256i)), second_half),
+            _mm256_cmpgt_epi32(second_half, last),
+        );
+        let (low, high) = sort16(low, high);
+        _mm256_storeu_si256(order.as_mut_ptr() as *mut __m256i, low);
+        _mm256_storeu_si256(order.as_mut_ptr().add(LANES) as *mut __m256i, high);
+    }
+
     /// Of `LANES * blocks` ascending starts padded with `u32::MAX`: how many
     /// are below `floor`, and how many are at most `ts`.
     ///
@@ -603,6 +643,9 @@ struct Work {
     profile: Profile,
     /// Bucket summaries `[min, max, count, unused]`; all `EMPTY_CELL` between persons.
     cells: Vec<[u32; 4]>,
+    /// The numbers of the person's buckets, in the order they were first
+    /// met, with room to read `NETWORK_MAX` of them wherever they end.
+    touched: Vec<u32>,
     /// `0xFF` per bucket with events, in whole 32-byte groups; all zero between persons.
     flags: Vec<u8>,
     /// Sort path: the index of each session's first event, and one past the last.
@@ -649,12 +692,34 @@ struct Work {
 }
 
 impl Work {
+    /// Bytes of scratch held, the high-water mark over the persons so far.
+    fn bytes(&self) -> usize {
+        held(&self.cells)
+            + held(&self.touched)
+            + held(&self.flags)
+            + held(&self.first)
+            + held(&self.start)
+            + held(&self.count)
+            + held(&self.revenue)
+            + held(&self.purchases)
+            + held(&self.row)
+            + held(&self.category_sums)
+            + held(&self.best)
+            + held(&self.credited)
+            + held(&self.lookup)
+            + held(&self.slot_of)
+            + held(&self.slot_campaign)
+            + held(&self.masks)
+            + held(&self.pending)
+    }
+
     fn new(params: &Params, tuning: Tuning) -> Self {
         // A bucket holds at most one session start.
         let sessions = BUCKETS.max(tuning.sort_max).max(NETWORK_MAX) + 1;
         Self {
             profile: Profile::new(),
             cells: vec![EMPTY_CELL; BUCKETS],
+            touched: vec![0; BUCKETS + NETWORK_MAX],
             flags: vec![0; BUCKETS + 32],
             first: vec![0; tuning.sort_max.max(NETWORK_MAX) + 2],
             start: vec![0; sessions + LANES],
@@ -690,8 +755,14 @@ impl Drop for ScratchC {
     fn drop(&mut self) {
         if PROFILE {
             self.work.profile.report();
+            eprintln!("SESSIONS_SCRATCH bytes={}", self.group.bytes() + self.work.bytes());
         }
     }
+}
+
+/// Bytes a vector holds on to.
+fn held<T>(vector: &Vec<T>) -> usize {
+    vector.capacity() * std::mem::size_of::<T>()
 }
 
 impl ScratchC {
@@ -797,50 +868,105 @@ fn take_flags(flags: &mut [u8], base: usize) -> u32 {
     bits
 }
 
+/// The session being built while a person's bucket summaries are taken in
+/// time order.
+struct Walk {
+    /// Index of the open session.
+    open: usize,
+    /// Its events so far.
+    events: u32,
+    /// The latest timestamp seen.
+    latest: u32,
+}
+
+impl Walk {
+    /// Starts with the person's earliest bucket.
+    #[inline(always)]
+    fn first(cell: [u32; 4], start: &mut [u32]) -> Walk {
+        start[0] = cell[0];
+        Walk { open: 0, events: cell[2], latest: cell[1] }
+    }
+
+    /// Takes the next bucket in time order. The open session's count and
+    /// the next session's start are written before the gap decides whether
+    /// a session starts here.
+    #[inline(always)]
+    fn next(&mut self, cell: [u32; 4], start: &mut [u32], count: &mut [u32]) {
+        // Buckets come in time order, so `cell.min >= self.latest`.
+        let cut = cell[0] - self.latest > GAP;
+        count[self.open] = self.events;
+        start[self.open + 1] = cell[0];
+        self.open += usize::from(cut);
+        self.events = if cut { cell[2] } else { self.events + cell[2] };
+        self.latest = cell[1];
+    }
+
+    /// Closes the last session; returns how many there are.
+    #[inline(always)]
+    fn finish(self, count: &mut [u32]) -> usize {
+        count[self.open] = self.events;
+        self.open + 1
+    }
+}
+
 /// Sessions of one person from half-hour bucket summaries. Returns how many.
-fn sessions_by_buckets(events: &[u32], work: &mut Work) -> usize {
-    let (mut low, mut high) = (u32::MAX, 0u32);
+fn sessions_by_buckets(events: &[u32], work: &mut Work, network: bool) -> usize {
+    let mut touched = 0;
     for &ts in events {
         let bucket = (ts / GAP) as usize;
         // SAFETY: `ts` is a 31-bit value, so `bucket < BUCKETS`, the length
-        // of `cells` and less than that of `flags`.
+        // of `cells`; `touched` counts different buckets, so it is at most
+        // `BUCKETS`, less than the length of `work.touched`.
         unsafe {
             let cell = work.cells.get_unchecked_mut(bucket);
+            // The bucket is noted every time; the note stays the first time.
+            *work.touched.get_unchecked_mut(touched) = bucket as u32;
+            touched += usize::from(cell[2] == 0);
             cell[0] = cell[0].min(ts);
             cell[1] = cell[1].max(ts);
             cell[2] += 1;
-            *work.flags.get_unchecked_mut(bucket) = 0xFF;
         }
-        low = low.min(ts);
-        high = high.max(ts);
     }
-    // The earliest event's bucket opens the first session.
-    let (first, last) = ((low / GAP) as usize, (high / GAP) as usize);
-    let [min, max, cell_count, _] = std::mem::replace(&mut work.cells[first], EMPTY_CELL);
-    work.flags[first] = 0;
-    work.start[0] = min;
-    let (mut open, mut running, mut previous_max) = (0, cell_count, max);
-    let mut base = first;
-    while base <= last {
+    #[cfg(target_arch = "x86_64")]
+    if network && touched <= NETWORK_MAX {
+        // Few buckets: put their numbers in order with the fixed network.
+        let mut order = [0u32; NETWORK_MAX];
+        // SAFETY: `work.touched` has `NETWORK_MAX` words from its start.
+        unsafe { wide::order_buckets(work.touched.as_ptr(), touched, &mut order) };
+        let earliest = std::mem::replace(&mut work.cells[(order[0] >> 4) as usize], EMPTY_CELL);
+        let mut walk = Walk::first(earliest, &mut work.start);
+        for &entry in &order[1..touched] {
+            let cell = std::mem::replace(&mut work.cells[(entry >> 4) as usize], EMPTY_CELL);
+            walk.next(cell, &mut work.start, &mut work.count);
+        }
+        return walk.finish(&mut work.count);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = network;
+    // Many buckets: flag each one and read the flags back in bucket order.
+    let (mut low, mut high) = (usize::MAX, 0);
+    for &bucket in &work.touched[..touched] {
+        let bucket = bucket as usize;
+        work.flags[bucket] = 0xFF;
+        low = low.min(bucket);
+        high = high.max(bucket);
+    }
+    // The earliest bucket opens the first session.
+    work.flags[low] = 0;
+    let earliest = std::mem::replace(&mut work.cells[low], EMPTY_CELL);
+    let mut walk = Walk::first(earliest, &mut work.start);
+    let mut base = low;
+    while base <= high {
         let mut bits = take_flags(&mut work.flags, base);
         while bits != 0 {
             let bucket = base + bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let [min, max, cell_count, _] = std::mem::replace(&mut work.cells[bucket], EMPTY_CELL);
-            // Buckets come in time order, so `min >= previous_max`. The count
-            // and the start are written before the gap decides whether the
-            // open session ends here.
-            let cut = min - previous_max > GAP;
-            work.count[open] = running;
-            work.start[open + 1] = min;
-            open += usize::from(cut);
-            running = if cut { cell_count } else { running + cell_count };
-            previous_max = max;
+            let cell = std::mem::replace(&mut work.cells[bucket], EMPTY_CELL);
+            walk.next(cell, &mut work.start, &mut work.count);
         }
         base += 32;
     }
-    work.count[open] = running;
-    open + 1
+    walk.finish(&mut work.count)
 }
 
 /// Sets bits `from..to` (`from < to`) of a bit set of 64-bit words.
@@ -1135,7 +1261,7 @@ fn person(
     } else if count <= tuning.sort_max {
         sessions_by_sort(&mut events[..count], work)
     } else {
-        sessions_by_buckets(&events[..count], work)
+        sessions_by_buckets(&events[..count], work, tuning.network)
     };
     work.start[sessions..sessions + LANES].fill(u32::MAX);
     work.profile.lap(3);
@@ -1869,5 +1995,238 @@ mod tests {
         let (small, large) = if a < b { (a, b) } else { (b, a) };
         assert_eq!(credited(&[(start + 5, small, 0), (start + 5, large, 1)]), (0, vec![1, 1, 0]));
         assert_eq!(credited(&[(start + 5, large, 1), (start + 5, small, 0)]), (0, vec![1, 1, 0]));
+    }
+
+    /// Every tuning the per-person strategies can run under.
+    fn tunings() -> Vec<Tuning> {
+        let mut tunings = Vec::new();
+        for network in [true, false] {
+            for sort_max in [0, 40] {
+                for lookup_min in [0, 2048, usize::MAX] {
+                    tunings.push(Tuning { network, sort_max, lookup_min });
+                }
+            }
+        }
+        tunings
+    }
+
+    /// One person given in absolute milliseconds: events `(ts, purchase)` and
+    /// clicks `(ts, click ID, campaign)`, with campaigns `A` (0) and `B` (1)
+    /// and categories `A` (0) and `B` (1). Checks every tuning against the
+    /// literal rules and returns the number of sessions.
+    fn sessions_of_case(window_start: i64, events: &[(i64, Option<(u32, u32)>)], clicks: &[(i64, &str, u32)]) -> i64 {
+        let mut exotic: Vec<&str> = Vec::new();
+        let clicks: Vec<Click> = clicks
+            .iter()
+            .map(|&(ts, id, campaign)| {
+                let code = pattern_code(id.as_bytes(), b'k').unwrap_or_else(|| {
+                    let at = exotic.iter().position(|known| *known == id).unwrap_or_else(|| {
+                        exotic.push(id);
+                        exotic.len() - 1
+                    });
+                    EXOTIC_BASE + at as u64
+                });
+                Click { local: 11, ts: (ts - (window_start - WEEK_MS)) as u32, code, campaign }
+            })
+            .collect();
+        let events = events
+            .iter()
+            .map(|&(ts, purchase)| Event { local: 11, ts: (ts - window_start) as u32, purchase })
+            .collect();
+        let world = World::new(window_start, 14 * DAY, &["A", "B"], 3, &exotic);
+        let partitions = [Partition { part: 5, events, clicks }];
+        let want = expected(&world, &partitions);
+        for tuning in tunings() {
+            assert!(run(&world, tuning, &partitions, &mut Rng(window_start as u64)) == want);
+        }
+        want.rows.values().map(|row| row.0).sum()
+    }
+
+    /// The named cases of `checks/attack_rewrites.py`, for every offset of
+    /// the window start from midnight that it uses.
+    #[test]
+    fn named_cases_of_the_rewrite_attack() {
+        const MIDNIGHT: i64 = 1_790_812_800_000;
+        let (gap, day, week) = (SESSION_GAP_MS, DAY_MS, WEEK_MS);
+        let view = |ts: i64| (ts, None);
+        for offset in [0, 1, gap - 1, 26_000_000, 123_457, day - 1] {
+            let w = MIDNIGHT + offset;
+            // A bucket edge of the grid that starts at the window start.
+            let edge = w + 20 * gap;
+            let minute = 60_000;
+            let plain: [(&[i64], i64); 8] = [
+                (&[edge, edge + gap], 1),
+                (&[edge - 1, edge + gap - 1], 1),
+                (&[edge, edge + 2 * gap - 1], 2),
+                (&[edge - 1, edge + gap], 2),
+                (&[edge, edge + gap + 1], 2),
+                (&[edge - 1, edge], 1),
+                (
+                    &[
+                        edge - 1,
+                        edge - 1,
+                        edge,
+                        edge,
+                        edge,
+                        edge + gap,
+                        edge + gap,
+                        edge + gap,
+                        edge + 2 * gap + 1,
+                        edge + 2 * gap + 1,
+                    ],
+                    2,
+                ),
+                (&[edge + 7, edge + 7 + gap, edge + 7 + 2 * gap], 1),
+            ];
+            for (times, sessions) in plain {
+                let events: Vec<_> = times.iter().map(|&ts| view(ts)).collect();
+                assert_eq!(sessions_of_case(w, &events, &[]), sessions, "offset {offset}, times {times:?}");
+            }
+            // A bucket's min and max are not its first and last line.
+            let events: Vec<_> = [29, 1, 58, 31, 89, 88].iter().map(|&at| view(edge + at * minute)).collect();
+            assert_eq!(sessions_of_case(w, &events, &[(edge + 15 * minute, "k", 0)]), 1);
+            // The first and last instants of the window and of the click window.
+            let last = w + 14 * day - 1;
+            assert_eq!(sessions_of_case(w, &[view(w), view(last)], &[(w - week, "a", 0), (last, "b", 1)]), 2);
+            // A session across UTC midnight, with purchases on both sides.
+            let midnight = MIDNIGHT + 3 * day;
+            let events = [
+                view(midnight - 600_000),
+                (midnight, Some((5, 0))),
+                (midnight + gap - 1, Some((7, 1))),
+                view(midnight + 2 * gap),
+            ];
+            assert_eq!(sessions_of_case(w, &events, &[(midnight - 600_000, "k", 0)]), 2);
+            // Two clicks of one campaign whose 7-day reaches touch, almost
+            // touch, or leave a hole of one millisecond.
+            let t = MIDNIGHT + 2 * day - 1 - week;
+            for (second, start) in
+                [(t + week, t + week), (t + week + 1, t + week), (t + week + 2, t + week + 1), (t + week + 1, t + week + 1)]
+            {
+                assert_eq!(sessions_of_case(w, &[view(start)], &[(t, "k1", 0), (second, "k2", 0)]), 1);
+            }
+            // A reach that ends exactly at a midnight.
+            let events = [view(MIDNIGHT + 9 * day), view(MIDNIGHT + 9 * day + gap + 1)];
+            assert_eq!(sessions_of_case(w, &events, &[(MIDNIGHT + 2 * day, "k", 0)]), 2);
+            // A tie between campaigns: the loser of the tie still assists.
+            let clicks = [
+                (MIDNIGHT + 5 * day, "k10", 0),
+                (MIDNIGHT + 5 * day, "k9", 1),
+                (MIDNIGHT + 4 * day, "K", 0),
+                (MIDNIGHT + 5 * day, "k10", 0),
+            ];
+            assert_eq!(sessions_of_case(w, &[view(MIDNIGHT + 6 * day)], &clicks), 1);
+        }
+        // A heavy person: an event every two hours for 14 days, a click of A
+        // every hour for 21 days, clicks of B every hour for two days, every
+        // click three times.
+        let hour = 3_600_000;
+        let events: Vec<_> = (0..14 * 24).step_by(2).map(|at| view(MIDNIGHT + at * hour)).collect();
+        let ids: Vec<String> = (0..21 * 24)
+            .map(|at| format!("h{at:04}"))
+            .chain((0..48).map(|at| if at < 24 { format!("g{at:02}") } else { format!("i{at:02}") }))
+            .collect();
+        let mut clicks: Vec<(i64, &str, u32)> = Vec::new();
+        for _ in 0..3 {
+            for at in 0..21 * 24 {
+                clicks.push((MIDNIGHT - week + at as i64 * hour, &ids[at], 0));
+            }
+            for at in 0..48 {
+                clicks.push((MIDNIGHT + 4 * day + at as i64 * hour, &ids[21 * 24 + at], 1));
+            }
+        }
+        assert_eq!(sessions_of_case(MIDNIGHT, &events, &clicks), 168);
+    }
+
+    /// A network of compare-exchanges sorts every input if it sorts every
+    /// input of zeros and ones.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_network_sorts_every_zero_one_input() {
+        use std::arch::x86_64::*;
+        for pattern in 0u32..1 << NETWORK_MAX {
+            let input: [u32; NETWORK_MAX] = std::array::from_fn(|lane| pattern >> lane & 1);
+            let mut output = [0u32; NETWORK_MAX];
+            // SAFETY: the arrays hold two registers each; the crate is built with AVX2.
+            unsafe {
+                let (low, high) = wide::sort16(
+                    _mm256_loadu_si256(input.as_ptr() as *const __m256i),
+                    _mm256_loadu_si256(input.as_ptr().add(LANES) as *const __m256i),
+                );
+                _mm256_storeu_si256(output.as_mut_ptr() as *mut __m256i, low);
+                _mm256_storeu_si256(output.as_mut_ptr().add(LANES) as *mut __m256i, high);
+            }
+            let zeros = NETWORK_MAX - pattern.count_ones() as usize;
+            for (lane, &value) in output.iter().enumerate() {
+                assert_eq!(value, u32::from(lane >= zeros), "pattern {pattern:#06x}");
+            }
+        }
+    }
+
+    /// The AVX2 kernels against plain code, on values at the ends of their ranges.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernels_match_plain_code() {
+        let mut rng = Rng(7);
+        let edge = |rng: &mut Rng| match rng.below(6) {
+            0 => 0,
+            1 => TS_MASK as u32,
+            2 => GAP * rng.below(1193) as u32,
+            3 => GAP * rng.below(1193) as u32 + GAP - 1,
+            _ => rng.below(TS_MASK + 1) as u32,
+        };
+        for _ in 0..20_000 {
+            let count = rng.range(1, NETWORK_MAX as u64) as usize;
+            // Whatever follows the first `count` words must not matter.
+            let mut events: [u32; NETWORK_MAX] = std::array::from_fn(|_| rng.next() as u32);
+            let step = rng.pick(&[0, 1, GAP - 1, GAP, GAP + 1, 3 * GAP]);
+            let mut ts = edge(&mut rng) % (TS_MASK as u32 - 16 * 3 * GAP);
+            for event in &mut events[..count] {
+                *event = ts;
+                let jump = rng.below(2 * u64::from(GAP)) as u32;
+                ts += rng.pick(&[0, step, step, jump]);
+            }
+            rng.shuffle(&mut events[..count]);
+            let mut want = events[..count].to_vec();
+            want.sort_unstable();
+            let want_cuts = (1..count).fold(0u32, |cuts, at| cuts | u32::from(want[at] - want[at - 1] > GAP) << at);
+            let mut sorted = [0u32; NETWORK_MAX];
+            // SAFETY: `events` has `NETWORK_MAX` words.
+            let cuts = unsafe { wide::sort_and_cut(events.as_ptr(), count, &mut sorted) };
+            assert_eq!(&sorted[..count], &want[..]);
+            assert!(sorted[count..].iter().all(|&pad| pad == u32::MAX));
+            assert_eq!(cuts, want_cuts);
+
+            // Bucket numbers, all different as a person's are.
+            let mut buckets: [u32; NETWORK_MAX] = std::array::from_fn(|_| rng.next() as u32);
+            let mut chosen = BTreeSet::new();
+            while chosen.len() < count {
+                let any = rng.below(BUCKETS as u64) as u32;
+                chosen.insert(rng.pick(&[0, BUCKETS as u32 - 1, any]));
+            }
+            let mut picked: Vec<u32> = chosen.iter().copied().collect();
+            rng.shuffle(&mut picked);
+            buckets[..count].copy_from_slice(&picked);
+            let mut order = [0u32; NETWORK_MAX];
+            // SAFETY: `buckets` has `NETWORK_MAX` words.
+            unsafe { wide::order_buckets(buckets.as_ptr(), count, &mut order) };
+            for (rank, &bucket) in chosen.iter().enumerate() {
+                assert_eq!(order[rank] >> 4, bucket);
+                assert_eq!(buckets[(order[rank] & 15) as usize], bucket);
+            }
+            assert!(order[count..].iter().all(|&pad| pad == u32::MAX));
+
+            // Reach over padded ascending starts.
+            let blocks = rng.range(1, 8) as usize;
+            let sessions = rng.range(LANES as u64 * (blocks as u64 - 1) + 1, (LANES * blocks) as u64) as usize;
+            let mut starts: Vec<u32> = (0..sessions).map(|_| edge(&mut rng)).collect();
+            starts.sort_unstable();
+            starts.resize(LANES * blocks, u32::MAX);
+            let (floor, ts) = (edge(&mut rng), edge(&mut rng));
+            // SAFETY: `starts` has `LANES * blocks` words.
+            let (below, up_to) = unsafe { wide::reach(starts.as_ptr(), blocks, floor, ts) };
+            assert_eq!(below, starts[..sessions].iter().filter(|&&start| start < floor).count());
+            assert_eq!(up_to, starts[..sessions].iter().filter(|&&start| start <= ts).count());
+        }
     }
 }
