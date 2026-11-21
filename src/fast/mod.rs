@@ -99,8 +99,9 @@ pub struct Ctx {
     /// `SS_EVENT_PART_BITS` / `SS_PERSON_PART_BITS`, override them.
     pub event_part_bits: u32,
     pub person_part_bits: u32,
-    /// The generator's scramble keys, when the data has them (see `keys`);
-    /// `SS_STRUCT=0` leaves them unused.
+    /// The generator's scramble keys (see `keys`). Index mode is an
+    /// experiment: only `SS_STRUCT=1` looks for them. Without it they stay
+    /// unset and every dataset runs through the general path.
     pub keys: Option<keys::Keys>,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
@@ -353,7 +354,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let event_files = map_all(&data.join("events"))?;
     let event_bytes: u64 = event_files.iter().map(|file| file.len() as u64).sum();
     ctx.size_partitions(event_bytes);
-    if !std::env::var_os("SS_STRUCT").is_some_and(|value| value == "0") {
+    if std::env::var_os("SS_STRUCT").is_some_and(|value| value == "1") {
         // The start of the largest events file is enough to find the keys.
         if let Some(largest) = event_files.iter().max_by_key(|file| file.len()) {
             let excerpt = &largest.bytes()[..largest.len().min(1 << 16)];
