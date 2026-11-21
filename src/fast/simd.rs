@@ -949,6 +949,12 @@ unsafe fn event_decode_lean<const MODE: u32>(
     ROW_DROP
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Rows the lean event kernel declined on this thread.
+    static DECLINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `event_row_fast`, out of line: the lean kernel's way out.
 #[inline(never)]
 unsafe fn event_row_declined<const MODE: u32, const INDEXED: bool>(
@@ -957,6 +963,8 @@ unsafe fn event_row_declined<const MODE: u32, const INDEXED: bool>(
     out: &mut ParseOut,
     row: &mut EventRow,
 ) -> (usize, u32) {
+    #[cfg(test)]
+    DECLINED.with(|count| count.set(count.get() + 1));
     event_row_fast::<MODE, INDEXED>(ctx, p, out, row)
 }
 
@@ -1175,4 +1183,677 @@ pub unsafe fn click_row_fast(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -
         ts: (ts_ms - click_window_start) as u32,
     };
     (length, ROW_EMIT)
+}
+
+// Every fast kernel against the general parsers, line by line: named probes
+// for each range and shape check a kernel makes, then random damage.
+#[cfg(test)]
+mod tests {
+    use super::super::keys::{scramble, Keys};
+    use super::super::parse::{click_row_slow, event_row_slow, event_row_slow_indexed, SlowIndexed};
+    use super::*;
+
+    const PRODUCTS: &str = "product_id,category\np1,shoes\np2,books\np10,toys\np12345,games\np50000,games\n\
+        p007,odd\nP9,upper\npx,letters\np4194303,edge\np4194304,past\np9999999,seven\np10000000,eight\n\"p77\",quoted\n";
+    const CAMPAIGNS: &str = "campaign_id,channel\nc_1,search\nc_2,social\nc_10,email\nc_2000,display\nc_007,odd\n\
+        C_9,upper\ncamp,letters\nc_1048575,edge\nc_1048576,past\nc_9999999,seven\nc_10000000,eight\n\"c_77\",quoted\n";
+
+    /// What may follow a row's newline: the kernels read past it.
+    const TAILS: [&[u8]; 5] = [
+        b"e9zzzzzzz,u9zzzzzzz,2026-10-03T23:58:10Z,2026-10-03T23:59:10Z,view,p1,\n",
+        b"\"\"\"\"\"\"\"\"",
+        b",,,,,,,,",
+        b"\n\n\n\n",
+        b"0123456789",
+    ];
+
+    const WINDOWS: [(&str, &str, &str); 5] = [
+        ("october", "2026-10-01T00:00:00Z", "2026-10-15T00:00:00Z"),
+        ("new-year", "2027-12-25T00:00:00Z", "2028-01-08T00:00:00Z"),
+        ("leap-day", "2028-02-20T00:00:00Z", "2028-03-05T00:00:00Z"),
+        ("epoch", "1970-01-10T00:00:00Z", "1970-01-20T00:00:00Z"),
+        ("odd-start", "1791071890123", "1791671890123"),
+    ];
+
+    fn f1(milliseconds: i64) -> String {
+        let (year, month, day) = civil_from_days(milliseconds.div_euclid(DAY_MS));
+        let second = milliseconds.rem_euclid(DAY_MS) / 1_000;
+        format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", second / 3_600, second / 60 % 60, second % 60)
+    }
+
+    fn base36(mut value: u64) -> String {
+        let mut digits = Vec::new();
+        loop {
+            digits.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(value % 36) as usize]);
+            value /= 36;
+            if value == 0 {
+                break;
+            }
+        }
+        digits.reverse();
+        String::from_utf8(digits).unwrap()
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Runs lines through every kernel and compares with the general parser.
+    struct Checker {
+        ctx: Ctx,
+        keys: Keys,
+        out: ParseOut,
+        buffer: Vec<u8>,
+        lines: usize,
+        /// Lines each kernel answered itself: general, lean, indexed general,
+        /// indexed lean, click.
+        answered: [usize; 5],
+        /// Generated IDs and good times, for the probes to build rows from.
+        event_id: String,
+        user_id: String,
+        ts: String,
+        ingest: String,
+        /// The same time as `ts`, as 13 digits.
+        digits: String,
+    }
+
+    impl Checker {
+        fn new(window: usize) -> Self {
+            let (tag, window_start, window_end) = WINDOWS[window];
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!("ss-simd-{}-{tag}-{number}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let manifest = format!("{{\"window_start\": \"{window_start}\", \"window_end\": \"{window_end}\"}}");
+            std::fs::write(directory.join("manifest.json"), manifest).unwrap();
+            std::fs::write(directory.join("products.csv"), PRODUCTS).unwrap();
+            std::fs::write(directory.join("campaigns.csv"), CAMPAIGNS).unwrap();
+            let mut ctx = Ctx::load(&directory).unwrap().expect("a window the engine takes");
+            let _ = std::fs::remove_dir_all(&directory);
+            let keys =
+                Keys { event_key: 0xD1_40AB_A0D1, user_key: 0x0E_8948_5787, index_bound: 3 << 20, user_bound: 1 << 17 };
+            ctx.keys = Some(keys);
+            let out = ParseOut::new(&ctx);
+            // Generated IDs of 8 characters.
+            let event_id = (1_000..).map(|index| base36(scramble(index, keys.event_key))).find(|id| id.len() == 8);
+            let user_id = (700..).map(|user| base36(scramble(user << 9 | 3, keys.user_key))).find(|id| id.len() == 8);
+            let ts_ms = (ctx.window_start + DAY_MS + 3_723_000).div_euclid(1_000) * 1_000;
+            let ts = f1(ts_ms);
+            let ingest = f1((ctx.window_start + DAY_MS + 3_900_000).div_euclid(1_000) * 1_000);
+            Self {
+                ctx,
+                keys,
+                out,
+                buffer: Vec::new(),
+                lines: 0,
+                answered: [0; 5],
+                event_id: format!("e{}", event_id.unwrap()),
+                user_id: format!("u{}", user_id.unwrap()),
+                ts,
+                ingest,
+                digits: format!("{ts_ms:013}"),
+            }
+        }
+
+        /// `line`, then a newline, then enough of a tail, with a newline in front.
+        fn load(&mut self, line: &[u8], tail: &[u8]) -> *const u8 {
+            self.buffer.clear();
+            self.buffer.push(b'\n');
+            self.buffer.extend_from_slice(line);
+            self.buffer.push(b'\n');
+            while self.buffer.len() < line.len() + 2 * ROW_PAD {
+                self.buffer.extend_from_slice(tail);
+            }
+            // SAFETY: the buffer is longer than one byte.
+            unsafe { self.buffer.as_ptr().add(1) }
+        }
+
+        fn event_with(&mut self, line: &[u8], tail: &[u8]) {
+            let p = self.load(line, tail);
+            let shown = String::from_utf8_lossy(line).into_owned();
+            let slow = event_row_slow(&self.ctx, line);
+            let slow_indexed = event_row_slow_indexed(&self.ctx, &self.keys, line);
+            for kernel in 0..4 {
+                let mut row = EventRow::default();
+                // SAFETY: `load` left ROW_PAD readable bytes after `p`.
+                let (length, status) = unsafe {
+                    match kernel {
+                        0 => event_row_fast::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
+                        1 => event_row_lean::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
+                        2 => event_row_fast::<MODE_ROW, true>(&self.ctx, p, &mut self.out, &mut row),
+                        _ => event_row_lean::<MODE_ROW, true>(&self.ctx, p, &mut self.out, &mut row),
+                    }
+                };
+                if status != ROW_LONG {
+                    assert_eq!(length, line.len(), "kernel {kernel}: length of {shown:?}");
+                }
+                match (status, kernel < 2) {
+                    (ROW_EMIT, true) => assert_eq!(Some(row), slow, "kernel {kernel} on {shown:?}"),
+                    (ROW_DROP, true) => assert_eq!(None, slow, "kernel {kernel} on {shown:?}"),
+                    (ROW_EMIT, false) => {
+                        assert_eq!(SlowIndexed::Indexed(row), slow_indexed, "kernel {kernel} on {shown:?}")
+                    }
+                    (ROW_DROP, false) => assert_eq!(SlowIndexed::Drop, slow_indexed, "kernel {kernel} on {shown:?}"),
+                    (ROW_SLOW | ROW_LONG, _) | (ROW_GENERIC, false) => continue,
+                    _ => panic!("kernel {kernel}: status {status} on {shown:?}"),
+                }
+                self.answered[kernel] += 1;
+            }
+        }
+
+        fn click_with(&mut self, line: &[u8], tail: &[u8]) {
+            let p = self.load(line, tail);
+            let shown = String::from_utf8_lossy(line).into_owned();
+            let slow = click_row_slow(&self.ctx, line);
+            let mut click = ClickRecord { user: 0, code_and_campaign: 0, ts: 0 };
+            // SAFETY: `load` left ROW_PAD readable bytes after `p`.
+            let (length, status) = unsafe { click_row_fast(&self.ctx, p, &mut click) };
+            if status != ROW_LONG {
+                assert_eq!(length, line.len(), "click: length of {shown:?}");
+            }
+            match status {
+                ROW_EMIT => assert_eq!(Some(click), slow, "click {shown:?}"),
+                ROW_DROP => assert_eq!(None, slow, "click {shown:?}"),
+                ROW_SLOW | ROW_LONG => return,
+                _ => panic!("click: status {status} on {shown:?}"),
+            }
+            self.answered[4] += 1;
+        }
+
+        /// One tail per line, in turn.
+        fn event(&mut self, line: &[u8]) {
+            if !line.contains(&b'\n') {
+                self.lines += 1;
+                self.event_with(line, TAILS[self.lines % TAILS.len()]);
+            }
+        }
+
+        fn click(&mut self, line: &[u8]) {
+            if !line.contains(&b'\n') {
+                self.lines += 1;
+                self.click_with(line, TAILS[self.lines % TAILS.len()]);
+            }
+        }
+
+        /// Every tail.
+        fn event_all(&mut self, line: &[u8]) {
+            if !line.contains(&b'\n') {
+                for tail in TAILS {
+                    self.event_with(line, tail);
+                }
+            }
+        }
+
+        fn click_all(&mut self, line: &[u8]) {
+            if !line.contains(&b'\n') {
+                for tail in TAILS {
+                    self.click_with(line, tail);
+                }
+            }
+        }
+
+        /// A view with these times, long enough for the fast kernels (the
+        /// price of a view is ignored, so it pads the row).
+        fn view(&self, ts: &str, ingest: &str) -> Vec<u8> {
+            let mut line = format!("{},{},{ts},{ingest},view,p12345,", self.event_id, self.user_id).into_bytes();
+            while line.len() < 66 {
+                line.push(b'7');
+            }
+            line
+        }
+
+        fn purchase(&self, ts: &str, product: &str, price: &str) -> Vec<u8> {
+            format!("{},{},{ts},{},purchase,{product},{price}", self.event_id, self.user_id, self.ingest).into_bytes()
+        }
+
+        fn click_line(&self, campaign: &str, ts: &str) -> Vec<u8> {
+            format!("k{},{},{campaign},{ts}", &self.event_id[1..], self.user_id).into_bytes()
+        }
+
+        /// `ts` as an event's and a click's timestamp, and as an ingest time.
+        fn times(&mut self, ts: &str) {
+            let ingest = self.ingest.clone();
+            let good = self.ts.clone();
+            self.event(&self.view(ts, &ingest));
+            self.event(&self.view(&good, ts));
+            self.click(&self.click_line("c_1", ts));
+        }
+    }
+
+    /// The years around the window, and some that are no years.
+    fn years(check: &Checker) -> Vec<String> {
+        let (year, _, _) = civil_from_days(check.ctx.window_start.div_euclid(DAY_MS));
+        let mut years: Vec<String> = (year - 1..=year + 1).map(|year| format!("{year:04}")).collect();
+        years.extend(["0000", "9999", "2O26", "20 6", "-026", "+026"].map(String::from));
+        years
+    }
+
+    fn for_each_window(mut probe: impl FnMut(&mut Checker)) {
+        for window in 0..WINDOWS.len() {
+            let mut check = Checker::new(window);
+            probe(&mut check);
+            // The probes must reach the kernels, not only the general parser.
+            assert!(check.lines > 0);
+        }
+    }
+
+    #[test]
+    fn every_month_and_day() {
+        for_each_window(|check| {
+            for year in years(check) {
+                for month in 0..100 {
+                    for day in 0..100 {
+                        check.times(&format!("{year}-{month:02}-{day:02}T12:34:56Z"));
+                        if month <= 13 && (day <= 1 || day >= 27) {
+                            check.times(&format!("{year}-{month:02}-{day:02}T00:00:00+00:00"));
+                            check.times(&format!("{year}-{month:02}-{day:02}T23:59:59-10:00"));
+                            check.times(&format!("{year}-{month:02}-{day:02}T00:00:00+12:00"));
+                        }
+                    }
+                }
+            }
+            assert!(check.answered.iter().all(|&count| count > 1_000), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn every_hour_minute_second_and_offset() {
+        for_each_window(|check| {
+            let day = check.ts[..10].to_string();
+            for value in 0..100 {
+                for zone in ["Z", "+00:00", "-04:00", "+05:30"] {
+                    check.times(&format!("{day}T{value:02}:34:56{zone}"));
+                    check.times(&format!("{day}T12:{value:02}:56{zone}"));
+                    check.times(&format!("{day}T12:34:{value:02}{zone}"));
+                }
+            }
+            // Every offset, with every sign that is one and some that are not.
+            for sign in ["+", "-", " ", "Z", "*", ".", ":", "0", "T", "\"", "\u{2212}"] {
+                for hours in 0..100 {
+                    for minutes in 0..100 {
+                        check.times(&format!("{day}T12:34:56{sign}{hours:02}:{minutes:02}"));
+                    }
+                }
+            }
+            for text in ["+0200", "+02-00", "+02:0", "+2:00", "+02:000", "+02:00Z", "Z+02:00", "+02.00", "+ 2:00", "+02: 0"] {
+                check.times(&format!("{day}T12:34:56{text}"));
+            }
+            assert!(check.answered.iter().all(|&count| count > 1_000), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn every_byte_of_a_timestamp() {
+        for_each_window(|check| {
+            let start = check.ctx.window_start + DAY_MS;
+            let f1_text = check.ts.clone();
+            let f2_text = format!("{}-04:00", &f1_text[..19]);
+            let f3_text = format!("{:013}", start + 3_723_456);
+            for text in [f1_text, f2_text, f3_text] {
+                for at in 0..text.len() {
+                    for byte in 0..=255u8 {
+                        let mut bytes = text.clone().into_bytes();
+                        bytes[at] = byte;
+                        // A line is bytes, not text: build it as such.
+                        let ingest = check.ingest.clone();
+                        let mut line = format!("{},{},", check.event_id, check.user_id).into_bytes();
+                        line.extend_from_slice(&bytes);
+                        line.extend_from_slice(format!(",{ingest},view,p12345,7777777777777").as_bytes());
+                        check.event(&line);
+                        let mut line = format!("{},{},{},", check.event_id, check.user_id, check.ts).into_bytes();
+                        line.extend_from_slice(&bytes);
+                        line.extend_from_slice(b",view,p12345,7777777777777");
+                        check.event(&line);
+                        let mut line = format!("k{},{},c_1,", &check.event_id[1..], check.user_id).into_bytes();
+                        line.extend_from_slice(&bytes);
+                        check.click(&line);
+                    }
+                }
+            }
+            assert!(check.answered.iter().all(|&count| count > 1_000), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn digit_timestamps() {
+        for_each_window(|check| {
+            let (start, end) = (check.ctx.window_start, check.ctx.window_end);
+            let mut values: Vec<String> = Vec::new();
+            for value in [
+                0,
+                1,
+                start - WEEK_MS - 1,
+                start - WEEK_MS,
+                start - 1,
+                start,
+                start + 1,
+                start + DAY_MS,
+                end - 1,
+                end,
+                end + 1,
+                i64::MAX,
+            ] {
+                values.push(value.to_string());
+            }
+            values.extend(
+                ["9223372036854775808", "18446744073709551615", "18446744073709551616", "99999999999999999999999999"]
+                    .map(String::from),
+            );
+            for length in 1..=30 {
+                values.push("9".repeat(length));
+                values.push("0".repeat(length));
+                values.push(format!("1{}", "0".repeat(length - 1)));
+            }
+            for value in values.clone() {
+                // Leading zeros up to every length, and damage of every kind.
+                for width in value.len()..=value.len().max(26) {
+                    check.times(&format!("{value:0>width$}"));
+                }
+                for extra in ["+", "-", " ", ".0", "e3", "\r", "x", "Z"] {
+                    check.times(&format!("{extra}{value}"));
+                    check.times(&format!("{value}{extra}"));
+                }
+            }
+            assert!(check.answered.iter().all(|&count| count > 100), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn prices_products_and_campaigns() {
+        for_each_window(|check| {
+            let mut numbers: Vec<String> = Vec::new();
+            for value in [
+                0u64, 1, 2, 7, 9, 10, 12, 77, 99, 100, 250, 999, 1_000, 2_000, 2_001, 12_345, 50_000, 50_001, 99_999,
+                100_000, 999_999, 1_000_000, 1_048_575, 1_048_576, 4_194_303, 4_194_304, 9_999_999, 10_000_000,
+                10_000_001, 12_345_678, 99_999_999, 100_000_000, 999_999_999, 4_294_967_295, 4_294_967_296,
+                4_294_967_297, 10_000_000_000, 18_446_744_073_709_551_615,
+            ] {
+                for width in 0..=20 {
+                    numbers.push(format!("{value:0>width$}"));
+                }
+            }
+            numbers.extend(
+                ["", "-5", "+500", "19.99", "1e3", "1 ", " 1", "1\r", "0x10", "١٢٣", "12a", "a12", "1,2", "\u{ff11}"]
+                    .map(String::from),
+            );
+            let ts = check.digits.clone();
+            for number in &numbers {
+                for (open, close) in [("", ""), ("\"", "\""), ("\"", ""), ("", "\"")] {
+                    // As a price, as a product number and as a campaign number.
+                    check.event(&check.purchase(&ts, "p12345", &format!("{open}{number}{close}")));
+                    check.event(&check.purchase(&ts, &format!("{open}p{number}{close}"), "1234"));
+                    check.event(&check.purchase(&ts, &format!("{open}{number}{close}"), "1234"));
+                    check.event(&check.purchase(&ts, &format!("{open}P{number}{close}"), "1234"));
+                    check.click(&check.click_line(&format!("{open}c_{number}{close}"), &ts));
+                    check.click(&check.click_line(&format!("{open}C_{number}{close}"), &ts));
+                    check.click(&check.click_line(&format!("{open}c{number}{close}"), &ts));
+                    check.click(&check.click_line(&format!("{open}{number}{close}"), &ts));
+                }
+            }
+            for text in ["px", "camp", "p", "c_", "organic", "unknown", "p 1", "c_ 1", "p1 ", "c_1 ", " p1", " c_1"] {
+                check.event(&check.purchase(&ts, text, "1234"));
+                check.click(&check.click_line(text, &ts));
+            }
+            assert!(check.answered.iter().all(|&count| count > 100), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn ids_and_types() {
+        for_each_window(|check| {
+            let (ts, ingest) = (check.ts.clone(), check.ingest.clone());
+            let keys = check.keys;
+            let mut ids: Vec<String> = Vec::new();
+            // Generated numbers of every length, in and out of range.
+            for index in [0, 1, 35, 36, 1_295, 1_296, 46_655, 3 << 20, (3 << 20) - 1, (1 << 40) - 1] {
+                ids.push(base36(scramble(index, keys.event_key)));
+                ids.push(base36(scramble(index, keys.user_key)));
+                ids.push(base36(index));
+            }
+            for index in 0..600u64 {
+                ids.push(base36(scramble(index * 7_919, keys.event_key)));
+                ids.push(base36(scramble((index * 131) << 9 | (index & 7), keys.user_key)));
+            }
+            let plain = ids.clone();
+            for id in plain.iter().take(30) {
+                ids.push(format!("0{id}"));
+                ids.push(format!("{id}0"));
+                ids.push(id.to_uppercase());
+                ids.push(format!("{id} "));
+                ids.push(format!(" {id}"));
+                for at in 0..id.len() {
+                    for byte in ["A", "Z", "_", "-", "{", "`", "/", ":", "@", "[", "\u{e9}", "\r", " "] {
+                        ids.push(format!("{}{byte}{}", &id[..at], &id[at + 1..]));
+                    }
+                }
+            }
+            ids.extend(["", "zzzzzzzz", "zzzzzzzzz", "1000000000", "00000000", "0"].map(String::from));
+            for id in &ids {
+                for prefix in ["e", "u", "k", "E", "U", "", "x", "ee"] {
+                    for (open, close) in [("", ""), ("\"", "\"")] {
+                        let id = format!("{open}{prefix}{id}{close}");
+                        let mut line = format!("{id},{},{ts},{ingest},view,p12345,", check.user_id).into_bytes();
+                        line.resize(line.len().max(70), b'7');
+                        check.event(&line);
+                        let mut line = format!("{},{id},{ts},{ingest},view,p12345,", check.event_id).into_bytes();
+                        line.resize(line.len().max(70), b'7');
+                        check.event(&line);
+                        check.click(&format!("{id},{},c_1,{ts}", check.user_id).into_bytes());
+                        check.click(&format!("k{},{id},c_1,{ts}", &check.event_id[1..]).into_bytes());
+                    }
+                }
+            }
+            for kind in [
+                "view", "cart", "purchase", "View", "CART", "Purchase", "view ", " cart", "purchases", "viewx", "car",
+                "", "vieW", "purchas", "purchase\r", "refund", "v", "viewcart", "cartview", "purchaseX",
+            ] {
+                for (open, close) in [("", ""), ("\"", "\""), ("\"", ""), ("", "\"")] {
+                    for price in ["", "1234", "\"1234\"", "0", "x", "77777777777777777"] {
+                        let line = format!(
+                            "{},{},{ts},{ingest},{open}{kind}{close},p12345,{price}",
+                            check.event_id, check.user_id
+                        );
+                        check.event(line.as_bytes());
+                    }
+                }
+            }
+            assert!(check.answered.iter().all(|&count| count > 100), "{:?}", check.answered);
+        });
+    }
+
+    /// Rows of every regular kind, for the damage tests.
+    fn regular_rows(check: &Checker) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let start = check.ctx.window_start + DAY_MS;
+        let ts_forms = [
+            check.ts.clone(),
+            format!("{}-04:00", &check.ts[..19]),
+            format!("{}+05:30", &check.ts[..19]),
+            format!("{:013}", start + 3_723_456),
+        ];
+        let short_event = (2_000..).map(|index| base36(scramble(index, check.keys.event_key))).find(|id| id.len() == 7);
+        let short_user =
+            (900..).map(|user| base36(scramble(user << 9, check.keys.user_key))).find(|id| id.len() == 7).unwrap();
+        let short_event = short_event.unwrap();
+        let mut events = Vec::new();
+        let mut clicks = Vec::new();
+        for ts in &ts_forms {
+            for (event, user) in [
+                (check.event_id.clone(), check.user_id.clone()),
+                (format!("e{short_event}"), format!("u{short_user}")),
+            ] {
+                for (kind, product, price) in [
+                    ("view", "p12345", ""),
+                    ("cart", "p2", "77777"),
+                    ("view", "p50000", "+500"),
+                    ("purchase", "p12345", "3216"),
+                    ("purchase", "p1", "0250"),
+                    ("purchase", "p777", "10000000"),
+                ] {
+                    let fields = [&event[..], &user[..], &ts[..], &check.ingest[..], kind, product, price];
+                    // Every choice of quoted fields.
+                    for quoted in 0..128 {
+                        let mut line = Vec::new();
+                        for (at, field) in fields.iter().enumerate() {
+                            if at > 0 {
+                                line.push(b',');
+                            }
+                            if quoted >> at & 1 == 1 {
+                                line.push(b'"');
+                                line.extend_from_slice(field.as_bytes());
+                                line.push(b'"');
+                            } else {
+                                line.extend_from_slice(field.as_bytes());
+                            }
+                        }
+                        events.push(line);
+                    }
+                }
+                for campaign in ["c_1", "c_2000", "c_10"] {
+                    let fields = [&format!("k{}", &event[1..])[..], &user[..], campaign, &ts[..]];
+                    for quoted in 0..16 {
+                        let mut line = Vec::new();
+                        for (at, field) in fields.iter().enumerate() {
+                            if at > 0 {
+                                line.push(b',');
+                            }
+                            if quoted >> at & 1 == 1 {
+                                line.push(b'"');
+                                line.extend_from_slice(field.as_bytes());
+                                line.push(b'"');
+                            } else {
+                                line.extend_from_slice(field.as_bytes());
+                            }
+                        }
+                        clicks.push(line);
+                    }
+                }
+            }
+        }
+        (events, clicks)
+    }
+
+    #[test]
+    fn regular_rows_with_one_change() {
+        for_each_window(|check| {
+            let (events, clicks) = regular_rows(check);
+            let changes: [&[u8]; 12] = [b"\"", b",", b"\r", b" ", b"x", b"0", b"Z", b"\"\"", b",,", b"\",", b",\"", b"9"];
+            for (number, line) in events.iter().enumerate() {
+                let declined = DECLINED.with(|count| count.get());
+                check.event_all(line);
+                // Rows the lean kernel is made for: it must take them itself.
+                if line.len() >= 64 && line.len() <= 95 {
+                    assert_eq!(
+                        DECLINED.with(|count| count.get()),
+                        declined,
+                        "the lean kernel declined {:?}",
+                        String::from_utf8_lossy(line)
+                    );
+                }
+                // One in 13 rows gets every change at every position.
+                if number % 13 == 0 {
+                    for at in 0..=line.len() {
+                        for change in changes {
+                            let mut inserted = line[..at].to_vec();
+                            inserted.extend_from_slice(change);
+                            inserted.extend_from_slice(&line[at..]);
+                            check.event(&inserted);
+                            if at < line.len() {
+                                let mut replaced = line[..at].to_vec();
+                                replaced.extend_from_slice(change);
+                                replaced.extend_from_slice(&line[at + 1..]);
+                                check.event(&replaced);
+                            }
+                        }
+                        if at < line.len() {
+                            let mut removed = line[..at].to_vec();
+                            removed.extend_from_slice(&line[at + 1..]);
+                            check.event(&removed);
+                        }
+                    }
+                }
+            }
+            for line in &clicks {
+                check.click_all(line);
+                for at in 0..=line.len() {
+                    for change in changes {
+                        let mut inserted = line[..at].to_vec();
+                        inserted.extend_from_slice(change);
+                        inserted.extend_from_slice(&line[at..]);
+                        check.click(&inserted);
+                        if at < line.len() {
+                            let mut replaced = line[..at].to_vec();
+                            replaced.extend_from_slice(change);
+                            replaced.extend_from_slice(&line[at + 1..]);
+                            check.click(&replaced);
+                        }
+                    }
+                    if at < line.len() {
+                        let mut removed = line[..at].to_vec();
+                        removed.extend_from_slice(&line[at + 1..]);
+                        check.click(&removed);
+                    }
+                }
+            }
+            assert!(check.answered.iter().all(|&count| count > 1_000), "{:?}", check.answered);
+        });
+    }
+
+    #[test]
+    fn random_damage() {
+        let rounds = if cfg!(debug_assertions) { 20_000 } else { 400_000 };
+        for_each_window(|check| {
+            let (events, clicks) = regular_rows(check);
+            let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ check.ctx.window_start as u64);
+            const BYTES: &[u8] = b"\",,\"\r 0123456789azAZ:-+TZ._/e\x80\xff\x00pu";
+            let damage = |random: &mut Random, line: &mut Vec<u8>, pool: &[Vec<u8>]| {
+                for _ in 0..random.below(4) {
+                    let at = random.below(line.len() + 1);
+                    match random.below(7) {
+                        0 if at < line.len() => line[at] = BYTES[random.below(BYTES.len())],
+                        1 if at < line.len() => line[at] = random.next() as u8,
+                        2 => line.insert(at, BYTES[random.below(BYTES.len())]),
+                        3 if at < line.len() => {
+                            line.remove(at);
+                        }
+                        4 => {
+                            // A piece of another row in place of the rest.
+                            let other = &pool[random.below(pool.len())];
+                            line.truncate(at);
+                            line.extend_from_slice(&other[random.below(other.len() + 1)..]);
+                        }
+                        5 if at < line.len() => {
+                            // Two bytes swapped.
+                            let to = random.below(line.len());
+                            line.swap(at, to);
+                        }
+                        _ => {
+                            let length = random.below(12);
+                            let digit = b'0' + random.below(10) as u8;
+                            line.splice(at..at, std::iter::repeat(digit).take(length));
+                        }
+                    }
+                }
+            };
+            for _ in 0..rounds {
+                let mut line = events[random.below(events.len())].clone();
+                damage(&mut random, &mut line, &events);
+                check.event(&line);
+                let mut line = clicks[random.below(clicks.len())].clone();
+                damage(&mut random, &mut line, &clicks);
+                check.click(&line);
+            }
+            assert!(check.answered.iter().all(|&count| count > rounds / 20), "{:?}", check.answered);
+        });
+    }
 }
