@@ -509,14 +509,13 @@ fn write_user_daily(
 ) -> std::io::Result<()> {
     let path = output.join("user_daily").join(format!("part-{thread:03}.parquet"));
     // The counts and sums are INT32 unless one of them does not fit.
-    let narrow = if parquet::flags() & 2 != 0 { ColumnType::Int64 } else { ColumnType::Int32 };
-    if !user_daily_file(ctx, &path, rows, user_exotic, narrow)? {
+    if !user_daily_file(ctx, &path, rows, user_exotic, ColumnType::Int32)? {
         user_daily_file(ctx, &path, rows, user_exotic, ColumnType::Int64)?;
     }
     Ok(())
 }
 
-/// Writes one user_daily file with integer columns of the given kind.
+/// Writes one user_daily file with integer columns of the given type.
 /// `Ok(false)`: a value does not fit INT32, write the file again with INT64.
 fn user_daily_file(
     ctx: &Ctx,
@@ -539,15 +538,24 @@ fn user_daily_file(
     let mut start = 0;
     while start < count {
         let end = (start + group_rows).min(count);
-        writer.begin(end - start)?;
-        writer.runs(&rows.names[start..end], |code, slot| user_name(code, slot, user_exotic))?;
-        writer.dates(&rows.days[start..end], ctx.first_day as i32)?;
-        for column in [&rows.sessions, &rows.events, &rows.revenue] {
-            if !writer.ints(&column[start..end])? {
-                return Ok(false);
-            }
+        let names = &rows.names[start..end];
+        let days = &rows.days[start..end];
+        let sessions = &rows.sessions[start..end];
+        let events = &rows.events[start..end];
+        let revenue = &rows.revenue[start..end];
+        let top_category = &rows.top_category[start..end];
+        // Days with purchases go last in their row group: the other rows then
+        // share one run of zero revenue and one run of null categories.
+        writer.begin(names.len(), |row| top_category[row] != NO_CATEGORY)?;
+        writer.runs(names, |code, slot| user_name(code, slot, user_exotic))?;
+        writer.dates(|row| days[row])?;
+        if !writer.ints(|row| sessions[row])?
+            || !writer.ints(|row| events[row])?
+            || !writer.sparse_ints(|row| revenue[row])?
+        {
+            return Ok(false);
         }
-        writer.strings(&ctx.category_names, &rows.top_category[start..end], NO_CATEGORY)?;
+        writer.strings(&ctx.category_names, |row| top_category[row], NO_CATEGORY)?;
         start = end;
     }
     writer.finish()?;
@@ -609,12 +617,14 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
         let mut start = 0;
         while start < day.len() {
             let end = (start + GROUP_ROWS).min(day.len());
-            writer.begin(end - start)?;
+            let (channel, day) = (&channel[start..end], &day[start..end]);
+            writer.begin(end - start, |_| false)?;
             writer.runs(&campaign[start..end], |id, _| Text::Long(&ctx.campaign_ids[id as usize]))?;
-            writer.strings(&channels, &channel[start..end], u32::MAX)?;
-            writer.dates(&day[start..end], ctx.first_day as i32)?;
+            writer.strings(&channels, |row| channel[row], u32::MAX)?;
+            writer.dates(|row| day[row])?;
             for column in &columns {
-                if !writer.ints(&column[start..end])? {
+                let column = &column[start..end];
+                if !writer.ints(|row| column[row])? {
                     return Ok(false);
                 }
             }
@@ -623,8 +633,7 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
         writer.finish()?;
         Ok(true)
     };
-    let narrow = if parquet::flags() & 2 != 0 { ColumnType::Int64 } else { ColumnType::Int32 };
-    if !write(narrow)? {
+    if !write(ColumnType::Int32)? {
         write(ColumnType::Int64)?;
     }
     Ok(())
