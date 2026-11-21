@@ -901,6 +901,26 @@ impl ScratchC {
         person(&self.params, self.tuning, &mut self.work, out, click_exotic, name, events, count, purchases, clicks);
     }
 
+    /// `one_person` for a person whose events are already in time order:
+    /// the sessions come from one pass over the timestamps, with no sort and
+    /// no bucket summaries. `events` is exactly the person's timestamps (at
+    /// least one; no spare words needed, and they are not changed). If they
+    /// are not ascending after all, the person is done as by `one_person`,
+    /// so the rows are the same either way. The assists stay pending until
+    /// `flush`.
+    #[inline]
+    pub fn one_person_in_order(
+        &mut self,
+        out: &mut PassCOut,
+        click_exotic: &[Box<[u8]>],
+        name: u64,
+        events: &[u32],
+        purchases: &[[u64; 2]],
+        clicks: &[[u64; 2]],
+    ) {
+        person_in_order(&self.params, self.tuning, &mut self.work, out, click_exotic, name, events, purchases, clicks);
+    }
+
     /// Adds the assists that `one_person` left pending to `out`.
     pub fn flush(&mut self, out: &mut PassCOut) {
         apply_assists(&mut self.work.pending, &mut out.campaign_days);
@@ -942,6 +962,30 @@ fn starts_up_to(starts: &[u32], limit: u32) -> usize {
     } else {
         starts.partition_point(|&start| start <= limit)
     }
+}
+
+/// Sessions of one person whose timestamps are already ascending, in one
+/// pass over them. Returns how many, or `None` at the first timestamp that
+/// is smaller than the one before it.
+fn sessions_in_order(events: &[u32], work: &mut Work) -> Option<usize> {
+    let mut open = 0;
+    let mut first = 0;
+    work.start[0] = events[0];
+    for at in 1..events.len() {
+        let (previous, ts) = (events[at - 1], events[at]);
+        if ts < previous {
+            return None;
+        }
+        // The open session's count and the next one's start are written
+        // before the gap decides whether a session starts here.
+        let cut = ts - previous > GAP;
+        work.count[open] = (at - first) as u32;
+        work.start[open + 1] = ts;
+        first = if cut { at } else { first };
+        open += usize::from(cut);
+    }
+    work.count[open] = (events.len() - first) as u32;
+    Some(open + 1)
 }
 
 /// Sessions of one person by sorting its timestamps. Returns how many.
@@ -1052,9 +1096,11 @@ impl Walk {
 fn sessions_by_buckets(events: &[u32], work: &mut Work, network: bool) -> usize {
     let mut touched = 0;
     for &ts in events {
-        let bucket = (ts / GAP) as usize;
-        // SAFETY: `ts` is a 31-bit value, so `bucket < BUCKETS`, the length
-        // of `cells`; `touched` counts different buckets, so it is at most
+        // Timestamps have 31 bits. The mask changes nothing for them and
+        // keeps the index in range for any other value.
+        let bucket = ((ts & TS_MASK as u32) / GAP) as usize;
+        // SAFETY: a 31-bit value gives `bucket < BUCKETS`, the length of
+        // `cells`; `touched` counts different buckets, so it is at most
         // `BUCKETS`, less than the length of `work.touched`.
         unsafe {
             let cell = work.cells.get_unchecked_mut(bucket);
@@ -1258,7 +1304,6 @@ fn attribute_narrow(
     params: &Params,
     tuning: Tuning,
     work: &mut Work,
-    out: &mut PassCOut,
     click_exotic: &[Box<[u8]>],
     sessions: usize,
     rows: usize,
@@ -1303,7 +1348,6 @@ fn attribute_narrow(
 
     // Assists per campaign and day, kept for the end of the partition. Every
     // (campaign, row) pair is written; the write stays only if the count is not zero.
-    let _ = out;
     work.pending.reserve(slots as usize * rows);
     let mut length = work.pending.len();
     let pending = work.pending.as_mut_ptr();
@@ -1329,7 +1373,6 @@ fn attribute_narrow(
 fn attribute_wide(
     params: &Params,
     work: &mut Work,
-    out: &mut PassCOut,
     click_exotic: &[Box<[u8]>],
     sessions: usize,
     rows: usize,
@@ -1375,13 +1418,13 @@ fn attribute_wide(
         }
         bits.fill(0);
     }
-    let _ = out;
     work.profile.lap(9);
 }
 
 /// Everything for one person: its rows and its share of the campaign cells.
 /// `events` starts at the person's first event and runs to the end of the
-/// grouped events and their padding; the person has the first `count`.
+/// grouped events and their padding (`EVENT_PAD` words after the last
+/// person's last event); the person has the first `count`, in any order.
 #[allow(clippy::too_many_arguments)]
 fn person(
     params: &Params,
@@ -1402,8 +1445,50 @@ fn person(
     } else {
         sessions_by_buckets(&events[..count], work, tuning.network)
     };
-    work.start[sessions..sessions + LANES].fill(u32::MAX);
     work.profile.lap(3);
+    finish_person(params, tuning, work, out, click_exotic, name, sessions, purchases, clicks);
+}
+
+/// Everything for one person whose events are already in time order: its
+/// sessions come from one pass over the timestamps, with no sort and no
+/// bucket summaries. `events` is exactly the person's events (at least
+/// one). If they turn out not to be in order, the person is done as by
+/// `person`, so the rows are the same either way.
+#[allow(clippy::too_many_arguments)]
+fn person_in_order(
+    params: &Params,
+    tuning: Tuning,
+    work: &mut Work,
+    out: &mut PassCOut,
+    click_exotic: &[Box<[u8]>],
+    name: u64,
+    events: &[u32],
+    purchases: &[[u64; 2]],
+    clicks: &[[u64; 2]],
+) {
+    let sessions = match sessions_in_order(events, work) {
+        Some(sessions) => sessions,
+        None => sessions_by_buckets(events, work, tuning.network),
+    };
+    work.profile.lap(3);
+    finish_person(params, tuning, work, out, click_exotic, name, sessions, purchases, clicks);
+}
+
+/// The rest of a person once `work.start` and `work.count` hold its
+/// `sessions` sessions: rows, purchases, attribution and output.
+#[allow(clippy::too_many_arguments)]
+fn finish_person(
+    params: &Params,
+    tuning: Tuning,
+    work: &mut Work,
+    out: &mut PassCOut,
+    click_exotic: &[Box<[u8]>],
+    name: u64,
+    sessions: usize,
+    purchases: &[[u64; 2]],
+    clicks: &[[u64; 2]],
+) {
+    work.start[sessions..sessions + LANES].fill(u32::MAX);
 
     // One row per day with a session start. Every session writes the row it
     // would start; the write stays only where the day changes.
@@ -1440,9 +1525,9 @@ fn person(
     let has_clicks = !clicks.is_empty();
     if has_clicks {
         if sessions <= 64 {
-            attribute_narrow(params, tuning, work, out, click_exotic, sessions, rows, clicks);
+            attribute_narrow(params, tuning, work, click_exotic, sessions, rows, clicks);
         } else {
-            attribute_wide(params, work, out, click_exotic, sessions, rows, clicks);
+            attribute_wide(params, work, click_exotic, sessions, rows, clicks);
         }
         for session in 0..sessions {
             let day = work.row_day[work.row[session] as usize] as usize;
@@ -1847,6 +1932,11 @@ mod tests {
             let click_lists: Vec<PartList> = click_writers.iter_mut().map(PartWriter::finish).collect();
             partition_core(partition.part, &event_lists, &click_lists, &world.exotic, &mut out, &mut scratch);
         }
+        tables_of(&out)
+    }
+
+    /// A worker's output as tables.
+    fn tables_of(out: &PassCOut) -> Tables {
         let count = out.names.len();
         for length in [out.days.len(), out.sessions.len(), out.events.len(), out.revenue.len(), out.top_category.len()]
         {
@@ -1859,6 +1949,55 @@ mod tests {
             assert!(tables.rows.insert(key, row).is_none(), "two rows for one person and day");
         }
         tables
+    }
+
+    /// Runs every person through `person_in_order`, as a caller that keeps
+    /// each person's events together does: with the events sorted, or (to
+    /// reach the fallback) just as they come.
+    fn run_in_order(world: &World, tuning: Tuning, partitions: &[Partition], sorted: bool) -> Tables {
+        let params = Params::new(
+            world.window_start,
+            world.first_day,
+            world.day_count,
+            world.campaigns,
+            world.campaigns - 1,
+            &world.category_names,
+            TEST_PERSON_SHIFT,
+        );
+        let mut scratch = ScratchC::with(params, tuning);
+        let mut out = PassCOut {
+            names: Vec::new(),
+            days: Vec::new(),
+            sessions: Vec::new(),
+            events: Vec::new(),
+            revenue: Vec::new(),
+            top_category: Vec::new(),
+            campaign_days: vec![[0; 4]; world.campaigns * world.day_count],
+        };
+        for partition in partitions {
+            let mut people: BTreeMap<u32, (Vec<u32>, Vec<[u64; 2]>, Vec<[u64; 2]>)> = BTreeMap::new();
+            for event in &partition.events {
+                let person = people.entry(event.local).or_default();
+                person.0.push(event.ts);
+                if let Some((price, category)) = event.purchase {
+                    person.1.push([u64::from(event.ts), u64::from(price) | (u64::from(category) << 32)]);
+                }
+            }
+            for click in &partition.clicks {
+                if let Some(person) = people.get_mut(&click.local) {
+                    person.2.push([u64::from(click.ts), click.code | (u64::from(click.campaign) << 42)]);
+                }
+            }
+            for (&local, (events, purchases, clicks)) in &mut people {
+                if sorted {
+                    events.sort_unstable();
+                }
+                let name = unmix(((partition.part as u64) << TEST_PERSON_SHIFT) | u64::from(local));
+                scratch.one_person_in_order(&mut out, &world.exotic, name, events, purchases, clicks);
+            }
+            scratch.flush(&mut out);
+        }
+        tables_of(&out)
     }
 
     fn expected(world: &World, partitions: &[Partition]) -> Tables {
@@ -2087,6 +2226,10 @@ mod tests {
             // The default settings on the same data.
             let got = run(&world, Tuning::DEFAULT, &partitions, &mut rng);
             assert!(got == want, "seed {seed}: tables differ with the default tuning");
+            // The entry for events that are already in time order, and its
+            // fallback when they are not.
+            assert!(run_in_order(&world, tuning, &partitions, true) == want, "seed {seed}: in order");
+            assert!(run_in_order(&world, tuning, &partitions, false) == want, "seed {seed}: not in order");
         }
     }
 
@@ -2186,6 +2329,8 @@ mod tests {
         let want = expected(&world, &partitions);
         for tuning in tunings() {
             assert!(run(&world, tuning, &partitions, &mut Rng(window_start as u64)) == want);
+            assert!(run_in_order(&world, tuning, &partitions, true) == want);
+            assert!(run_in_order(&world, tuning, &partitions, false) == want);
         }
         want.rows.values().map(|row| row.0).sum()
     }
