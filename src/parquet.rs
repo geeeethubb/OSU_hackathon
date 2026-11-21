@@ -1046,6 +1046,13 @@ fn zeroed<T: Copy + Default, const SIZE: usize>() -> Box<[T; SIZE]> {
     }
 }
 
+/// The error for input a column method cannot write, or for a page that did
+/// not come out at the size its header announced. The engine's caller then
+/// falls back to the reference pipeline instead of leaving a wrong file.
+fn refused(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("Parquet writer: {what}"))
+}
+
 /// Replaces `buffer` by a zeroed one of at least `needed` bytes that starts
 /// with the same `keep` bytes. A fresh zeroed allocation costs nothing for the
 /// pages that are never written.
@@ -1211,7 +1218,9 @@ impl Pending {
     /// Ends a page. In a GZIP chunk its body becomes one GZIP member and its
     /// header is written again with both sizes.
     fn seal(&mut self, page: Page) -> io::Result<()> {
-        assert_eq!(self.used - page.body, page.size, "page size");
+        if self.used - page.body != page.size {
+            return Err(refused("a page is not as long as its header says"));
+        }
         if !self.gzip {
             return Ok(());
         }
@@ -1521,8 +1530,12 @@ impl<'a> GroupWriter<'a> {
             nulls_lead &= here == (tails_through != tails_before);
             tails_before = tails_through;
         }
-        assert!(optional || present == rows, "null in a required column");
-        assert!(present == 0 || (highest as usize) < dictionary.len(), "index outside the dictionary");
+        if !optional && present != rows {
+            return Err(refused("null in a required column"));
+        }
+        if present > 0 && highest as usize >= dictionary.len() {
+            return Err(refused("string index outside the dictionary"));
+        }
 
         // The definition levels (1 = present) of a nullable column, as RLE
         // runs in written order behind their byte length: what its data page
