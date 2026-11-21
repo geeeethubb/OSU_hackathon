@@ -565,6 +565,14 @@ pub struct Runner {
     /// `SS_BATCH=<n>` sets how many persons a batch holds, for A/B runs: the
     /// same rows either way.
     batched: bool,
+    /// Whether the assists of a partition are kept in the session kernel's
+    /// small table until `flush` instead of going to the output partition
+    /// by partition (`SS_ASSISTS=1`), and whether the sessions a batch
+    /// credits to campaigns are kept the same way (`SS_ASSISTS=2`; the
+    /// runner still has to tell the kernel). For A/B runs: the same cells
+    /// either way.
+    hold_assists: bool,
+    hold_sessions: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
     aliases: Vec<[u64; 2]>,
@@ -603,10 +611,13 @@ impl Runner {
         if let Some(persons) = batch.filter(|&persons| persons > 0) {
             kernel.set_batch_persons(persons);
         }
+        let hold = std::env::var("SS_ASSISTS").ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
         Self {
             place: ScratchI::new(index_shift),
             kernel,
             batched: batch != Some(0),
+            hold_assists: hold >= 1,
+            hold_sessions: hold >= 2,
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
@@ -648,6 +659,11 @@ impl Runner {
         }
         if !any {
             return;
+        }
+        if self.hold_sessions {
+            // Once: the kernel's table is as long as the output's.
+            self.hold_sessions = false;
+            self.kernel.hold_sessions(c_out.campaign_days.len());
         }
         if self.batched {
             self.read::<true>(shared, part, b_out, c_out);
@@ -857,7 +873,11 @@ impl Runner {
         }
         self.records = records;
         self.finish_batch(shared, c_out);
-        self.kernel.flush(c_out);
+        if self.hold_assists {
+            self.kernel.hold_assists(c_out);
+        } else {
+            self.kernel.flush(c_out);
+        }
         if !c_out.names.is_empty() {
             // A thread handles about `parts / threads` partitions like this one.
             self.kernel.reserve_rows(c_out, c_out.names.len() * shared.parts / shared.threads * 3 / 2);
@@ -972,13 +992,17 @@ impl Runner {
         }
     }
 
-    /// Adds the assists still pending after runs processed outside `partition`.
+    /// Adds the assists still pending after runs processed outside
+    /// `partition`, and the ones the partitions have held back
+    /// (`SS_ASSISTS=1`). Must be called after the runner's last partition
+    /// and run, with the output it has been writing to.
     pub fn flush(&mut self, c_out: &mut PassCOut) {
         self.kernel.flush(c_out);
     }
 
     /// Hands the session kernel back, for the general pass that follows.
     pub fn into_kernel(self) -> ScratchC {
+        assert!(!self.kernel.holds_assists(), "Runner::flush was not called after the runner's last partition");
         self.kernel
     }
 

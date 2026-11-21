@@ -787,6 +787,16 @@ struct Work {
     /// Assists of the partition's persons so far that are not in the output
     /// yet: `campaign_days index << 32 | sessions`.
     pending: Vec<u64>,
+    /// Assists per `campaign_days` cell that `ScratchC::hold_assists` has
+    /// taken from `pending` and that are not in the output yet (empty until
+    /// the first one is held); credited sessions per cell that a batch has
+    /// kept back the same way (`hold_sessions`); and a bound on the sum of
+    /// both.
+    held: Vec<u32>,
+    held_sessions: Vec<u32>,
+    held_most: u64,
+    /// Whether a batch keeps its credited sessions back.
+    hold_sessions: bool,
     /// The output columns have been given their room.
     reserved: bool,
 }
@@ -811,6 +821,8 @@ impl Work {
             + held(&self.slot_campaign)
             + held(&self.masks)
             + held(&self.pending)
+            + held(&self.held)
+            + held(&self.held_sessions)
     }
 
     fn new(params: &Params, tuning: Tuning) -> Self {
@@ -839,6 +851,10 @@ impl Work {
             slot_campaign: Vec::new(),
             masks: Vec::new(),
             pending: Vec::new(),
+            held: Vec::new(),
+            held_sessions: Vec::new(),
+            held_most: 0,
+            hold_sessions: false,
             reserved: false,
         }
     }
@@ -1041,10 +1057,71 @@ impl ScratchC {
         }
     }
 
-    /// Adds the assists that `one_person` left pending to `out`.
+    /// Adds the assists that `one_person` and the batch left pending to
+    /// `out`, and the ones `hold_assists` has kept back.
     pub fn flush(&mut self, out: &mut PassCOut) {
         assert_eq!(self.batch.persons, 0, "a batch of persons was left unfinished");
         apply_assists(&mut self.work.pending, &mut out.campaign_days);
+        if self.work.held_most != 0 {
+            for (cell, held) in out.campaign_days.iter_mut().zip(&mut self.work.held) {
+                cell[3] += i64::from(std::mem::take(held));
+            }
+            for (cell, held) in out.campaign_days.iter_mut().zip(&mut self.work.held_sessions) {
+                cell[0] += i64::from(std::mem::take(held));
+            }
+            self.work.held_most = 0;
+        }
+    }
+
+    /// From now on a batch keeps the sessions it credits to campaigns in a
+    /// table of the scratch's own, as `hold_assists` does with assists and
+    /// for the same reason. `hold_assists` must then be called at least once
+    /// per 2^24 such sessions, and `flush` at the end. `cells` is the length
+    /// of the output's `campaign_days`.
+    pub fn hold_sessions(&mut self, cells: usize) {
+        self.work.held_sessions = vec![0; cells];
+        self.work.hold_sessions = true;
+    }
+
+    /// Takes the pending assists into a table of the scratch's own instead
+    /// of adding them to `out`; a later `flush` adds them all at once.
+    ///
+    /// An assist is one addition to a cell somewhere in `out.campaign_days`,
+    /// a megabyte that no near cache keeps while a partition's records go
+    /// through it, and a 20M input has eleven million of them. A count per
+    /// cell is an eighth of that table and stays close. `out` is only
+    /// written if the counts could overflow otherwise.
+    pub fn hold_assists(&mut self, out: &mut PassCOut) {
+        assert_eq!(self.batch.persons, 0, "a batch of persons was left unfinished");
+        let work = &mut self.work;
+        // An entry counts sessions of one person: fewer than `BUCKETS + 1`.
+        // The sessions a batch keeps back until the next call are allowed for.
+        let most = work.pending.len() as u64 * (BUCKETS as u64 + 1);
+        if work.held_most + most > u64::from(u32::MAX) - (1 << 24) {
+            self.flush(out);
+            return;
+        }
+        if work.held.is_empty() {
+            work.held = vec![0; out.campaign_days.len()];
+        }
+        work.held_most += most;
+        for at in 0..work.pending.len() {
+            #[cfg(target_arch = "x86_64")]
+            if let Some(&later) = work.pending.get(at + 12) {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                // SAFETY: a prefetch reads nothing, whatever the address.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(work.held.as_ptr().wrapping_add((later >> 32) as usize) as *const i8) };
+            }
+            let entry = work.pending[at];
+            work.held[(entry >> 32) as usize] += entry as u32;
+        }
+        work.pending.clear();
+    }
+
+    /// Whether `hold_assists` has kept assists back that no `flush` has
+    /// added to the output yet.
+    pub fn holds_assists(&self) -> bool {
+        self.work.held_most != 0
     }
 
     /// Reserves room for `rows` more rows in `out`'s columns, the first time
@@ -1390,6 +1467,21 @@ fn finish_batch(
             attribute_narrow(params, tuning, work, click_exotic, count, person_rows, clicks);
         } else {
             attribute_wide(params, work, click_exotic, count, person_rows, clicks);
+        }
+        if work.hold_sessions {
+            // The count of sessions per cell is kept back; the few sessions
+            // with purchases write the rest of their cell at once.
+            for session in 0..count {
+                let day = batch.row_day[batch.row_of[from + session] as usize] as usize;
+                let cell = work.credited[session] as usize * params.day_count + day;
+                work.held_sessions[cell] += 1;
+                if batch.bought[from + session] > 0 {
+                    out.campaign_days[cell][1] += 1;
+                    out.campaign_days[cell][2] += batch.revenue[from + session];
+                }
+            }
+            work.held_most += count as u64;
+            continue;
         }
         for session in 0..count {
             let day = batch.row_day[batch.row_of[from + session] as usize] as usize;
@@ -2059,6 +2151,7 @@ fn partition_core(
 ) {
     let ScratchC { params, tuning, group, work, batch } = scratch;
     assert_eq!(batch.persons, 0, "a batch of persons was left unfinished");
+    assert_eq!(work.held_most, 0, "assists were held back and never added to the output");
     // The first block of every list, while the lists are measured.
     for list in event_lists.iter().chain(click_lists) {
         if let Some(block) = list.blocks().next() {
@@ -2445,6 +2538,9 @@ mod tests {
         // Decides how many persons a batch holds and where one is finished early.
         let mut rng = Rng(partitions.iter().map(|partition| partition.events.len() as u64).sum());
         scratch.set_batch_persons(rng.pick(&[1, 3, BATCH_PERSONS, BATCH_PERSONS_MOST]));
+        if rng.one_in(2) {
+            scratch.hold_sessions(out.campaign_days.len());
+        }
         for partition in partitions {
             // Per person: its events with their purchase words, and its clicks.
             let mut people: BTreeMap<u32, (Vec<(u32, Option<u64>)>, Vec<[u64; 2]>)> = BTreeMap::new();
@@ -2485,8 +2581,16 @@ mod tests {
                 scratch.one_person_in_order(&mut out, &world.exotic, name, &events, &purchases, clicks);
             }
             scratch.finish_batch(&mut out, &world.exotic);
-            scratch.flush(&mut out);
+            // Mostly held back and added at the end, sometimes at once.
+            if rng.one_in(4) {
+                scratch.flush(&mut out);
+            } else {
+                scratch.hold_assists(&mut out);
+            }
         }
+        scratch.flush(&mut out);
+        assert!(!scratch.holds_assists());
+        assert!(scratch.work.held.iter().chain(&scratch.work.held_sessions).all(|&count| count == 0));
         tables_of(&out)
     }
 
@@ -3037,9 +3141,14 @@ mod tests {
                     0 => batched.one_person_in_order(&mut out_batched, &world.exotic, name, &events, &purchases, &clicks),
                     // Begun in the batch with an event out of place, taken out again.
                     1 if stream.len() > 1 && stream[stream.len() - 1].0 > 0 => {
+                        // A copy of the last event somewhere before it, with a
+                        // purchase, and the last event a millisecond earlier:
+                        // half of the time the copy stands right before it,
+                        // and one millisecond is all that is out of order.
                         let mut broken = stream.clone();
                         let last = broken.len() - 1;
-                        broken.insert(rng.range(1, last as u64) as usize, (broken[last].0, Some(77)));
+                        let at = if rng.one_in(2) { last } else { rng.range(1, last as u64) as usize };
+                        broken.insert(at, (broken[last].0, Some(77)));
                         broken[last + 1].0 -= 1;
                         assert!(!give_to_batch(&mut batched, &mut out_batched, &world.exotic, name, &broken, &clicks));
                         batched.one_person_in_order(&mut out_batched, &world.exotic, name, &events, &purchases, &clicks);
