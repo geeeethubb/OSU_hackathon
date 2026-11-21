@@ -5,8 +5,12 @@
 # this builds that commit's root Dockerfile as TAG (default ss-prior:latest) so
 # bench-20m can time it against HEAD on the same machine and the same inputs.
 #
-# Never fails the job: a missing or unbuildable prior only means there is no
-# comparison, which the report says. Writes status=, sha= and image= to
+# Fails closed: when bench/BEST_SHA names a commit that cannot be found, has
+# no root Dockerfile or does not build, the step fails and with it the job,
+# because a green run without the prior-versus-candidate pairs looks like
+# evidence and is not (a mistyped hash once went unnoticed that way). Only a
+# missing or empty file, or a baseline that is HEAD itself, means "no
+# comparison" without an error. Writes status=, sha= and image= to
 # $GITHUB_OUTPUT. status is one of: absent, empty, unknown-commit,
 # same-as-head, no-dockerfile, build-failed, built.
 set -uo pipefail
@@ -27,24 +31,25 @@ if ! git cat-file -e "$want^{commit}" 2>/dev/null; then
     || git fetch --no-tags --quiet origin '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
 fi
 if ! full=$(git rev-parse --verify --quiet "$want^{commit}"); then
-  echo "::warning::bench/BEST_SHA names '$want', which is not a commit this checkout can find"
-  emit sha "$want"; emit status unknown-commit; exit 0
+  echo "::error::bench/BEST_SHA names '$want', which is not a commit this checkout can find"
+  emit sha "$want"; emit status unknown-commit; exit 1
 fi
 emit sha "$full"
 if [ "$full" = "$head" ]; then emit status same-as-head; exit 0; fi
 
 tree=$(mktemp -d)
 if ! git worktree add --detach "$tree/src" "$full" >/dev/null 2>&1; then
-  echo "::warning::could not check out $full"
-  emit status unknown-commit; exit 0
+  echo "::error::could not check out $full"
+  emit status unknown-commit; exit 1
 fi
 if [ ! -f "$tree/src/Dockerfile" ]; then
-  echo "::warning::bench/BEST_SHA commit $full has no root Dockerfile"
-  emit status no-dockerfile; exit 0
+  echo "::error::bench/BEST_SHA commit $full has no root Dockerfile"
+  emit status no-dockerfile; exit 1
 fi
 if docker buildx build --platform linux/amd64 --load -t "$TAG" "$tree/src"; then
   emit image "$TAG"; emit status built
 else
-  echo "::warning::the image of bench/BEST_SHA commit $full did not build"
+  echo "::error::the image of bench/BEST_SHA commit $full did not build"
   emit status build-failed
+  exit 1
 fi

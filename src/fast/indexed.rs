@@ -30,9 +30,9 @@ use super::arena::PartList;
 use super::codes::{unmix, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
-use super::links::LinkTable;
+use super::links::{LinkTable, SIMPLE, SLOW};
 use super::parse::CLICK_USERS;
-use super::sessions::{PassCOut, ScratchC, EVENT_SPARE};
+use super::sessions::{PassCOut, ScratchC};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -84,7 +84,13 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
                 if first || ((word1 >> 1) & INGEST_MASK) < ((scratch.slots[slot][1] >> 1) & INGEST_MASK) {
                     scratch.occupied[slot >> 6] |= bit;
                     scratch.slots[slot] = [word0, word1];
-                    scratch.purchases[slot] = purchase;
+                    // Only a purchase writes its word: every reader looks at
+                    // `purchases[slot]` only when the slot's winner has the
+                    // purchase bit, and that winner wrote it here. What an
+                    // earlier winner or partition left is never read.
+                    if has_purchase == 1 {
+                        scratch.purchases[slot] = purchase;
+                    }
                     any = true;
                 }
             }
@@ -146,19 +152,23 @@ unsafe impl Send for ClickTarget {}
 unsafe impl Sync for ClickTarget {}
 
 impl ClickIndexBuilder {
-    /// `lists[thread][range]` are the click lists. Ranges after the last one
-    /// that has clicks are left out.
-    pub fn new(lists: &[Vec<PartList>]) -> (Self, ClickTarget) {
-        let ranges = lists.first().map_or(0, Vec::len);
+    /// How many clicks a range holds: `lists` are its click lists, one per thread.
+    pub fn count(lists: impl Iterator<Item = PartList>) -> u32 {
+        lists.map(|list| list.words() / 2).sum::<usize>() as u32
+    }
+
+    /// `counts[range]` is the number of clicks of each range (`count`).
+    /// Ranges after the last one that has clicks are left out.
+    pub fn new(counts: &[u32]) -> (Self, ClickTarget) {
+        let ranges = counts.len();
         let mut bases = Vec::with_capacity(ranges + 1);
         let (mut total, mut used) = (0usize, 0usize);
-        for range in 0..ranges {
+        for (range, &clicks) in counts.iter().enumerate() {
             bases.push(total as u32);
-            let clicks: usize = lists.iter().map(|per_thread| per_thread[range].words() / 2).sum();
             if clicks > 0 {
                 used = range + 1;
             }
-            total += clicks;
+            total += clicks as usize;
         }
         assert!(total <= u32::MAX as usize);
         bases.truncate(used);
@@ -221,9 +231,19 @@ impl ClickIndexBuilder {
 
 /// Winning events whose own ID is not a generated one (they went through the
 /// general dedup pass) but whose person is simple: they join their user's run.
-#[derive(Default)]
 pub struct Extras {
     by_user: HashMap<u64, (AtomicBool, Vec<Record>)>,
+    /// One bit per `user % FILTER_BITS` that has extras: almost every run
+    /// asks about a user without any, and this answers without hashing.
+    filter: Vec<u64>,
+}
+
+const FILTER_BITS: u64 = 1 << 14;
+
+impl Default for Extras {
+    fn default() -> Self {
+        Self { by_user: HashMap::new(), filter: vec![0; (FILTER_BITS / 64) as usize] }
+    }
 }
 
 impl Extras {
@@ -246,7 +266,9 @@ impl Extras {
                         let word0 = (1 << 32) | (key & (TS_MASK << 1)) | 1;
                         match (links.lookup(name), keys.user_number_of_code(name)) {
                             ((_, false), Some(number)) => {
-                                let entry = extras.by_user.entry(number >> 9).or_default();
+                                let user = number >> 9;
+                                extras.filter[((user % FILTER_BITS) / 64) as usize] |= 1 << (user % 64);
+                                let entry = extras.by_user.entry(user).or_default();
                                 entry.1.push([word0, (number << 22) | is_purchase, purchase]);
                             }
                             _ => forward_named(out, name, word0, is_purchase, purchase),
@@ -262,84 +284,17 @@ impl Extras {
         self.by_user.len()
     }
 
+    /// The extras of `user`, if it has any.
+    #[inline(always)]
+    fn of(&self, user: u64) -> Option<&(AtomicBool, Vec<Record>)> {
+        if self.filter[((user % FILTER_BITS) / 64) as usize] & (1 << (user % 64)) == 0 {
+            return None;
+        }
+        self.by_user.get(&user)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_user.is_empty()
-    }
-}
-
-/// Set in a user's summary: it has a simple link component, named by the
-/// code in the low bits, whose members' aliases are the bits of the mask.
-const SIMPLE: u64 = 1 << 63;
-/// Set in a user's summary: the two words cannot describe its IDs (a member
-/// of a complex component, two simple components, or an alias of 64 or
-/// more). Each of its IDs is then resolved through the link table.
-const SLOW: u64 = 1 << 62;
-
-/// What the link table says about each user index, flat and in the order
-/// the index pass visits the users, so that a run costs one read instead of
-/// one table probe per ID.
-pub struct Summary {
-    /// Per user index: `[name code | SIMPLE | SLOW, member alias mask]`.
-    /// All zero: none of the user's IDs is in a link component of two or
-    /// more, so each is a person of its own.
-    users: Vec<[u64; 2]>,
-}
-
-impl Summary {
-    pub fn build(keys: &Keys, links: &LinkTable) -> Self {
-        // Zeroed pages stay untouched for user indexes without links.
-        let mut users = vec![[0u64; 2]; keys.user_bound as usize];
-        let note = |users: &mut [[u64; 2]], [number, name, complex]: [u64; 3]| {
-            let entry = &mut users[(number >> 9) as usize];
-            let alias = number & (ALIASES - 1);
-            if complex != 0 || alias >= 64 {
-                entry[0] |= SLOW;
-            } else if entry[0] & SIMPLE == 0 {
-                entry[0] |= SIMPLE | name;
-                entry[1] |= 1 << alias;
-            } else if entry[0] & CODE_MASK == name {
-                entry[1] |= 1 << alias;
-            } else {
-                entry[0] |= SLOW;
-            }
-        };
-        // The members come in table order, so their users are all over the
-        // array: each one waits in a ring while its entry is on the way to
-        // the cache.
-        const AHEAD: usize = 32;
-        let mut ring = [[0u64; 3]; AHEAD];
-        let mut seen = 0usize;
-        links.for_each_member(|member, name, complex| {
-            // An ID that is not a generated one makes its component complex:
-            // the generated members of that component say so themselves.
-            let Some(number) = keys.user_number_of_code(member) else {
-                return;
-            };
-            #[cfg(target_arch = "x86_64")]
-            {
-                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                // SAFETY: a prefetch reads nothing, whatever the address;
-                // the index is in range anyway (`user_number_of_code`).
-                unsafe { _mm_prefetch(users.as_ptr().wrapping_add((number >> 9) as usize) as *const i8, _MM_HINT_T0) };
-            }
-            let at = seen % AHEAD;
-            if seen >= AHEAD {
-                note(&mut users, ring[at]);
-            }
-            ring[at] = [number, name, u64::from(complex)];
-            seen += 1;
-        });
-        // Order does not matter for the result: notes only set bits or
-        // compare names.
-        for waiting in &ring[..seen.min(AHEAD)] {
-            note(&mut users, *waiting);
-        }
-        Self { users }
-    }
-
-    #[inline(always)]
-    fn of(&self, user: u64) -> [u64; 2] {
-        self.users.get(user as usize).copied().unwrap_or([SLOW, 0])
     }
 }
 
@@ -347,7 +302,6 @@ impl Summary {
 pub struct Shared<'a> {
     pub keys: &'a Keys,
     pub links: &'a LinkTable,
-    pub summary: &'a Summary,
     pub clicks: &'a ClickIndex,
     pub extras: &'a Extras,
     pub click_exotic: &'a [Box<[u8]>],
@@ -604,8 +558,9 @@ impl Runner {
     /// summary describes its IDs and nothing else joins the run.
     #[inline(always)]
     fn begin_direct(&mut self, shared: &Shared, user: u64) -> bool {
-        let [head, mask] = shared.summary.of(user);
-        if head & SLOW != 0 || (!shared.extras.is_empty() && shared.extras.by_user.contains_key(&user)) {
+        // What the links say about this user's IDs, in one read.
+        let [head, mask] = shared.links.summary(user);
+        if head & SLOW != 0 || shared.extras.of(user).is_some() {
             return false;
         }
         self.ts.clear();
@@ -707,12 +662,12 @@ impl Runner {
         pieces: &[&[Record]],
     ) {
         // The user's events whose own ID is not a generated one join the run.
-        let extra: &[Record] = match shared.extras.by_user.get(&user) {
-            Some((used, more)) if !shared.extras.is_empty() => {
+        let extra: &[Record] = match shared.extras.of(user) {
+            Some((used, more)) => {
                 used.store(true, Ordering::Relaxed);
                 more
             }
-            _ => &[],
+            None => &[],
         };
         self.run += 1;
         self.ts.clear();
@@ -781,15 +736,20 @@ impl Runner {
         self.run_kernel(shared, c_out, name);
     }
 
-    /// The session kernel on the person collected in `ts`, `purchases` and `clicks`.
+    /// The session kernel on the person collected in `ts`, `purchases` and
+    /// `clicks`. Events read in index order are in time order in generated
+    /// data, which the kernel uses when it holds and does not need: it
+    /// orders the events itself otherwise.
     #[inline(always)]
     fn run_kernel(&mut self, shared: &Shared, c_out: &mut PassCOut, name: u64) {
         let count = self.ts.len();
+        if count == 0 {
+            return;
+        }
         self.inline_persons += 1;
         self.inline_events += count as u64;
-        self.ts.resize(count + EVENT_SPARE, 0);
         let started = self.measure.then(std::time::Instant::now);
-        self.kernel.one_person(c_out, shared.click_exotic, name, &mut self.ts, count, &self.purchases, &self.clicks);
+        self.kernel.one_person_in_order(c_out, shared.click_exotic, name, &self.ts, &self.purchases, &self.clicks);
         if let Some(started) = started {
             self.kernel_nanos += started.elapsed().as_nanos() as u64;
         }

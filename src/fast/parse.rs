@@ -30,9 +30,12 @@ pub struct EventRow {
 }
 
 /// A valid click before its user is mapped to a person.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClickRecord {
+    /// User code. In index mode a fast kernel hands a generated user ID back
+    /// as its user number instead, and `user_is_number` says so.
     pub user: u64,
+    pub user_is_number: bool,
     /// Click ID code in the low 42 bits, campaign index above.
     pub code_and_campaign: u64,
     /// Milliseconds since `window_start - 7 days`.
@@ -106,26 +109,61 @@ pub fn click_parts(keys: &Keys) -> usize {
     (keys.user_bound >> CLICK_SHIFT) as usize + 1
 }
 
-#[inline(always)]
-pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
-    if let Some(number) = out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user)) {
-        // SAFETY: the number's user index is below the keys' bound, which
-        // sized `user_clicks`; `reserve` returned room for two words.
-        unsafe {
-            let writer = out.user_clicks.get_unchecked_mut((number >> (9 + CLICK_SHIFT)) as usize);
-            let at = writer.reserve(&mut out.arena, USER_CLICK_BLOCK, 2);
-            *at = u64::from(click.ts) | ((number & ((1 << (9 + CLICK_SHIFT)) - 1)) << 32);
-            *at.add(1) = click.code_and_campaign;
-        }
-        return;
+/// The click as index mode stores it: the user of a generated user ID is its
+/// user number. A click that already carries a number is returned as it is.
+#[inline]
+pub fn click_indexed_form(keys: &Keys, click: ClickRecord) -> ClickRecord {
+    if click.user_is_number {
+        return click;
     }
-    let user = click.user;
+    match keys.user_number_of_code(click.user) {
+        Some(number) => ClickRecord { user: number, user_is_number: true, ..click },
+        None => click,
+    }
+}
+
+/// Stores a click whose user is known by its code: three words in the
+/// worker's click list.
+#[inline(always)]
+pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts: u64) {
     let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
     // SAFETY: `reserve` returned room for three words.
     unsafe {
         *at = user;
-        *at.add(1) = click.code_and_campaign;
-        *at.add(2) = u64::from(click.ts);
+        *at.add(1) = code_and_campaign;
+        *at.add(2) = ts;
+    }
+}
+
+/// Index mode: stores a click of a generated user ID, known by its user
+/// number: two words in the list of its run of user indexes.
+///
+/// # Safety
+/// The number's user index (`number >> 9`) must be below the keys' bound.
+#[inline(always)]
+pub unsafe fn emit_number_click(out: &mut ParseOut, number: u64, code_and_campaign: u64, ts: u64) {
+    // SAFETY: the keys' bound sized `user_clicks`; `reserve` returned room
+    // for two words.
+    let writer = out.user_clicks.get_unchecked_mut((number >> (9 + CLICK_SHIFT)) as usize);
+    let at = writer.reserve(&mut out.arena, USER_CLICK_BLOCK, 2);
+    *at = ts | ((number & ((1 << (9 + CLICK_SHIFT)) - 1)) << 32);
+    *at.add(1) = code_and_campaign;
+}
+
+#[inline(always)]
+pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
+    // A kernel that read the user number from the text says so; any other
+    // click of index mode has its code turned into the number here.
+    let number = if click.user_is_number {
+        Some(click.user)
+    } else {
+        out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user))
+    };
+    match number {
+        // SAFETY: the number's user index is below the keys' bound: the
+        // kernels and `user_number_of_code` hand out no other numbers.
+        Some(number) => unsafe { emit_number_click(out, number, click.code_and_campaign, u64::from(click.ts)) },
+        None => emit_code_click(out, click.user, click.code_and_campaign, u64::from(click.ts)),
     }
 }
 
@@ -345,9 +383,16 @@ pub fn click_row_slow(ctx: &Ctx, line: &[u8]) -> Option<ClickRecord> {
     let user = id_code(user_id, b'u', &ctx.user_ids);
     Some(ClickRecord {
         user,
+        user_is_number: false,
         code_and_campaign: click_code | (u64::from(campaign) << 42),
         ts: (ts - click_window_start) as u32,
     })
+}
+
+/// One click line in index mode: the click of `click_row_slow`, with the
+/// user of a generated user ID as its user number.
+pub fn click_row_slow_indexed(ctx: &Ctx, keys: &Keys, line: &[u8]) -> Option<ClickRecord> {
+    click_row_slow(ctx, line).map(|click| click_indexed_form(keys, click))
 }
 
 pub fn link_row_slow(ctx: &Ctx, line: &[u8]) -> Option<(u64, u64)> {
@@ -370,168 +415,56 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
-    let kernel = event_kernel();
-    if kernel == KERNEL_GENERAL {
-        return events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out);
-    }
-    if MODE == MODE_ROW {
+    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, MODE_STORE};
+    match event_kernel() {
+        KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
         // Checked rows go one by one through the loop that compares them.
-        return events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out);
-    }
-    let plain = kernel == KERNEL_LEAN_PLAIN;
-    // Index mode has no diagnostic modes of its own: SS_DIAG=2, 3 and 7 pick them here.
-    match (INDEXED && MODE == MODE_STORE, ctx.diag, plain) {
-        (true, 2, _) => events_lean_loop::<2, INDEXED, false>(ctx, buffer, position, end, out),
-        (true, 3, false) => events_lean_loop::<3, INDEXED, false>(ctx, buffer, position, end, out),
-        (true, 3, true) => events_lean_loop::<3, INDEXED, true>(ctx, buffer, position, end, out),
-        (true, 7, false) => events_lean_loop::<7, INDEXED, false>(ctx, buffer, position, end, out),
-        (true, 7, true) => events_lean_loop::<7, INDEXED, true>(ctx, buffer, position, end, out),
-        (_, _, false) => events_lean_loop::<MODE, INDEXED, false>(ctx, buffer, position, end, out),
-        (_, _, true) => events_lean_loop::<MODE, INDEXED, true>(ctx, buffer, position, end, out),
+        _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        // Index mode has no diagnostic modes of its own: SS_DIAG=2 and 7 pick them here.
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
+            events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
+        }
+        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
+            events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
+        }
+        _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
 }
 
 /// The lean kernel's loop when rows are stored (or, in a diagnostic mode,
 /// dropped). Nothing is called on its common path.
-///
-/// The kernel works in two halves, and the loop runs them out of step: the
-/// first half of the next row, then the second half of this one. A row's
-/// first half is everything that takes long to arrive (loads, the vector
-/// units); run one row early, its results are there when the second half
-/// needs them, and the processor never sits with a window full of work that
-/// is waiting. The next row's start is taken from this row's early guess of
-/// its own length; where that was wrong, or the row is declined, the first
-/// half is simply run again at the right place.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
+fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     buffer: &[u8],
     mut position: usize,
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{
-        event_lean_back, event_lean_front, event_lean_front_plain, event_lean_masks, event_lean_step,
-        event_lean_store, lean_setup, LeanFrame, LeanFront, LeanSink, LeanTables, LEAN_PAD, ROW_DECLINE,
-    };
-    /// A row's first half, in assembly or as the compiler makes it.
-    #[inline(always)]
-    unsafe fn first_half<const INDEXED: bool, const PLAIN: bool>(
-        lean: *const LeanTables,
-        p: *const u8,
-        front: *mut LeanFront,
-    ) {
-        if PLAIN {
-            event_lean_front_plain::<INDEXED>(lean, p, front)
-        } else {
-            event_lean_front::<INDEXED>(lean, p, front)
-        }
-    }
-    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(LEAN_PAD));
-    // A first half reads up to 8 bytes before its row: a row that starts
-    // before byte 8 of the file (a header that short) is not for it.
-    if position < 8 && position < stop {
-        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
-    }
+    use super::simd::{event_row_lean_step, lean_setup, ROW_DECLINE, ROW_PAD};
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
     let (lean, window_length) = lean_setup(ctx);
     // Opaque to the optimizer: see `LeanTables`.
     let lean = std::hint::black_box(lean);
-    let base = buffer.as_ptr();
     let mut row = EventRow::default();
-    if MODE == 2 {
-        while position < stop {
-            // SAFETY: at least LEAN_PAD readable bytes follow `position`.
-            let (folded, guess) = unsafe { event_lean_masks(lean, base.add(position)) };
-            row.event ^= folded;
+    while position < stop {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`, and the
+        // tables are those of `ctx`.
+        let (length, guess, status) = unsafe {
+            event_row_lean_step::<MODE, INDEXED>(ctx, lean, window_length, buffer.as_ptr().add(position), out, &mut row)
+        };
+        if status == ROW_DECLINE {
+            position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+        } else if length != guess {
+            position = row_end_elsewhere(position, length);
+        } else {
             position += guess + 1;
-        }
-        std::hint::black_box(row.event);
-        return position;
-    }
-    // Two records, each row's first half in turn in one and in the other.
-    // Their address goes through `black_box` so that they stay in memory:
-    // the second half then takes its operands from there.
-    let mut frame = LeanFrame::new(ctx);
-    let frame = std::hint::black_box(&mut frame as *mut LeanFrame);
-    let records = frame as *mut LeanFront;
-    if MODE == 3 {
-        // Diagnostic: first halves only.
-        while position < stop {
-            // SAFETY: as below.
-            unsafe {
-                first_half::<INDEXED, PLAIN>(lean, base.add(position), records);
-                row.event ^= (*records).fold();
-                position += (*records).guess + 1;
-            }
-        }
-        std::hint::black_box(row.event);
-        return position;
-    }
-    // SAFETY (all of this loop): a row that starts before `stop` has LEAN_PAD
-    // readable bytes after it and (see above) eight before it; a first half
-    // reads from 8 bytes before to 132 bytes after where it is run, which
-    // is a row's start or at most 97 bytes past one. The record of the row
-    // at `p` is the one the step reads. The sink is made anew after every
-    // use of `out`.
-    let mut p = unsafe { base.add(position) };
-    let last = unsafe { base.add(stop) };
-    'restart: while p < last {
-        let sink = LeanSink::new::<INDEXED>(out);
-        unsafe { first_half::<INDEXED, PLAIN>(lean, p, records) };
-        loop {
-            // One row with its record in place `$current`; the next row's
-            // first half goes to the other place.
-            macro_rules! row {
-                ($current:literal) => {{
-                    let (next, status) = unsafe {
-                        let current = records.add($current);
-                        let (common, next) = if PLAIN {
-                            let next = p.add((*current).guess + 1);
-                            first_half::<INDEXED, true>(lean, next, records.add(1 - $current));
-                            (None, next)
-                        } else {
-                            // The next row's first half and, for the common
-                            // kind of row, this row's second half.
-                            let (step, next) = event_lean_step::<INDEXED, $current>(lean, p, frame);
-                            ((step.rare == 0).then_some(step), next)
-                        };
-                        match common {
-                            Some(step) => {
-                                (next, event_lean_store::<MODE, INDEXED>(ctx, current, &step, &sink, &mut row))
-                            }
-                            None => {
-                                let (length, status) =
-                                    event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, current, &sink, &mut row);
-                                if status != ROW_DECLINE && length != (*current).guess {
-                                    // Read and stored, but the row ends elsewhere.
-                                    position = row_end_elsewhere(p.offset_from(base) as usize, length);
-                                    p = base.add(position);
-                                    continue 'restart;
-                                }
-                                (next, status)
-                            }
-                        }
-                    };
-                    if status == ROW_DECLINE {
-                        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, unsafe { p.offset_from(base) } as usize, out);
-                        p = unsafe { base.add(position) };
-                        continue 'restart;
-                    }
-                    p = next;
-                    if p >= last {
-                        break 'restart;
-                    }
-                }};
-            }
-            row!(0);
-            row!(1);
         }
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
     std::hint::black_box(row.event);
-    unsafe { p.offset_from(base) as usize }
+    position
 }
 
 /// One row the lean kernel declined: through the general kernel and, if
@@ -602,8 +535,7 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
-            // The lean kernel reads up to 8 bytes before its row.
-            if KERNEL == KERNEL_GENERAL || position < 8 {
+            if KERNEL == KERNEL_GENERAL {
                 event_row_fast::<MODE, INDEXED>(ctx, p, out, &mut row)
             } else {
                 event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row)
@@ -697,53 +629,116 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
     });
 }
 
+/// The fast loop over click rows, specialized for what happens to a parsed
+/// row (`simd::MODE_STORE`: the kernel stores it; `simd::MODE_ROW`: it comes
+/// back and is checked against the general parser first), for index mode
+/// (`INDEXED`: a generated user ID is read as its user number, and
+/// `ctx.keys` must be set) and for one of the click kernels
+/// (`simd::KERNEL_*`). Returns where the general parser must continue.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    mut position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{
+        click_row_fast, click_row_lean, ClickFrame, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG,
+        ROW_PAD,
+    };
+    let limit = end.min(buffer.len());
+    let safe = buffer.len().saturating_sub(ROW_PAD);
+    // The lean kernel's view of the window: a local, so that the kernel's
+    // loads from it are known not to change under the loop's stores.
+    let frame = ClickFrame::new(ctx);
+    let mut click = ClickRecord::default();
+    while position < limit && position < safe {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`.
+        let (length, status) = unsafe {
+            let p = buffer.as_ptr().add(position);
+            if KERNEL == KERNEL_GENERAL {
+                click_row_fast::<INDEXED>(ctx, p, &mut click)
+            } else {
+                click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click)
+            }
+        };
+        if status == ROW_DONE {
+            position += length + 1;
+            continue;
+        }
+        if status == ROW_EMIT && MODE != MODE_ROW {
+            emit_click(out, &click);
+            position += length + 1;
+            continue;
+        }
+        if status == ROW_LONG {
+            let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
+            if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
+                emit_click(out, &click);
+            }
+            position = line_end + 1;
+            continue;
+        }
+        let line = &buffer[position..position + length];
+        let fast = match status {
+            ROW_EMIT => Some(click),
+            ROW_DROP => None,
+            _ => click_row_slow(ctx, line),
+        };
+        if MODE == MODE_ROW && (status == ROW_EMIT || status == ROW_DROP) {
+            // In index mode a kernel must hand back exactly the indexed
+            // form of what the general parser reads.
+            let slow = match &ctx.keys {
+                Some(keys) if INDEXED => click_row_slow_indexed(ctx, keys, line),
+                _ => click_row_slow(ctx, line),
+            };
+            assert!(
+                slow == fast,
+                "click row mismatch on {:?}: fast {:?}, slow {:?}",
+                String::from_utf8_lossy(line),
+                fast,
+                slow
+            );
+        }
+        if let Some(click) = fast {
+            emit_click(out, &click);
+        }
+        position += length + 1;
+    }
+    position
+}
+
+/// `clicks_rows_loop` with the click kernel of this run.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn clicks_fast_loop<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{click_kernel, KERNEL_GENERAL, KERNEL_LEAN};
+    match click_kernel() {
+        KERNEL_GENERAL => clicks_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
+        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+    }
+}
+
 pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
     if ctx.fast_rows {
-        use super::simd::{click_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
-        let limit = end.min(buffer.len());
-        let safe = buffer.len().saturating_sub(ROW_PAD);
-        let verify = ctx.verify;
-        let mut click = ClickRecord { user: 0, code_and_campaign: 0, ts: 0 };
-        while position < limit && position < safe {
-            // SAFETY: at least ROW_PAD readable bytes follow `position`.
-            let (length, status) = unsafe { click_row_fast(ctx, buffer.as_ptr().add(position), &mut click) };
-            if status == ROW_EMIT && !verify {
-                emit_click(out, &click);
-                position += length + 1;
-                continue;
-            }
-            if status == ROW_LONG {
-                let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
-                if let Some(click) = click_row_slow(ctx, &buffer[position..line_end]) {
-                    emit_click(out, &click);
-                }
-                position = line_end + 1;
-                continue;
-            }
-            let line = &buffer[position..position + length];
-            let fast = match status {
-                ROW_EMIT => Some(click),
-                ROW_DROP => None,
-                _ => click_row_slow(ctx, line),
-            };
-            if verify && (status == ROW_EMIT || status == ROW_DROP) {
-                let slow = click_row_slow(ctx, line);
-                assert!(
-                    slow == fast,
-                    "click row mismatch on {:?}: fast {:?}, slow {:?}",
-                    String::from_utf8_lossy(line),
-                    fast,
-                    slow
-                );
-            }
-            if let Some(click) = fast {
-                emit_click(out, &click);
-            }
-            position += length + 1;
-        }
+        use super::simd::{MODE_ROW, MODE_STORE};
+        position = match (ctx.keys.is_some(), ctx.verify) {
+            (true, true) => clicks_fast_loop::<MODE_ROW, true>(ctx, buffer, position, end, out),
+            (true, false) => clicks_fast_loop::<MODE_STORE, true>(ctx, buffer, position, end, out),
+            (false, true) => clicks_fast_loop::<MODE_ROW, false>(ctx, buffer, position, end, out),
+            (false, false) => clicks_fast_loop::<MODE_STORE, false>(ctx, buffer, position, end, out),
+        };
     }
     lines_from(buffer, position, end, |line| {
         if let Some(click) = click_row_slow(ctx, line) {
