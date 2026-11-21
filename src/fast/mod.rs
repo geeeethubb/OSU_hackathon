@@ -583,6 +583,23 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
 /// headers and the footer stay negligible.
 const GROUP_ROWS: usize = parquet::MAX_GROUP_ROWS;
 
+/// The columns written as GZIP pages when `SS_GZIP=1`: the ones whose bytes
+/// an entropy code shrinks (IDs, dictionary indices of skewed counts, sums).
+/// Off by default: it makes the files about 40% smaller for more CPU time in
+/// the output stage.
+const USER_DAILY_GZIP: [&str; 4] = ["user_id", "sessions", "events", "revenue_cents"];
+const CAMPAIGN_DAILY_GZIP: [&str; 6] =
+    ["campaign_id", "channel", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"];
+
+/// The columns of a table to compress: `all` when `SS_GZIP=1`, else none.
+fn gzip_columns<'a>(all: &'a [&'a str]) -> &'a [&'a str] {
+    if std::env::var_os("SS_GZIP").is_some_and(|value| value == "1") {
+        all
+    } else {
+        &[]
+    }
+}
+
 /// Two characters for every pair of base-37 digits, first digit in the low
 /// byte; digit 0 ("no character") is a zero byte.
 static DIGIT_PAIRS: [u16; 1369] = digit_pairs();
@@ -656,6 +673,7 @@ fn write_tables(
             start = end;
         }
     }
+    let gzip = gzip_columns(&USER_DAILY_GZIP);
     // Task 0 is the campaign table, task `n + 1` is piece `n`.
     let write = |integer: ColumnType, first_task: usize| -> std::io::Result<bool> {
         let fields = [
@@ -677,7 +695,7 @@ fn write_tables(
                 // attempt, to replace what the first one left behind.
                 let mut writer = None;
                 if thread == 0 || integer == ColumnType::Int64 {
-                    writer = Some(GroupWriter::create(&path, &fields)?);
+                    writer = Some(GroupWriter::create(&path, &fields)?.gzip(gzip));
                 }
                 while !too_narrow.load(Ordering::Relaxed) {
                     let task = next.fetch_add(1, Ordering::Relaxed);
@@ -690,7 +708,7 @@ fn write_tables(
                     };
                     let writer = match &mut writer {
                         Some(writer) => writer,
-                        None => writer.insert(GroupWriter::create(&path, &fields)?),
+                        None => writer.insert(GroupWriter::create(&path, &fields)?.gzip(gzip)),
                     };
                     if !write_user_daily(ctx, writer, rows, start, end, user_exotic)? {
                         too_narrow.store(true, Ordering::Relaxed);
@@ -795,7 +813,7 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
             ("revenue_cents", integer),
             ("assisted_sessions", integer),
         ];
-        let mut writer = GroupWriter::create(&path, &fields)?;
+        let mut writer = GroupWriter::create(&path, &fields)?.gzip(gzip_columns(&CAMPAIGN_DAILY_GZIP));
         let mut start = 0;
         while start < day.len() {
             let end = (start + GROUP_ROWS).min(day.len());

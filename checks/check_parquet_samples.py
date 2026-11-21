@@ -27,7 +27,9 @@ def plain(row):
 
 
 def check(path):
-    expected = sorted(tuple(row) for row in json.loads(path.with_suffix(".json").read_text(encoding="utf-8")))
+    # `<name>-gzip.parquet` holds the rows of `<name>.json` too.
+    rows = path.with_name(path.stem.removesuffix("-gzip") + ".json")
+    expected = sorted(tuple(row) for row in json.loads(rows.read_text(encoding="utf-8")))
     frame = pl.read_parquet(path)
     table = pq.read_table(path)
     table.validate(full=True)
@@ -50,10 +52,11 @@ def check(path):
     assert from_polars == expected, f"{path.name}: polars rows differ from the expected rows"
     assert from_arrow == expected, f"{path.name}: pyarrow rows differ from the expected rows"
     meta = pq.ParquetFile(path).metadata
-    encodings = sorted({encoding for group in range(meta.num_row_groups) for column in range(meta.num_columns)
-                        for encoding in meta.row_group(group).column(column).encodings})
-    print(f"ok   {path.name:28s} {len(expected):6d} rows, {meta.num_row_groups:3d} row groups, {path.stat().st_size:8d} bytes, "
-          f"{','.join(encodings)}")
+    chunks = [meta.row_group(group).column(column) for group in range(meta.num_row_groups)
+              for column in range(meta.num_columns)]
+    kinds = sorted({encoding for chunk in chunks for encoding in chunk.encodings} | {chunk.compression for chunk in chunks})
+    print(f"ok   {path.name:33s} {len(expected):6d} rows, {meta.num_row_groups:3d} row groups, {path.stat().st_size:8d} bytes, "
+          f"{','.join(kinds)}")
 
 
 def main():
