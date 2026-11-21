@@ -34,3 +34,45 @@ it is kept or dropped, and what follows.
 | 91c180bc4f85c0a08db8d222664b853c7cda78d6 [run 44930828767](https://github.com/geeeethubb/OSU_hackathon/actions/runs/44930828767) | 03b15f2f8a1281773184f4f7389436bda4be0a44 | GitHub runner ubuntu26 20261116.88.1, Intel(R) Xeon(R) 6975P-C, 4 vCPU, 15.3 GiB RAM; `--cpus 4 --memory 13g --memory-swap 13g --cpuset-cpus 0-3`; native linux/amd64; Docker 29.4.2 | 20M events / 5M clicks, seed 3, 1,921,667,038 bytes in 152 files (holdout seed) | fresh container per run, `State.StartedAt`→`State.FinishedAt`; input page cache warm (100.0% resident before, 100.0% after) | 3 fresh runs, container ms: 1149, 1162, 1164 (median 1162); client wall ms: 1224, 1240, 1236; pairs prior/this: 1,165.8/1,166.7 (AB), 1,143.6/1,158.6 (AB), 1,179.5/1,174.6 (BA), 1,159.8/1,149.5 (BA), 1,166.5/1,146.6 (BA), 1,149.5/1,155.9 (AB) | +2.0 ms (3/6 pairs won; medians 1,162.8 → 1,157.2); within the A/A noise: no measurable difference | median abs diff 5.9 ms, max 12.6 ms over 6 A/A pairs (signed A−B: -8.3, -12.6, +7.8, +2.1, -0.3, +4.1); second run faster in 2/6 | 36/36 fixtures; 43/43 extra fixtures; dev MATCH; 20M vs /reference: 23/23 runs of this commit MATCH; prior best 7/7 MATCH | not run | KEPT (step toward 23b285da). Hypothesis: about 24K records per partition instead of a fixed 2^11 partitions keeps each partition in L2 at any scale. — largest stage parse 570 ms (53%); container minus in-process total 78.6 ms; peak memory 1.09 GiB |
 | 23b285da8246d00275b1ad191da0fffb8c5f81e4 [run 44930932775](https://github.com/geeeethubb/OSU_hackathon/actions/runs/44930932775) | 03b15f2f8a1281773184f4f7389436bda4be0a44 | GitHub runner ubuntu26 20261116.202.1, INTEL(R) XEON(R) PLATINUM 8573C, 4 vCPU, 15.6 GiB RAM; `--cpus 4 --memory 13g --memory-swap 13g --cpuset-cpus 0-3`; native linux/amd64; Docker 29.4.2 | 20M events / 5M clicks, seed 2, 1,901,148,800 bytes in 117 files | fresh container per run, `State.StartedAt`→`State.FinishedAt`; input page cache warm (100.0% resident before, 100.0% after) | 3 fresh runs, container ms: 1416, 1405, 1430 (median 1416); client wall ms: 1904, 2040, 2086; pairs prior/this: 1,489.0/1,408.5 (BA), 1,505.3/1,446.9 (AB), 1,488.6/1,432.0 (AB), 1,491.3/1,424.0 (AB), 1,491.4/1,434.2 (BA), 1,515.7/1,441.7 (BA) | +62.9 ms (6/6 pairs won; medians 1,491.4 → 1,433.1); larger than the median A/A difference but inside its range: treat as unconfirmed | median abs diff 7.6 ms, max 105.9 ms over 6 A/A pairs (signed A−B: +17.4, -7.9, -105.9, -4.2, -4.0, +7.4); second run faster in 3/6 | 36/36 fixtures; 43/43 extra fixtures; dev MATCH; 20M vs /reference: 29/29 runs of this commit MATCH; prior best 7/7 MATCH; variant 7/7 MATCH | not run | KEPT, new prior best. Hypothesis: a third of the anonymous memory was still in 4 KiB pages; asking for huge pages on every large allocation removes page faults and exit teardown (variant SS_THP=0 is 24 to 29 ms slower, losing 11 of 12 pairs). — largest stage parse 711 ms (53%); container minus in-process total 94.8 ms; peak memory 1.08 GiB |
 | 23b285da8246d00275b1ad191da0fffb8c5f81e4 [run 44930932775](https://github.com/geeeethubb/OSU_hackathon/actions/runs/44930932775) | 03b15f2f8a1281773184f4f7389436bda4be0a44 | GitHub runner ubuntu26 20261116.202.1, INTEL(R) XEON(R) PLATINUM 8573C, 4 vCPU, 15.6 GiB RAM; `--cpus 4 --memory 13g --memory-swap 13g --cpuset-cpus 0-3`; native linux/amd64; Docker 29.4.2 | 20M events / 5M clicks, seed 3, 1,921,667,038 bytes in 152 files (holdout seed) | fresh container per run, `State.StartedAt`→`State.FinishedAt`; input page cache warm (100.0% resident before, 100.0% after) | 3 fresh runs, container ms: 1456, 1470, 1456 (median 1456); client wall ms: 2052, 2076, 2055; pairs prior/this: 1,509.3/1,433.8 (AB), 1,526.4/1,431.0 (AB), 1,499.1/1,427.2 (BA), 1,496.1/1,494.5 (BA), 1,482.2/1,434.1 (BA), 1,510.9/1,439.3 (AB) | +71.8 ms (6/6 pairs won; medians 1,504.2 → 1,433.9); larger than every A/A difference seen here | median abs diff 9.2 ms, max 42.0 ms over 6 A/A pairs (signed A−B: -12.3, +1.6, +8.1, -10.3, +42.0, -7.9); second run faster in 4/6 | 36/36 fixtures; 43/43 extra fixtures; dev MATCH; 20M vs /reference: 29/29 runs of this commit MATCH; prior best 7/7 MATCH; variant 7/7 MATCH | not run | KEPT, new prior best. Hypothesis: a third of the anonymous memory was still in 4 KiB pages; asking for huge pages on every large allocation removes page faults and exit teardown (variant SS_THP=0 is 24 to 29 ms slower, losing 11 of 12 pairs). — largest stage parse 749 ms (54%); container minus in-process total 99.1 ms; peak memory 1.09 GiB |
+
+## Sprint log (three-hour sprint from 2026-11-21 18:20 UTC)
+
+Three kinds of numbers appear below and are never mixed: **laptop** (native Windows runs, no
+container, 8 threads unless said otherwise), **CI** (fresh containers on 4-vCPU GitHub runners,
+`State.StartedAt` to `State.FinishedAt`) and **official** (accepted practice scores; the only one
+known so far is 1.38 s for `e4eef020`).
+
+### 18:25 UTC
+
+- **Best verified candidate:** `23b285da8246d00275b1ad191da0fffb8c5f81e4` (CI run 44930932775: 62.9 ms
+  and 71.8 ms faster than `03b15f2f`, 6 of 6 pairs on both seeds; 36/36 fixtures, 43/43 extra
+  fixtures, dev MATCH, 20M MATCH on both seeds).
+- **In CI now:** `16bc175b` on branch `exp-general-default` (general path as the default, streaming
+  Parquet writer, branch-light session pass; variant `SS_STRUCT=1`; 20M seeds 2, 3 and the new
+  confirmation seed 5; 60M), and `8e92bfaa` (same sources, paired against the unchanged `db0c2e04` image).
+- **Tried and learned:** index mode as pushed in `db0c2e04` only moved the dedup work and lost in CI
+  (run 44932808661: `SS_STRUCT=0` 73.4 / 75.9 ms faster on the same image, 6/6 pairs each). The CI stage
+  table says where: startup 9.8 -> 44.6 ms (key search), parse 358 -> 392 ms, dedup + indexed 232 -> 256 ms,
+  sessions 179 -> 165 ms. The laptop had shown it as time-neutral: laptop stage times do not rank
+  candidates, CI pairs do.
+- **Current limiting work (CI, general path, EPYC 9V45, seed 2):** parse 358 ms, dedup 232 ms,
+  sessions 179 ms, output 10 ms, startup 10 ms, container minus process 98 ms (a no-op container: 72 to 83 ms).
+- **Three ways to remove work, ranked:**
+  1. *Lay events out by event index and sessionize in place* (index mode with an inline session path).
+     Disappears: the dedup hash table, one link lookup and one scatter per surviving event (542 CPU-ms of
+     forwarding), per-partition grouping and per-person sorting, one lookup and scatter per click.
+     Correct because every property it uses is checked at run time (keys verified on samples, IDs that do
+     not fit go to the general path, user indexes must not decrease along the index order or the run starts
+     over on the general path) and persons whose linked IDs span users stay on the general path whole.
+     Next bottleneck: parse, then the click index. Disproof: same-image CI variant; drop it unless
+     dedup + indexed + sessions falls well under the general path (411 ms on this host).
+  2. *Decode several rows per step from tile-wide delimiter masks* (parser agent, `exp-parse`).
+     Disappears: overlapping loads, the newline-to-next-row dependency (about 5 ns/row), mispredicted
+     branches on the three timestamp forms. Correct by the row-for-row verify mode and the slow-path
+     fallback. Next bottleneck: stores into partitions. Disproof: masks-only and decode-only builds on the
+     same bytes; drop it if it loses on either 20M seed.
+  3. *Identity links without the second table* (links agent, `exp-links`): count successful unions instead
+     of scanning, and probe the forest itself. Disappears: one scan and one table build; small, because the
+     build already overlaps the parse. Disproof: in-pipeline A/B at 20M and 60M.
+- **Next experiment:** finish hypothesis 1 behind `SS_STRUCT=1` (cheap key search, click index, inline
+  persons, edge runs joined across partitions, restart on the general path when the layout check fails).
