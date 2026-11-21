@@ -670,13 +670,17 @@ pub const ROW_DECLINE: u32 = 6;
 /// The event kernels a fast loop can run.
 pub const KERNEL_GENERAL: u32 = 0;
 pub const KERNEL_LEAN: u32 = 1;
+/// The lean kernel with its first half as the compiler makes it.
+pub const KERNEL_LEAN_PLAIN: u32 = 2;
 
 /// The event kernel of this run: the lean one unless `SS_KERNEL=general`
-/// asks for `event_row_fast` alone (for A/B runs).
+/// asks for `event_row_fast` alone, or `SS_KERNEL=plain` for the lean kernel
+/// without its assembly (for A/B runs).
 pub fn event_kernel() -> u32 {
     static KERNEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *KERNEL.get_or_init(|| match std::env::var("SS_KERNEL").as_deref() {
         Ok("general") => KERNEL_GENERAL,
+        Ok("plain") => KERNEL_LEAN_PLAIN,
         _ => KERNEL_LEAN,
     })
 }
@@ -710,6 +714,37 @@ pub struct LeanTables {
     /// number). Where there is no such day: a year no text has in a row the
     /// kernel would store as valid, and seconds past every range.
     day: [[u32; 2]; 512],
+    // The vector constants of the first half in assembly: the same values
+    // `iso_tails`, `digits13`, `two_codes` and `two_numbers36` build in place.
+    iso_pattern: [u8; 32],
+    iso_limit: [u8; 32],
+    iso_shuffle: [u8; 32],
+    /// Ten times the first byte of a pair plus the second.
+    tens: [u8; 32],
+    iso_ceilings: [u16; 16],
+    iso_weights: [u16; 16],
+    type_masks: [u64; 4],
+    type_texts: [u64; 4],
+    zeros: [u8; 16],
+    keep13: [u8; 16],
+    nine: [u8; 16],
+    hundreds: [u32; 4],
+    ten_thousands: [u32; 4],
+    /// Added to a byte: its distance from `0`, from `a`.
+    id_digit: [u8; 16],
+    id_letter: [u8; 16],
+    twenty_five: [u8; 16],
+    /// Added to a byte: its base-37 digit if it is a digit, a letter.
+    id_digit_value: [u8; 16],
+    id_letter_value: [u8; 16],
+    id_pairs: [u8; 16],
+    id_fours: [u32; 4],
+    id_eights: [u64; 2],
+    /// The same for base 36 (a digit's value is its distance from `0`).
+    id36_letter_value: [u8; 16],
+    id36_pairs: [u8; 16],
+    id36_fours: [u32; 4],
+    id36_eights: [u64; 2],
 }
 
 impl LeanTables {
@@ -724,6 +759,12 @@ impl LeanTables {
                 day[(month * 32 + date) as usize] = [text(year), (offset * 86_400 + ingest_adjust) as i32 as u32];
             }
         }
+        let twice = |lane: [u8; 16]| {
+            let mut both = [0u8; 32];
+            both[..16].copy_from_slice(&lane);
+            both[16..].copy_from_slice(&lane);
+            both
+        };
         let mut type_step = [0u8; 16];
         type_step[1] = 5;
         type_step[2] = 5;
@@ -739,6 +780,31 @@ impl LeanTables {
             lead36: [14 * POWER36_7, 0, 30 * POWER36_7, 0],
             canonical36: [[POWER36_6, POWER36_7 - 1 - POWER36_6], [POWER36_7, NUMBER_MASK - POWER36_7]],
             day,
+            iso_pattern: twice(*b"-00-00T00:00:00Z"),
+            iso_limit: twice([0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0]),
+            iso_shuffle: twice([1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 128, 128, 128, 128, 128, 128]),
+            tens: twice([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]),
+            iso_ceilings: [12, 31, 23, 59, 59, 0x7FFF, 0x7FFF, 0x7FFF, 12, 31, 23, 59, 59, 0x7FFF, 0x7FFF, 0x7FFF],
+            iso_weights: [32, 1, 3600, 60, 1, 0, 0, 0, 32, 1, 3600, 60, 1, 0, 0, 0],
+            type_masks: [TYPE_SHORT, TYPE_SHORT, u64::MAX, u64::MAX],
+            type_texts: [TYPE_VIEW, TYPE_CART, TYPE_VIEW_QUOTED, TYPE_CART_QUOTED],
+            zeros: [0x30; 16],
+            keep13: [0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            nine: [9; 16],
+            hundreds: [0x0001_0064; 4],
+            ten_thousands: [0x0001_2710; 4],
+            id_digit: [0u8.wrapping_sub(b'0'); 16],
+            id_letter: [0u8.wrapping_sub(b'a'); 16],
+            twenty_five: [25; 16],
+            id_digit_value: [1u8.wrapping_sub(b'0'); 16],
+            id_letter_value: [11u8.wrapping_sub(b'a'); 16],
+            id_pairs: [37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1, 37, 1],
+            id_fours: [0x0001_0559; 4],
+            id_eights: [1_874_161; 2],
+            id36_letter_value: [10u8.wrapping_sub(b'a'); 16],
+            id36_pairs: [36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1],
+            id36_fours: [0x0001_0510; 4],
+            id36_eights: [1_679_616; 2],
         }
     }
 }
@@ -795,9 +861,11 @@ unsafe fn iso_tails(a: *const u8, b: *const u8) -> (u64, u64, u32) {
 }
 
 /// The number written as the 13 bytes at `p` (3 bytes before them must be
-/// readable), and a mask that is 0xFFFF when all 13 are ASCII digits.
+/// readable), as its first 5 digits in the low half and its last 8 in the
+/// high half of a word (`digits13_value` puts them together), and a mask
+/// that is 0xFFFF when all 13 are ASCII digits.
 #[inline(always)]
-unsafe fn digits13(p: *const u8) -> (i64, u32) {
+unsafe fn digits13(p: *const u8) -> (u64, u32) {
     let text = _mm_loadu_si128(p.sub(3) as *const __m128i);
     let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let values = _mm_and_si128(_mm_xor_si128(text, _mm_set1_epi8(0x30)), keep);
@@ -806,8 +874,12 @@ unsafe fn digits13(p: *const u8) -> (i64, u32) {
     let fours = _mm_madd_epi16(twos, _mm_set1_epi32(0x0001_0064));
     let packed = _mm_packus_epi32(fours, fours);
     let eights = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
-    let both = _mm_cvtsi128_si64(eights) as u64;
-    (((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32)) as i64, digits)
+    (_mm_cvtsi128_si64(eights) as u64, digits)
+}
+
+#[inline(always)]
+fn digits13_value(halves: u64) -> i64 {
+    ((halves & 0xFFFF_FFFF) * 100_000_000 + (halves >> 32)) as i64
 }
 
 // What follows the ingest_ts of a regular row, from its comma on.
@@ -834,7 +906,9 @@ fn opaque(mut value: u64) -> u64 {
     value
 }
 
-/// What the first half of the lean kernel leaves for the second half.
+/// What the first half of the lean kernel leaves for the second half. The
+/// assembly version of the first half writes it field by field, so the
+/// layout is fixed.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct LeanFront {
@@ -843,17 +917,21 @@ pub struct LeanFront {
     /// 64 plus where bytes 64..96 have their first newline: the row's
     /// length, nearly always, and known long before the true length is.
     pub guess: usize,
-    /// The event's code; in index mode its index.
+    /// The event's code; in index mode the number its ID is written as.
     event: u64,
-    /// The user's code; in index mode the user number.
+    /// The user's code; in index mode the number its ID is written as.
     user: u64,
     /// Both timestamps as `iso_tails` returns them.
     ts_packed: u64,
     ingest_packed: u64,
+    /// The assembly stores `ingest_packed` with the eight bytes after it.
+    spill: u64,
+    /// ts as 13 digits: the first 8 as a number in the low half, the last 8
+    /// in the high half (the two overlap; see `digits13`).
+    digits: u64,
     good: u32,
-    /// ts as 13 digits, and whether it is that (`digits13`).
+    /// Whether ts is 13 digits (`digits13`).
     digit_mask: u32,
-    digits: i64,
     ts_length: u32,
     /// Masks of the 32 bytes from the comma after `view` or `cart`.
     region_newlines: u32,
@@ -876,25 +954,50 @@ impl LeanFront {
             ^ self.user
             ^ self.ts_packed
             ^ self.ingest_packed
+            ^ self.digits
             ^ u64::from(self.good)
             ^ u64::from(self.digit_mask)
-            ^ self.digits as u64
             ^ u64::from(self.ts_length)
             ^ u64::from(self.region_newlines)
             ^ u64::from(self.region_commas)
             ^ u64::from(self.region_quotes)
             ^ self.step as u64
     }
+
+    /// Whether two first halves left the same record (the spilled bytes aside).
+    #[cfg(test)]
+    fn same(&self, other: &LeanFront) -> bool {
+        self.bad == other.bad
+            && self.guess == other.guess
+            && self.event == other.event
+            && self.user == other.user
+            && self.ts_packed == other.ts_packed
+            && self.ingest_packed == other.ingest_packed
+            && self.digits == other.digits
+            && self.good == other.good
+            && self.digit_mask == other.digit_mask
+            && self.ts_length == other.ts_length
+            && self.region_newlines == other.region_newlines
+            && self.region_commas == other.region_commas
+            && self.region_quotes == other.region_quotes
+            && self.step == other.step
+            && self.ts_at == other.ts_at
+            && self.ingest_at == other.ingest_at
+            && self.type_at == other.type_at
+    }
 }
 
 /// The first half of the lean kernel on the row at `p`: everything that
 /// takes long to arrive (the row's masks, the bytes of its fields through
 /// the vector units), with no branch and no lookup that depends on the
-/// window. It reads up to 132 bytes from `p` whatever is there, so it may run
-/// on a place that turns out not to be a row's start; its result is then
-/// simply not used.
+/// window. It reads from 8 bytes before `p` to 132 bytes after it whatever
+/// is there, so it may run on a place that turns out not to be a row's
+/// start; its result is then simply not used.
+///
+/// This is the plain version; `event_lean_front` below does the same in
+/// assembly, instruction for instruction what is written here.
 #[inline(always)]
-pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const LeanTables, p: *const u8, front: *mut LeanFront) {
+pub unsafe fn event_lean_front_plain<const INDEXED: bool>(lean: *const LeanTables, p: *const u8, front: *mut LeanFront) {
     let comma = _mm256_load_si256(std::ptr::addr_of!((*lean).comma) as *const __m256i);
     let quote = _mm256_load_si256(std::ptr::addr_of!((*lean).quote) as *const __m256i);
     let newline = _mm256_load_si256(std::ptr::addr_of!((*lean).newline) as *const __m256i);
@@ -908,42 +1011,51 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
     // Which of the first four fields open with a quote (bit `i`: field `i`),
     // and which of the first three have one right before their comma. Fields
     // 0 to 2 are quoted at both ends or at neither.
-    let opened = _pext_u64(quote_low, (comma_low << 1) | 1);
+    let starts = (comma_low << 1) | 1;
+    let opened = _pext_u64(quote_low, starts);
     let before = _pext_u64(quote_low << 1, comma_low);
     let mut bad = (opened ^ before) & 7;
-    // The first three commas. If the first 64 bytes have fewer, a position
-    // is 64, and the lengths below are not those of a regular row.
-    let c0 = comma_low.trailing_zeros() as usize;
-    let rest = _blsr_u64(comma_low);
-    let c1 = rest.trailing_zeros() as usize;
-    let c2 = _blsr_u64(rest).trailing_zeros() as usize;
-    let q0 = (opened & 1) as usize;
-    let q1 = ((opened >> 1) & 1) as usize;
-    let q2 = ((opened >> 2) & 1) as usize;
     let q3 = ((opened >> 3) & 1) as usize;
+    // Where the texts of the first four fields start and those of the first
+    // three end, one bit each: a start moves up over its quote, an end (the
+    // comma) moves down onto its quote. If the first 64 bytes have fewer
+    // commas, a position is 64 and the lengths below are not those of a
+    // regular row.
+    let text_starts = starts.wrapping_add(quote_low & starts);
+    let text_ends = comma_low.wrapping_sub(quote_low & comma_low.rotate_right(1));
+    let s0 = text_starts.trailing_zeros() as usize;
+    let rest = _blsr_u64(text_starts);
+    let s1 = rest.trailing_zeros() as usize;
+    let rest = _blsr_u64(rest);
+    let s2 = rest.trailing_zeros() as usize;
+    let s3 = _blsr_u64(rest).trailing_zeros() as usize;
+    let e0 = text_ends.trailing_zeros() as usize;
+    let rest = _blsr_u64(text_ends);
+    let e1 = rest.trailing_zeros() as usize;
+    let e2 = _blsr_u64(rest).trailing_zeros() as usize;
+
+    // Both timestamps; ingest_ts must end with `Z,`, or with `",` when it
+    // opened with a quote.
+    let ts_at = p.add(s2);
+    let ts_length = e2.wrapping_sub(s2) as u32;
+    let ingest_at = p.add(s3);
+    let type_at = ingest_at.add(20 + q3);
+    bad |= u64::from((type_at.sub(1) as *const u16).read_unaligned() ^ *(*lean).ingest_end.get_unchecked(q3));
 
     // Both IDs: the prefix and 7 or 8 characters (`*_extra` is 0 or 1).
-    let event_extra = c0.wrapping_sub(2 * q0 + 8);
-    let user_extra = c1.wrapping_sub(c0 + 2 * q1 + 9);
-    let user_at = p.add(c0 + q1 + 1);
+    let event_extra = e0.wrapping_sub(s0).wrapping_sub(8);
+    let user_extra = e1.wrapping_sub(s1).wrapping_sub(8);
     bad |= ((event_extra | user_extra) >> 1) as u64;
-    bad |= u64::from(*p.add(q0) ^ b'e') | u64::from(*user_at ^ b'u');
+    bad |= u64::from(*p.add(s0) ^ b'e') | u64::from(*p.add(s1) ^ b'u');
     let (event, user) = if INDEXED {
         // Index mode: both IDs must be generated ones. The eight bytes that
         // end an ID are its 8 characters, or its prefix and 7 characters
         // (the prefix is a letter, so all eight are characters either way).
         // Read as one base-36 number, less the prefix's part, they give the
         // ID's number; the text is canonical (no leading zero, below 2^40)
-        // exactly when the number is in the range of its length. (Where the
-        // lengths are not regular, `bad` is set already; the bytes read are
-        // then kept inside the row's first 64.)
-        let keys = ctx.keys.as_ref().unwrap_unchecked();
-        let event_end = c0.wrapping_sub(q0 + 8);
-        let user_end = c1.wrapping_sub(q1 + 8);
-        let (event_number, user_number, known) = two_numbers36(
-            read_u64(p.add(select_unpredictable(event_end > 56, 0, event_end))),
-            read_u64(p.add(select_unpredictable(user_end > 56, 0, user_end))),
-        );
+        // exactly when the number is in the range of its length.
+        let (event_number, user_number, known) =
+            two_numbers36(read_u64(p.add(e0).sub(8)), read_u64(p.add(e1).sub(8)));
         bad |= u64::from(known ^ 0xFFFF);
         let (event_extra, user_extra) = (event_extra & 1, user_extra & 1);
         let event_number = event_number.wrapping_sub(*(*lean).lead36.get_unchecked(event_extra));
@@ -953,29 +1065,19 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
         let user_range = *canonical.add(user_extra);
         bad |= u64::from(event_number.wrapping_sub(event_range[0]) > event_range[1]);
         bad |= u64::from(user_number.wrapping_sub(user_range[0]) > user_range[1]);
-        let index = unscramble(event_number, keys.event_key);
-        let number = unscramble(user_number, keys.user_key);
-        bad |= u64::from(index >= keys.index_bound) | u64::from((number >> 9) >= keys.user_bound);
-        (index, number)
+        (event_number, user_number)
     } else {
         // The eight bytes after the prefix are the characters, or seven of
         // them and the quote or comma that ends the field, which counts as
         // no character.
-        let (event_code, user_code, known) = two_codes(read_u64(p.add(q0 + 1)), read_u64(user_at.add(1)));
-        let need = 0x7F7F | ((event_extra as u32 & 1) << 7) | ((user_extra as u32 & 1) << 15);
+        let (event_code, user_code, known) = two_codes(read_u64(p.add(s0 + 1)), read_u64(p.add(s1 + 1)));
+        let need = 0x7F7F + ((event_extra as u32 & 1) << 7) + ((user_extra as u32 & 1) << 15);
         bad |= u64::from(known ^ need);
         (event_code, user_code)
     };
 
-    // Both timestamps; ingest_ts must end with `Z,`, or with `",` when it
-    // opened with a quote.
-    let ts_at = p.add(c1 + q2 + 1);
-    let ts_length = c2.wrapping_sub(c1 + 2 * q2 + 1) as u32;
-    let ingest_at = p.add(c2 + q3 + 1);
-    let type_at = ingest_at.add(20 + q3);
     let (ts_packed, ingest_packed, good) = iso_tails(ts_at, ingest_at);
     let (digits, digit_mask) = digits13(ts_at);
-    bad |= u64::from((type_at.sub(1) as *const u16).read_unaligned() ^ *(*lean).ingest_end.get_unchecked(q3));
 
     // The event type with its commas and quotes, as one of four texts, and
     // the masks of the 32 bytes from its last comma on.
@@ -998,9 +1100,10 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
         user,
         ts_packed,
         ingest_packed,
+        spill: 0,
+        digits,
         good,
         digit_mask,
-        digits,
         ts_length,
         region_newlines: mask(region, newline) as u32,
         region_commas: mask(region, comma) as u32,
@@ -1010,6 +1113,310 @@ pub unsafe fn event_lean_front<const INDEXED: bool>(ctx: &Ctx, lean: *const Lean
         ingest_at,
         type_at,
     });
+}
+
+/// The first half of the lean kernel, in assembly: `event_lean_front_plain`
+/// instruction for instruction, with every constant taken from the tables
+/// and every result stored straight into the record. (The compiler's version
+/// of the plain one is a fifth longer: it moves values between registers and
+/// the stack that here never leave their place.) The tests run both on every
+/// line they have and compare the records.
+///
+/// # Safety
+/// As `event_lean_front_plain`.
+#[inline(always)]
+pub unsafe fn event_lean_front<const INDEXED: bool>(lean: *const LeanTables, p: *const u8, front: *mut LeanFront) {
+    use std::mem::offset_of;
+    macro_rules! front_asm {
+        ($($line:literal,)* ; $($name:ident = const $value:expr,)*) => {
+            std::arch::asm!(
+                // Masks of the commas (r8) and quotes (r9) of bytes 0..64.
+                "vmovdqu ymm0, ymmword ptr [rdi]",
+                "vmovdqu ymm1, ymmword ptr [rdi + 32]",
+                "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {comma}]",
+                "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {comma}]",
+                "vpmovmskb eax, ymm2",
+                "vpmovmskb r8d, ymm3",
+                "shl r8, 32",
+                "or r8, rax",
+                "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {quote}]",
+                "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {quote}]",
+                "vpmovmskb eax, ymm2",
+                "vpmovmskb r9d, ymm3",
+                "shl r9, 32",
+                "or r9, rax",
+                // The guess of the row's length.
+                "vmovdqa ymm7, ymmword ptr [rsi + {newline}]",
+                "vpcmpeqb ymm2, ymm7, ymmword ptr [rdi + 64]",
+                "vpmovmskb eax, ymm2",
+                "tzcnt eax, eax",
+                "add eax, 64",
+                "mov qword ptr [rdx + {guess}], rax",
+                // Quotes at the starts (r10) of the first four fields and
+                // before the first three commas; rax collects `bad`, r11 is q3.
+                "lea r10, [r8 + r8 + 1]",
+                "pext r11, r9, r10",
+                "lea rax, [r9 + r9]",
+                "pext rax, rax, r8",
+                "xor rax, r11",
+                "and eax, 7",
+                "shr r11d, 3",
+                "and r11d, 1",
+                // Text starts (rcx) and text ends (r8) as bits.
+                "mov rcx, r10",
+                "and rcx, r9",
+                "add rcx, r10",
+                "rorx r10, r8, 1",
+                "and r10, r9",
+                "sub r8, r10",
+                // s0 r9, s1 r10, s2 r12, s3 r13, e0 rcx, e1 r14, e2 r8.
+                "tzcnt r9, rcx",
+                "blsr rcx, rcx",
+                "tzcnt r10, rcx",
+                "blsr rcx, rcx",
+                "tzcnt r12, rcx",
+                "blsr rcx, rcx",
+                "tzcnt r13, rcx",
+                "tzcnt rcx, r8",
+                "blsr r8, r8",
+                "tzcnt r14, r8",
+                "blsr r8, r8",
+                "tzcnt r8, r8",
+                // ts (r12) and ingest_ts (r13), the comma after it (r8).
+                "sub r8, r12",
+                "mov dword ptr [rdx + {ts_length}], r8d",
+                "add r12, rdi",
+                "mov qword ptr [rdx + {ts_at}], r12",
+                "add r13, rdi",
+                "mov qword ptr [rdx + {ingest_at}], r13",
+                "lea r8, [r13 + r11 + 20]",
+                "mov qword ptr [rdx + {type_at}], r8",
+                "movzx r15d, word ptr [r8 - 1]",
+                "xor r15w, word ptr [rsi + r11*2 + {ingest_end}]",
+                "or rax, r15",
+                $($line,)*
+                // Both timestamps' bytes 4..20.
+                "vmovdqu xmm0, xmmword ptr [r12 + 4]",
+                "vinserti128 ymm0, ymm0, xmmword ptr [r13 + 4], 1",
+                "vpxor ymm0, ymm0, ymmword ptr [rsi + {iso_pattern}]",
+                "vpminub ymm1, ymm0, ymmword ptr [rsi + {iso_limit}]",
+                "vpcmpeqb ymm1, ymm1, ymm0",
+                "vpshufb ymm0, ymm0, ymmword ptr [rsi + {iso_shuffle}]",
+                "vpmaddubsw ymm0, ymm0, ymmword ptr [rsi + {tens}]",
+                "vpcmpgtw ymm2, ymm0, ymmword ptr [rsi + {iso_ceilings}]",
+                "vpandn ymm1, ymm2, ymm1",
+                "vpmovmskb ecx, ymm1",
+                "mov dword ptr [rdx + {good}], ecx",
+                "vpmaddwd ymm0, ymm0, ymmword ptr [rsi + {iso_weights}]",
+                "vpshufd ymm1, ymm0, 0xFB",
+                "vpaddd ymm0, ymm0, ymm1",
+                "vmovq qword ptr [rdx + {ts_packed}], xmm0",
+                "vextracti128 xmmword ptr [rdx + {ingest_packed}], ymm0, 1",
+                // ts as 13 digits.
+                "vmovdqu xmm0, xmmword ptr [r12 - 3]",
+                "vpxor xmm0, xmm0, xmmword ptr [rsi + {zeros}]",
+                "vpand xmm0, xmm0, xmmword ptr [rsi + {keep13}]",
+                "vpminub xmm1, xmm0, xmmword ptr [rsi + {nine}]",
+                "vpcmpeqb xmm1, xmm1, xmm0",
+                "vpmovmskb ecx, xmm1",
+                "mov dword ptr [rdx + {digit_mask}], ecx",
+                "vpmaddubsw xmm0, xmm0, xmmword ptr [rsi + {tens}]",
+                "vpmaddwd xmm0, xmm0, xmmword ptr [rsi + {hundreds}]",
+                "vpackusdw xmm0, xmm0, xmm0",
+                "vpmaddwd xmm0, xmm0, xmmword ptr [rsi + {ten_thousands}]",
+                "vmovq qword ptr [rdx + {digits}], xmm0",
+                // The type, and the masks of the 32 bytes after it.
+                "vpbroadcastq ymm0, qword ptr [r8]",
+                "vpand ymm0, ymm0, ymmword ptr [rsi + {type_masks}]",
+                "vpcmpeqq ymm0, ymm0, ymmword ptr [rsi + {type_texts}]",
+                "vmovmskpd ecx, ymm0",
+                "movzx ecx, byte ptr [rsi + rcx + {type_step}]",
+                "mov qword ptr [rdx + {step}], rcx",
+                "vmovdqu ymm0, ymmword ptr [r8 + rcx]",
+                "vpcmpeqb ymm1, ymm0, ymm7",
+                "vpmovmskb ecx, ymm1",
+                "mov dword ptr [rdx + {region_newlines}], ecx",
+                "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {comma}]",
+                "vpmovmskb ecx, ymm1",
+                "mov dword ptr [rdx + {region_commas}], ecx",
+                "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {quote}]",
+                "vpmovmskb ecx, ymm1",
+                "mov dword ptr [rdx + {region_quotes}], ecx",
+                "mov qword ptr [rdx + {bad}], rax",
+                in("rdi") p,
+                in("rsi") lean,
+                in("rdx") front,
+                out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+                out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+                out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _, out("ymm7") _,
+                comma = const offset_of!(LeanTables, comma),
+                quote = const offset_of!(LeanTables, quote),
+                newline = const offset_of!(LeanTables, newline),
+                ingest_end = const offset_of!(LeanTables, ingest_end),
+                iso_pattern = const offset_of!(LeanTables, iso_pattern),
+                iso_limit = const offset_of!(LeanTables, iso_limit),
+                iso_shuffle = const offset_of!(LeanTables, iso_shuffle),
+                tens = const offset_of!(LeanTables, tens),
+                iso_ceilings = const offset_of!(LeanTables, iso_ceilings),
+                iso_weights = const offset_of!(LeanTables, iso_weights),
+                zeros = const offset_of!(LeanTables, zeros),
+                keep13 = const offset_of!(LeanTables, keep13),
+                nine = const offset_of!(LeanTables, nine),
+                hundreds = const offset_of!(LeanTables, hundreds),
+                ten_thousands = const offset_of!(LeanTables, ten_thousands),
+                type_masks = const offset_of!(LeanTables, type_masks),
+                type_texts = const offset_of!(LeanTables, type_texts),
+                type_step = const offset_of!(LeanTables, type_step),
+                id_digit = const offset_of!(LeanTables, id_digit),
+                id_letter = const offset_of!(LeanTables, id_letter),
+                twenty_five = const offset_of!(LeanTables, twenty_five),
+                guess = const offset_of!(LeanFront, guess),
+                bad = const offset_of!(LeanFront, bad),
+                event = const offset_of!(LeanFront, event),
+                ts_packed = const offset_of!(LeanFront, ts_packed),
+                ingest_packed = const offset_of!(LeanFront, ingest_packed),
+                digits = const offset_of!(LeanFront, digits),
+                good = const offset_of!(LeanFront, good),
+                digit_mask = const offset_of!(LeanFront, digit_mask),
+                ts_length = const offset_of!(LeanFront, ts_length),
+                region_newlines = const offset_of!(LeanFront, region_newlines),
+                region_commas = const offset_of!(LeanFront, region_commas),
+                region_quotes = const offset_of!(LeanFront, region_quotes),
+                step = const offset_of!(LeanFront, step),
+                ts_at = const offset_of!(LeanFront, ts_at),
+                ingest_at = const offset_of!(LeanFront, ingest_at),
+                type_at = const offset_of!(LeanFront, type_at),
+                $($name = const $value,)*
+                options(nostack),
+            )
+        };
+    }
+    if INDEXED {
+        front_asm!(
+            // Index mode. The eight bytes that end each ID (ends: rcx, r14).
+            "vmovq xmm0, qword ptr [rdi + rcx - 8]",
+            "vpinsrq xmm0, xmm0, qword ptr [rdi + r14 - 8], 1",
+            // Lengths (rcx, r14: 0 or 1 more than 7 characters) and prefixes.
+            "sub rcx, r9",
+            "sub rcx, 8",
+            "sub r14, r10",
+            "sub r14, 8",
+            "mov r11, rcx",
+            "or r11, r14",
+            "shr r11, 1",
+            "or rax, r11",
+            "movzx r11d, byte ptr [rdi + r9]",
+            "xor r11d, 101",
+            "or rax, r11",
+            "movzx r11d, byte ptr [rdi + r10]",
+            "xor r11d, 117",
+            "or rax, r11",
+            "and ecx, 1",
+            "and r14d, 1",
+            // Base-36 values of the sixteen bytes; all must be characters.
+            "vpaddb xmm1, xmm0, xmmword ptr [rsi + {id_digit}]",
+            "vpminub xmm2, xmm1, xmmword ptr [rsi + {nine}]",
+            "vpcmpeqb xmm2, xmm2, xmm1",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id_letter}]",
+            "vpminub xmm4, xmm3, xmmword ptr [rsi + {twenty_five}]",
+            "vpcmpeqb xmm4, xmm4, xmm3",
+            "vpand xmm1, xmm1, xmm2",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id36_letter_value}]",
+            "vpand xmm3, xmm3, xmm4",
+            "vpor xmm1, xmm1, xmm3",
+            "vpor xmm2, xmm2, xmm4",
+            "vpmovmskb r11d, xmm2",
+            "xor r11d, 0xFFFF",
+            "or rax, r11",
+            "vpmaddubsw xmm1, xmm1, xmmword ptr [rsi + {id36_pairs}]",
+            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {id36_fours}]",
+            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {id36_eights}]",
+            "vpsrlq xmm1, xmm1, 32",
+            "vpaddq xmm1, xmm1, xmm2",
+            "vmovq r9, xmm1",
+            "vpextrq r10, xmm1, 1",
+            // Less the prefix's part; then the range of canonical texts.
+            "sub r9, qword ptr [rsi + rcx*8 + {lead36}]",
+            "sub r10, qword ptr [rsi + r14*8 + {lead36} + 16]",
+            "mov qword ptr [rdx + {event}], r9",
+            "mov qword ptr [rdx + {event} + 8], r10",
+            "shl ecx, 4",
+            "shl r14d, 4",
+            "sub r9, qword ptr [rsi + rcx + {canonical36}]",
+            "xor r11d, r11d",
+            "cmp r9, qword ptr [rsi + rcx + {canonical36} + 8]",
+            "seta r11b",
+            "or rax, r11",
+            "sub r10, qword ptr [rsi + r14 + {canonical36}]",
+            "xor r11d, r11d",
+            "cmp r10, qword ptr [rsi + r14 + {canonical36} + 8]",
+            "seta r11b",
+            "or rax, r11",
+            ;
+            id36_letter_value = const offset_of!(LeanTables, id36_letter_value),
+            id36_pairs = const offset_of!(LeanTables, id36_pairs),
+            id36_fours = const offset_of!(LeanTables, id36_fours),
+            id36_eights = const offset_of!(LeanTables, id36_eights),
+            lead36 = const offset_of!(LeanTables, lead36),
+            canonical36 = const offset_of!(LeanTables, canonical36),
+        );
+    } else {
+        front_asm!(
+            // General mode. Lengths (rcx, r14: 0 or 1 more than 7
+            // characters) and prefixes.
+            "sub rcx, r9",
+            "sub rcx, 8",
+            "sub r14, r10",
+            "sub r14, 8",
+            "mov r11, rcx",
+            "or r11, r14",
+            "shr r11, 1",
+            "or rax, r11",
+            "movzx r11d, byte ptr [rdi + r9]",
+            "xor r11d, 101",
+            "or rax, r11",
+            "movzx r11d, byte ptr [rdi + r10]",
+            "xor r11d, 117",
+            "or rax, r11",
+            // The eight bytes after each prefix, and which of them must be
+            // characters (ecx).
+            "vmovq xmm0, qword ptr [rdi + r9 + 1]",
+            "vpinsrq xmm0, xmm0, qword ptr [rdi + r10 + 1], 1",
+            "and ecx, 1",
+            "and r14d, 1",
+            "shl ecx, 7",
+            "shl r14d, 15",
+            "lea ecx, [rcx + r14 + 0x7F7F]",
+            "vpaddb xmm1, xmm0, xmmword ptr [rsi + {id_digit}]",
+            "vpminub xmm2, xmm1, xmmword ptr [rsi + {nine}]",
+            "vpcmpeqb xmm2, xmm2, xmm1",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id_letter}]",
+            "vpminub xmm4, xmm3, xmmword ptr [rsi + {twenty_five}]",
+            "vpcmpeqb xmm4, xmm4, xmm3",
+            "vpaddb xmm1, xmm0, xmmword ptr [rsi + {id_digit_value}]",
+            "vpand xmm1, xmm1, xmm2",
+            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id_letter_value}]",
+            "vpand xmm3, xmm3, xmm4",
+            "vpor xmm1, xmm1, xmm3",
+            "vpor xmm2, xmm2, xmm4",
+            "vpmovmskb r11d, xmm2",
+            "xor r11d, ecx",
+            "or rax, r11",
+            // Base 37, most significant character first.
+            "vpmaddubsw xmm1, xmm1, xmmword ptr [rsi + {id_pairs}]",
+            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {id_fours}]",
+            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {id_eights}]",
+            "vpsrlq xmm1, xmm1, 32",
+            "vpaddq xmm1, xmm1, xmm2",
+            "vmovdqu xmmword ptr [rdx + {event}], xmm1",
+            ;
+            id_digit_value = const offset_of!(LeanTables, id_digit_value),
+            id_letter_value = const offset_of!(LeanTables, id_letter_value),
+            id_pairs = const offset_of!(LeanTables, id_pairs),
+            id_fours = const offset_of!(LeanTables, id_fours),
+            id_eights = const offset_of!(LeanTables, id_eights),
+        );
+    }
 }
 
 /// The second half of the lean kernel: the row at `p`, whose first half is
@@ -1032,6 +1439,19 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
     if front.bad != 0 {
         return DECLINE;
     }
+    let (event, user) = if INDEXED {
+        // Index mode: the numbers of both IDs must be those of generated
+        // ones: an event index and a user index below the keys' bounds.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let index = unscramble(front.event, keys.event_key);
+        let number = unscramble(front.user, keys.user_key);
+        if index >= keys.index_bound || (number >> 9) >= keys.user_bound {
+            return DECLINE;
+        }
+        (index, number)
+    } else {
+        (front.event, front.user)
+    };
     // ingest_ts must be F1 on a table day.
     let days = std::ptr::addr_of!((*lean).day) as *const [u32; 2];
     let ingest_day = *days.add((front.ingest_packed & 511) as usize);
@@ -1074,7 +1494,7 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
         if opaque(u64::from(select_unpredictable(not_digits == 0, 0, not_plain))) != 0 {
             return DECLINE;
         }
-        select_unpredictable(not_digits == 0, front.digits, iso_ms)
+        select_unpredictable(not_digits == 0, digits13_value(front.digits), iso_ms)
     };
     let ts = ts_ms.wrapping_sub(ctx.window_start) as u64;
     let mut valid = (ts < window_length) & (ingest_ms.wrapping_sub(ts_ms) <= LATE_MS);
@@ -1152,11 +1572,10 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
                 None => valid = false,
             }
         }
-        let status =
-            event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, purchase);
+        let status = event_lean_finish::<MODE, INDEXED>(sink, row, event, user, ts, valid, ingest_seconds, purchase);
         return (length, status);
     }
-    (length, event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, None))
+    (length, event_lean_finish::<MODE, INDEXED>(sink, row, event, user, ts, valid, ingest_seconds, None))
 }
 
 /// Where the lean kernel stores event records: the writers of the mode's
@@ -1304,7 +1723,7 @@ thread_local! {
 }
 
 /// As `event_row_fast`, with the lean kernel in front of it: the same
-/// arguments, the same answers.
+/// arguments, the same answers. Eight bytes before `p` must be readable too.
 #[inline(always)]
 pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
@@ -1314,7 +1733,14 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
 ) -> (usize, u32) {
     let (lean, window_length) = lean_setup(ctx);
     let mut front = std::mem::MaybeUninit::<LeanFront>::uninit();
-    event_lean_front::<INDEXED>(ctx, lean, p, front.as_mut_ptr());
+    event_lean_front::<INDEXED>(lean, p, front.as_mut_ptr());
+    #[cfg(test)]
+    {
+        // Both versions of the first half must leave the same record.
+        let mut plain = std::mem::MaybeUninit::<LeanFront>::uninit();
+        event_lean_front_plain::<INDEXED>(lean, p, plain.as_mut_ptr());
+        assert!((*front.as_ptr()).same(&*plain.as_ptr()), "the two first halves differ");
+    }
     let sink = LeanSink::new::<INDEXED>(out);
     let (length, status) =
         event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, front.as_ptr(), &sink, row);
@@ -1622,14 +2048,14 @@ mod tests {
         /// `line`, then a newline, then enough of a tail, with a newline in front.
         fn load(&mut self, line: &[u8], tail: &[u8]) -> *const u8 {
             self.buffer.clear();
-            self.buffer.push(b'\n');
+            self.buffer.extend_from_slice(b"01234567\n");
             self.buffer.extend_from_slice(line);
             self.buffer.push(b'\n');
             while self.buffer.len() < line.len() + 2 * ROW_PAD {
                 self.buffer.extend_from_slice(tail);
             }
-            // SAFETY: the buffer is longer than one byte.
-            unsafe { self.buffer.as_ptr().add(1) }
+            // SAFETY: the buffer is longer than nine bytes.
+            unsafe { self.buffer.as_ptr().add(9) }
         }
 
         fn event_with(&mut self, line: &[u8], tail: &[u8]) {

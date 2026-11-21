@@ -370,22 +370,25 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, MODE_STORE};
-    match event_kernel() {
-        KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
+    use super::simd::{event_kernel, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
+    let kernel = event_kernel();
+    if kernel == KERNEL_GENERAL {
+        return events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out);
+    }
+    if MODE == MODE_ROW {
         // Checked rows go one by one through the loop that compares them.
-        _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
-        // Index mode has no diagnostic modes of its own: SS_DIAG=2 and 7 pick them here.
-        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
-            events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
-        }
-        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 3 => {
-            events_lean_loop::<3, INDEXED>(ctx, buffer, position, end, out)
-        }
-        _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 => {
-            events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
-        }
-        _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
+        return events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out);
+    }
+    let plain = kernel == KERNEL_LEAN_PLAIN;
+    // Index mode has no diagnostic modes of its own: SS_DIAG=2, 3 and 7 pick them here.
+    match (INDEXED && MODE == MODE_STORE, ctx.diag, plain) {
+        (true, 2, _) => events_lean_loop::<2, INDEXED, false>(ctx, buffer, position, end, out),
+        (true, 3, false) => events_lean_loop::<3, INDEXED, false>(ctx, buffer, position, end, out),
+        (true, 3, true) => events_lean_loop::<3, INDEXED, true>(ctx, buffer, position, end, out),
+        (true, 7, false) => events_lean_loop::<7, INDEXED, false>(ctx, buffer, position, end, out),
+        (true, 7, true) => events_lean_loop::<7, INDEXED, true>(ctx, buffer, position, end, out),
+        (_, _, false) => events_lean_loop::<MODE, INDEXED, false>(ctx, buffer, position, end, out),
+        (_, _, true) => events_lean_loop::<MODE, INDEXED, true>(ctx, buffer, position, end, out),
     }
 }
 
@@ -402,7 +405,7 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
 /// half is simply run again at the right place.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
+fn events_lean_loop<const MODE: u32, const INDEXED: bool, const PLAIN: bool>(
     ctx: &Ctx,
     buffer: &[u8],
     mut position: usize,
@@ -410,10 +413,28 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        event_lean_back, event_lean_front, event_lean_masks, lean_setup, LeanFront, LeanSink, LEAN_PAD,
-        ROW_DECLINE,
+        event_lean_back, event_lean_front, event_lean_front_plain, event_lean_masks, lean_setup, LeanFront,
+        LeanSink, LeanTables, LEAN_PAD, ROW_DECLINE,
     };
+    /// A row's first half, in assembly or as the compiler makes it.
+    #[inline(always)]
+    unsafe fn first_half<const INDEXED: bool, const PLAIN: bool>(
+        lean: *const LeanTables,
+        p: *const u8,
+        front: *mut LeanFront,
+    ) {
+        if PLAIN {
+            event_lean_front_plain::<INDEXED>(lean, p, front)
+        } else {
+            event_lean_front::<INDEXED>(lean, p, front)
+        }
+    }
     let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(LEAN_PAD));
+    // A first half reads up to 8 bytes before its row: a row that starts
+    // before byte 8 of the file (a header that short) is not for it.
+    if position < 8 && position < stop {
+        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+    }
     let (lean, window_length) = lean_setup(ctx);
     // Opaque to the optimizer: see `LeanTables`.
     let lean = std::hint::black_box(lean);
@@ -440,7 +461,7 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
         while position < stop {
             // SAFETY: as below.
             unsafe {
-                event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a);
+                first_half::<INDEXED, PLAIN>(lean, base.add(position), record_a);
                 row.event ^= (*record_a).fold();
                 position += (*record_a).guess + 1;
             }
@@ -450,11 +471,12 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     }
     'restart: while position < stop {
         // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
-        // readable bytes after it; a first half reads at most 132 bytes from
-        // where it is run, which is `position` or at most 97 bytes past it.
+        // readable bytes after it and `position >= 8` eight before it; a
+        // first half reads from 8 bytes before to 132 bytes after where it
+        // is run, which is `position` or at most 97 bytes past it.
         // The sink is made anew after every use of `out`.
         let sink = LeanSink::new::<INDEXED>(out);
-        unsafe { event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a) };
+        unsafe { first_half::<INDEXED, PLAIN>(lean, base.add(position), record_a) };
         loop {
             // One row with its record in `$current`, the next row's in `$next`.
             macro_rules! row {
@@ -462,7 +484,7 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
                     let p = unsafe { base.add(position) };
                     let guess = unsafe { (*$current).guess };
                     let (length, status) = unsafe {
-                        event_lean_front::<INDEXED>(ctx, lean, p.add(guess + 1), $next);
+                        first_half::<INDEXED, PLAIN>(lean, p.add(guess + 1), $next);
                         event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, $current, &sink, &mut row)
                     };
                     if status == ROW_DECLINE {
@@ -556,7 +578,8 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
-            if KERNEL == KERNEL_GENERAL {
+            // The lean kernel reads up to 8 bytes before its row.
+            if KERNEL == KERNEL_GENERAL || position < 8 {
                 event_row_fast::<MODE, INDEXED>(ctx, p, out, &mut row)
             } else {
                 event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row)
