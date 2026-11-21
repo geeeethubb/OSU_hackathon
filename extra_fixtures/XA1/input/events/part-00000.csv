@@ -1,0 +1,10 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e1,ua,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,1
+e2,ub,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,2
+e3,uc,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,4
+e4,ud,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,8
+e5,ue,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,16
+e6,uf,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,32
+e7,ug,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,64
+e8,uh,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,128
+e9,uj,2026-10-03T10:00:00Z,2026-10-03T12:00:00Z,purchase,p1,256

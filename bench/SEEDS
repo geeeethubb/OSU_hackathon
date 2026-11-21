@@ -1,0 +1,4 @@
+# Generator seeds for bench-20m, in order. The first is the tuning seed: experiments
+# are judged on it. Every later seed is a holdout that confirms a result and must
+# not be used to choose between ideas.
+2 3

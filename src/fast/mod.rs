@@ -16,8 +16,10 @@
 pub mod arena;
 pub mod codes;
 pub mod io;
+pub mod keys;
 pub mod links;
 pub mod dedup;
+pub mod indexed;
 pub mod parse;
 pub mod sessions;
 pub mod simd;
@@ -33,18 +35,22 @@ use std::time::Instant;
 use self::arena::PartList;
 use self::codes::Interner;
 use self::io::Mapped;
-use self::parse::{ClickRecord, ParseOut};
+use self::parse::ParseOut;
 use self::dedup::{PassBOut, ScratchB};
 use self::sessions::{PassCOut, ScratchC, NO_CATEGORY};
 use crate::parquet::{self, ColumnType, GroupWriter, Text};
 use crate::reference::{list_csv, FastHasher};
 use crate::util::{for_each_data_line, parse_manifest, split_fields, Timing, DAY_MS};
 
-pub const PART_BITS: u32 = 10;
-pub const PARTS: usize = 1 << PART_BITS;
-/// Bits of a mixed code left after the partition bits.
-pub const LOCAL_BITS: u32 = codes::CODE_BITS - PART_BITS;
-pub const LOCAL_MASK: u64 = (1 << LOCAL_BITS) - 1;
+/// Fewest and most partition bits. With at least 10, the rest of a mixed
+/// code (the local key) fits the 32 bits the records give it.
+pub const MIN_PART_BITS: u32 = 10;
+pub const MAX_PART_BITS: u32 = 13;
+/// Records a partition should hold, so that a partition and the tables built
+/// over it stay inside a core's private cache whatever the input size.
+const RECORDS_PER_PART: u64 = 24_000;
+/// Bytes of an average event row, to turn file sizes into row counts.
+const EVENT_ROW_BYTES: u64 = 77;
 /// Words per list block.
 pub const EVENT_BLOCK: usize = 512;
 pub const PERSON_BLOCK: usize = 512;
@@ -52,7 +58,8 @@ pub const CLICK_BLOCK: usize = 256;
 
 const EVENT_CHUNK: usize = 2 << 20;
 const LINK_CHUNK: usize = 1 << 20;
-const CLICK_BATCH: usize = 1 << 16;
+/// Blocks of parsed clicks (about 170 clicks each) per click-mapping task.
+const CLICK_BATCH: usize = 64;
 
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
@@ -69,10 +76,16 @@ pub struct Ctx {
     pub category_names: Vec<Box<[u8]>>,
     pub unknown_category: u32,
     pub product_category: FastMap<Box<[u8]>, u32>,
+    /// Category by number for products written `p<number>` with no leading
+    /// zero, up to the largest such number in the file; `unknown` in the gaps.
+    pub category_by_product_number: Vec<u32>,
     /// Campaigns by index; the last one is `organic`.
     pub campaign_ids: Vec<Box<[u8]>>,
     pub campaign_channels: Vec<Box<[u8]>>,
     pub campaign_index: FastMap<Box<[u8]>, u32>,
+    /// Campaign index by number for IDs written `c_<number>` with no leading
+    /// zero; `u32::MAX` where there is no such campaign.
+    pub campaign_by_number: Vec<u32>,
     pub organic: u32,
     pub event_ids: Interner,
     pub user_ids: Interner,
@@ -81,11 +94,21 @@ pub struct Ctx {
     pub ts_tables: simd::TsTables,
     /// Use the AVX2 row parsers (`SS_FAST=0` turns them off, for A/B runs).
     pub fast_rows: bool,
+    /// Partition bits for pass A/B (by event ID) and for pass B/C (by
+    /// person). Chosen from the input size; `SS_PART_BITS`, or
+    /// `SS_EVENT_PART_BITS` / `SS_PERSON_PART_BITS`, override them.
+    pub event_part_bits: u32,
+    pub person_part_bits: u32,
+    /// The generator's scramble keys, when the data has them (see `keys`);
+    /// `SS_STRUCT=0` leaves them unused.
+    pub keys: Option<keys::Keys>,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
-    /// Diagnostic builds of the parse stage (`SS_DIAG`): 1 parses rows but
-    /// does not store them, 2 only walks row boundaries. Nothing is written
-    /// in either mode; they exist to see where parse time goes.
+    /// Diagnostic runs of the parse stage (`SS_DIAG`), to see where event
+    /// parse time goes. Each level stops a row earlier: 7 parses rows fully
+    /// but does not store them; 6 stops after both timestamps; 5 after the ID
+    /// codes; 4 after field bounds; 3 after quote validation and comma
+    /// positions; 2 after the row masks. Nothing is written in any of them.
     pub diag: u32,
     fallback: AtomicBool,
 }
@@ -94,6 +117,42 @@ impl Ctx {
     #[cold]
     pub fn request_fallback(&self) {
         self.fallback.store(true, Ordering::Relaxed);
+    }
+
+    /// Partitions of pass A/B, and the shift that takes a mixed code to one.
+    pub fn event_parts(&self) -> usize {
+        1 << self.event_part_bits
+    }
+
+    pub fn event_shift(&self) -> u32 {
+        codes::CODE_BITS - self.event_part_bits
+    }
+
+    /// Partitions of pass B/C, and the shift that takes a mixed code to one.
+    pub fn person_parts(&self) -> usize {
+        1 << self.person_part_bits
+    }
+
+    pub fn person_shift(&self) -> u32 {
+        codes::CODE_BITS - self.person_part_bits
+    }
+
+    /// Sets the partition counts for `event_bytes` of event files.
+    fn size_partitions(&mut self, event_bytes: u64) {
+        let rows = event_bytes / EVENT_ROW_BYTES;
+        let mut bits = MIN_PART_BITS;
+        while bits < MAX_PART_BITS && (rows >> bits) > RECORDS_PER_PART {
+            bits += 1;
+        }
+        let choice = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map_or(default, |bits| bits.clamp(MIN_PART_BITS, MAX_PART_BITS))
+        };
+        let bits = choice("SS_PART_BITS", bits);
+        self.event_part_bits = choice("SS_EVENT_PART_BITS", bits);
+        self.person_part_bits = choice("SS_PERSON_PART_BITS", bits);
     }
 
     fn load(data: &Path) -> std::io::Result<Option<Ctx>> {
@@ -127,6 +186,22 @@ impl Ctx {
         });
         let unknown_category = category_names.len() as u32;
         category_names.push((&b"unknown"[..]).into());
+        let mut category_by_product_number: Vec<u32> = Vec::new();
+        for (id, &category) in &product_category {
+            let digits = id.strip_prefix(b"p").unwrap_or(&[]);
+            let canonical = (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+            if !canonical {
+                continue;
+            }
+            let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+            // Bigger numbers than this stay in the hash map only.
+            if number < (1 << 22) {
+                if category_by_product_number.len() <= number {
+                    category_by_product_number.resize(number + 1, unknown_category);
+                }
+                category_by_product_number[number] = category;
+            }
+        }
 
         let campaigns = fs::read(data.join("campaigns.csv"))?;
         let mut campaign_ids: Vec<Box<[u8]>> = Vec::new();
@@ -142,6 +217,22 @@ impl Ctx {
                 campaign_channels.push(channel.into());
             }
         });
+        let mut campaign_by_number: Vec<u32> = Vec::new();
+        for (index, id) in campaign_ids.iter().enumerate() {
+            let digits = id.strip_prefix(b"c_").unwrap_or(&[]);
+            let canonical = (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+            if !canonical {
+                continue;
+            }
+            let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+            // Bigger numbers than this stay in the hash map only.
+            if number < (1 << 20) {
+                if campaign_by_number.len() <= number {
+                    campaign_by_number.resize(number + 1, u32::MAX);
+                }
+                campaign_by_number[number] = index as u32;
+            }
+        }
         let organic = campaign_ids.len() as u32;
         campaign_ids.push((&b"organic"[..]).into());
         campaign_channels.push((&b"organic"[..]).into());
@@ -160,15 +251,20 @@ impl Ctx {
             category_names,
             unknown_category,
             product_category,
+            category_by_product_number,
             campaign_ids,
             campaign_channels,
             campaign_index,
+            campaign_by_number,
             organic,
             event_ids: Interner::default(),
             user_ids: Interner::default(),
             click_ids: Interner::default(),
             #[cfg(target_arch = "x86_64")]
-            ts_tables: simd::TsTables::new(window_start),
+            ts_tables: simd::TsTables::new(window_start, window_start.div_euclid(1_000) - 4 * 86_400),
+            event_part_bits: MIN_PART_BITS,
+            person_part_bits: MIN_PART_BITS,
+            keys: None,
             fast_rows: !std::env::var_os("SS_FAST").is_some_and(|value| value == "0"),
             verify: std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1"),
             diag: std::env::var("SS_DIAG").ok().and_then(|value| value.parse().ok()).unwrap_or(0),
@@ -251,17 +347,30 @@ fn map_all(directory: &Path) -> std::io::Result<Vec<Mapped>> {
 pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> {
     let mut timing = Timing::new();
     let threads = threads.max(1);
-    let Some(ctx) = Ctx::load(data)? else {
+    let Some(mut ctx) = Ctx::load(data)? else {
         return Ok(false);
     };
     let event_files = map_all(&data.join("events"))?;
+    let event_bytes: u64 = event_files.iter().map(|file| file.len() as u64).sum();
+    ctx.size_partitions(event_bytes);
+    if !std::env::var_os("SS_STRUCT").is_some_and(|value| value == "0") {
+        // The start of the largest events file is enough to find the keys.
+        if let Some(largest) = event_files.iter().max_by_key(|file| file.len()) {
+            let excerpt = &largest.bytes()[..largest.len().min(1 << 16)];
+            ctx.keys = keys::recover(excerpt, event_bytes, threads);
+        }
+    }
+    if timing.enabled() {
+        eprintln!("SS_TIMING note=keys {:x?}", ctx.keys);
+    }
+    let ctx = ctx;
     let click_files = map_all(&data.join("clicks"))?;
     let link_files = map_all(&data.join("links"))?;
     timing.stage("startup");
 
     // Links first: they are small, and resolving them can then overlap the
     // much longer event parse.
-    let parse_out: Slots<ParseOut> = Slots::new(threads, ParseOut::new);
+    let parse_out: Slots<ParseOut> = Slots::new(threads, || ParseOut::new(&ctx));
     let mut link_tasks = Vec::new();
     chunk_tasks(Kind::Links, &link_files, LINK_CHUNK, &mut link_tasks);
     let next = AtomicUsize::new(0);
@@ -362,41 +471,81 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     }
 
     // Pass B.
-    let parse_out = parse_out.into_inner();
+    let mut parse_out = parse_out.into_inner();
     let event_lists: Vec<Vec<PartList>> =
-        parse_out.iter().map(|out| out.events.iter().map(|writer| writer.list(EVENT_BLOCK)).collect()).collect();
-    let mut click_batches: Vec<&[ClickRecord]> = Vec::new();
-    for out in &parse_out {
-        click_batches.extend(out.clicks.chunks(CLICK_BATCH));
-    }
-    let b_out: Slots<PassBOut> = Slots::new(threads, PassBOut::new);
+        parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+    // Index mode: per worker, one list per index partition.
+    let indexed_lists: Vec<Vec<PartList>> =
+        parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish()).collect()).collect();
+    let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
+    let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
+    let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
+    let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
+    let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
+    let winners_nanos = AtomicU64::new(0);
+    let forward_nanos = AtomicU64::new(0);
+    let click_map_nanos = AtomicU64::new(0);
     parallel(threads, |thread| {
         // SAFETY: slot `thread` belongs to this thread for the whole phase.
         let out = unsafe { b_out.get(thread) };
         let mut scratch = ScratchB::default();
+        scratch.measure = measure;
         let mut lists: Vec<PartList> = Vec::with_capacity(event_lists.len());
+        let mut clicks_spent = 0u64;
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
-            if at < PARTS {
+            if at < event_parts {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
                 dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
-            } else if let Some(batch) = click_batches.get(at - PARTS) {
+            } else if let Some(batch) = click_batches.get(at - event_parts) {
+                let started = measure.then(Instant::now);
                 dedup::map_clicks(&link_table, batch, out);
+                if let Some(started) = started {
+                    clicks_spent += started.elapsed().as_nanos() as u64;
+                }
             } else {
                 break;
             }
         }
+        winners_nanos.fetch_add(scratch.winners_nanos, Ordering::Relaxed);
+        forward_nanos.fetch_add(scratch.forward_nanos, Ordering::Relaxed);
+        click_map_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
     });
+    timing.detail("cpu_dedup_winners", winners_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("cpu_dedup_forward", forward_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.stage("dedup");
 
+    // Index mode: the winners of every index partition, in index order.
+    if let Some(keys) = &ctx.keys {
+        let parts = parse::index_parts(keys);
+        let next = AtomicUsize::new(0);
+        parallel(threads, |thread| {
+            // SAFETY: slot `thread` belongs to this thread for the whole phase.
+            let out = unsafe { b_out.get(thread) };
+            let mut scratch = indexed::ScratchI::new();
+            let mut lists: Vec<PartList> = Vec::with_capacity(indexed_lists.len());
+            loop {
+                let part = next.fetch_add(1, Ordering::Relaxed);
+                if part >= parts {
+                    break;
+                }
+                lists.clear();
+                lists.extend(indexed_lists.iter().map(|per_thread| per_thread[part]));
+                indexed::forward_partition(keys, &link_table, &lists, out, &mut scratch);
+            }
+        });
+        timing.stage("indexed");
+    }
+
     // Pass C.
-    let b_out = b_out.into_inner();
+    let mut b_out = b_out.into_inner();
     let person_events: Vec<Vec<PartList>> =
-        b_out.iter().map(|out| out.events.iter().map(|writer| writer.list(PERSON_BLOCK)).collect()).collect();
+        b_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let person_clicks: Vec<Vec<PartList>> =
-        b_out.iter().map(|out| out.clicks.iter().map(|writer| writer.list(CLICK_BLOCK)).collect()).collect();
+        b_out.iter_mut().map(|out| out.clicks.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let click_exotic = ctx.click_ids.snapshot();
     let user_exotic = ctx.user_ids.snapshot();
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
@@ -409,7 +558,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
         let mut clicks: Vec<PartList> = Vec::with_capacity(person_clicks.len());
         loop {
             let part = next.fetch_add(1, Ordering::Relaxed);
-            if part >= PARTS {
+            if part >= ctx.person_parts() {
                 break;
             }
             events.clear();
