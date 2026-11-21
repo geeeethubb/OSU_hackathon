@@ -351,3 +351,23 @@ official_receipt_and_score: not yet submitted
   designed (restarts on moved events, cross-user copies and swapped event IDs). The same lists are being
   re-run on this commit.
 - **`bench/build_prior.sh` now fails the job** when the baseline cannot be found or built.
+
+### 20:34 UTC
+
+- **Architectural experiment, rejected on its kill test: partition-owned (direct) winner construction.**
+  Hypothesis: letting the parsers hand each record to the owner of its index partition, which keeps the
+  winning copy directly, removes the intermediate partition lists and the placement pass. Smallest
+  experiment that could disprove it: `bench/experiments/scatter.rs` on branch `exp-scatter` moves 20M
+  (and 60M) records that arrive in random index order, plus 3% second copies, without any parsing,
+  (a) the engine's way: per-thread block lists by 2^14-index partition, then placement in a slot table
+  that stays in the cache, then a read in order; (b) the best case of an owner design: no queues, no
+  batches, every producer writes straight into the final slot of one array (one atomic maximum per
+  record, huge pages), then a read in order. Linux runner (run 44946867096, EPYC 9V74, 4 vCPU, huge
+  pages granted on request): 20M, 4 threads: (a) 104 to 125 ms, (b) 229 to 276 ms; 20M, 2 threads:
+  139 to 178 against 223 to 252 ms; 60M, 4 threads: 432 to 443 against 747 to 761 ms. Laptop, 8 threads:
+  41 to 118 against 108 to 168 ms. The direct scheme pays a cache miss per record where the lists scheme
+  pays a sequential write and an in-cache placement; queues and a completion protocol could only add to
+  it. Decision: reject; keep lists and placement.
+- **What the same numbers suggest instead:** in (a), writing the lists is 82 of the 104 ms: about 16 ns per
+  record of thread time, mostly the read-for-ownership of fresh list memory. Next experiment in the same
+  harness: write-combining buffers flushed with non-temporal stores for the partition lists.
