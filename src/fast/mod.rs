@@ -834,6 +834,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     write_tables(&ctx, output, threads, &c_out, &user_exotic)?;
     timing.stage("output");
     timing.total();
+    // Both tables are written and their files closed. Returning from here
+    // would hand a gigabyte of buffers back to the allocator piece by piece
+    // before the process ends; leaving at once lets the kernel take the
+    // whole address space back in one step. `SS_EXIT=drop` keeps the
+    // ordinary return, for comparison.
+    if !std::env::var_os("SS_EXIT").is_some_and(|value| value == "drop") {
+        std::process::exit(0);
+    }
     Ok(Attempt::Done)
 }
 
