@@ -406,9 +406,11 @@ def monitor_text(run):
         return "not measured"
     if monitor_peak(run) is None:
         return "not captured (the container's cgroup was not found while it ran)"
+    huge = monitor.get("max_anon_thp_bytes")
     return (f"{size(monitor_peak(run))} (cgroup `memory.peak`, which also counts page cache charged to the container; sampled anonymous "
-            f"memory peaked at {size(monitor.get('max_anon_bytes'))}, file cache at {size(monitor.get('max_file_bytes'))}; "
-            f"{num(monitor.get('samples'))} samples)")
+            f"memory peaked at {size(monitor.get('max_anon_bytes'))}"
+            + (f", of which {size(huge)} in transparent huge pages" if huge is not None else "")
+            + f", file cache at {size(monitor.get('max_file_bytes'))}; {num(monitor.get('samples'))} samples)")
 
 
 def compare_text(entry):
@@ -420,6 +422,9 @@ def compare_text(entry):
     text = f"{sum(1 for item in new if item.get('match'))}/{len(new)} runs of this commit **{'MATCH' if all(item.get('match') for item in new) else 'DIFFER'}**"
     if prior:
         text += f"; prior best {sum(1 for item in prior if item.get('match'))}/{len(prior)} {'MATCH' if all(item.get('match') for item in prior) else 'DIFFER'}"
+    variant = [item for item in comparisons if item.get("which") == "variant"]
+    if variant:
+        text += f"; variant {sum(1 for item in variant if item.get('match'))}/{len(variant)} {'MATCH' if all(item.get('match') for item in variant) else 'DIFFER'}"
     return text
 
 
@@ -474,6 +479,23 @@ def aa_lines(analysis):
     return lines
 
 
+def variant_lines(analysis, aa):
+    """The same image with and without extra environment: a runtime switch judged without a build."""
+    described = " ".join(f"{key}={value}" for key, value in (analysis.get("env") or {}).items())
+    saving = analysis.get("median_a_minus_b_ms")
+    lines = [f"A is this commit's image as it is scored, B is the same image with `{described}`; {analysis.get('n')} pairs in the "
+             f"pre-shuffled order {' '.join(analysis.get('orders') or [])} on the same input, each run a fresh container; "
+             f"{cache_text(analysis.get('cache'))}.", ""]
+    lines += pair_table(analysis, "default", "variant", "saved (default − variant)")
+    lines += ["", f"Median per configuration: default {millis(analysis.get('median_a_ms'))} ms, variant {millis(analysis.get('median_b_ms'))} ms. "
+                  f"**Median paired saving of the variant {millis(saving, signed=True)} ms**; it was faster in {analysis.get('b_faster_pairs')} of "
+                  f"{analysis.get('n')} pairs. A/A noise on the same runner and input: {aa_summary(aa)}. The saving is {noise_judgement(saving, aa)}."]
+    if (analysis.get("timing_run") or {}).get("ss_timing"):
+        lines += ["", "<details><summary>Stage timings of the variant</summary>", ""]
+        lines += stage_lines(analysis["timing_run"], "Variant, one extra run with `SS_TIMING=1`") + ["", "</details>"]
+    return lines
+
+
 def ab_lines(analysis, aa, prior_sha, sha):
     saving = analysis.get("median_a_minus_b_ms")
     lines = [f"A is the prior best `{short(prior_sha)}`, B is this commit `{short(sha)}`; {analysis.get('n')} pairs in the pre-shuffled order "
@@ -519,8 +541,16 @@ def sixty_text(b60):
         return "run failed before the pipeline started" if not b60.get("ok") else "not run"
     check = "MATCH /reference" if (entry.get("compare") and all(item.get("match") for item in entry["compare"])) else (
         "self-check OK" if (entry.get("self_check") or {}).get("ok") else "self-check FAILED")
-    return (f"seed {entry.get('seed')}: container {secs(run.get('docker_s'))}, exit {run.get('exit_code')}, peak {size(monitor_peak(run))}, "
+    text = (f"seed {entry.get('seed')}: container {secs(run.get('docker_s'))}, exit {run.get('exit_code')}, peak {size(monitor_peak(run))}, "
             f"{check}")
+    ab = entry.get("ab")
+    if ab:
+        text += (f"; against the baseline in the same job {millis(ab.get('median_a_minus_b_ms'), signed=True)} ms "
+                 f"({ab.get('b_faster_pairs')}/{ab.get('n')} pairs, medians {millis(ab.get('median_a_ms'))} → {millis(ab.get('median_b_ms'))}; "
+                 f"A/A median abs {millis((entry.get('aa') or {}).get('median_abs_diff_ms'))} ms)")
+    if b60.get("run_url"):
+        text += f" [run {b60['run_url'].rsplit('/', 1)[-1]}]({b60['run_url']})"
+    return text
 
 
 def compact_rows(result, correctness=None, b60=None):
@@ -596,7 +626,7 @@ def render_bench20m(result, correctness=None, b60=None, with_line=True):
     images = result.get("images") or {}
     prior = result.get("prior") or {}
     if result.get("mode") == "stand-in":
-        lines += ["", "**Stand-in mode**: this commit has no root `Dockerfile`, so there are no pipeline numbers; only the diagnostics ran."]
+        lines += ["", "**Stand-in mode**: no pipeline image was built (no root `Dockerfile` at this commit, or the `standin` self-test was requested), so there are no pipeline numbers; only the diagnostics ran."]
     elif images.get("pipeline"):
         image = images["pipeline"]
         same = ""
@@ -648,6 +678,8 @@ def render_bench20m(result, correctness=None, b60=None, with_line=True):
                 lines += ["", f"### Seed {seed}: A/A noise check", ""] + aa_lines(entry["aa"])
             if entry.get("ab"):
                 lines += ["", f"### Seed {seed}: prior best versus this commit", ""] + ab_lines(entry["ab"], entry.get("aa"), prior.get("sha"), result.get("sha"))
+            if entry.get("variant"):
+                lines += ["", f"### Seed {seed}: variant of this commit", ""] + variant_lines(entry["variant"], entry.get("aa"))
             lines += ["", f"### Seed {seed}: stages, memory, correctness", ""]
             if pipeline.get("timing_run"):
                 lines += stage_lines(pipeline["timing_run"], "Stage timings from one extra run with `SS_TIMING=1`")
@@ -748,9 +780,27 @@ def render_bench60m(result):
         lines += [f"| {name} | {value} |" for name, value in rows]
         for item in [item for item in entry.get("compare") or [] if not item.get("match")][:2]:
             lines += ["", "```", item.get("output", ""), "```"]
+        prior = result.get("prior") or {}
+        if prior.get("status") == "built":
+            lines += ["", f"Prior best (`bench/BEST_SHA`): `{prior.get('sha')}`, built in this job"
+                          + (", but its `/pipeline` is byte-identical to this commit's, so there is nothing to compare."
+                             if prior.get("same_binary") else ".")]
+        plan = entry.get("pair_plan") or {}
+        if plan.get("requested") and plan.get("aa_pairs", 0) < plan["requested"]:
+            lines += ["", f"A run takes about {plan.get('per_run_s')} s here, so the {plan.get('budget_s'):.0f} s pair budget allowed "
+                          f"{plan.get('aa_pairs')} A/A pairs and {plan.get('ab_pairs')} prior-vs-candidate pairs instead of {plan['requested']}."]
+        if entry.get("aa"):
+            lines += ["", f"### Seed {entry.get('seed')}: A/A noise check at 60M", ""] + aa_lines(entry["aa"])
+        if entry.get("ab"):
+            lines += ["", f"### Seed {entry.get('seed')}: prior best versus this commit at 60M", ""]
+            lines += ab_lines(entry["ab"], entry.get("aa"), prior.get("sha"), result.get("sha"))
         staged = entry.get("timing_run") or run
         if staged.get("ss_timing"):
-            lines += [""] + stage_lines(staged, "Stage timings from one extra run with `SS_TIMING=1`")
+            lines += ["", f"### Seed {entry.get('seed')}: stages at 60M", ""]
+            lines += stage_lines(staged, "Stage timings from one extra run with `SS_TIMING=1`")
+        if (entry.get("prior_timing_run") or {}).get("ss_timing"):
+            lines += ["", "<details><summary>Stage timings of the prior best</summary>", ""]
+            lines += stage_lines(entry["prior_timing_run"], "Prior best, one extra run with `SS_TIMING=1`") + ["", "</details>"]
     return "\n".join(lines) + "\n"
 
 

@@ -28,6 +28,9 @@ on:
       pair_budget_s:
         description: "bench-20m: seconds the paired runs may take per seed (slow pipelines get fewer pairs)"
         default: "300"
+      variant_env:
+        description: "bench-20m: also pair this commit against itself with extra environment, e.g. SS_FAST=0"
+        default: ""
       cold_run:
         description: "bench-20m: add one labelled run from a cold page cache"
         type: boolean
@@ -116,6 +119,7 @@ jobs:
     timeout-minutes: 60
     env:
       INPUT_SEEDS: ${{ inputs.seeds }}
+      INPUT_VARIANT: ${{ inputs.variant_env }}
       VAR_SEEDS: ${{ vars.BENCH_SEEDS }}
       COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
       RUNS: ${{ inputs.runs || '3' }}
@@ -169,10 +173,15 @@ jobs:
           if [ -z "$seeds" ] && [ -f bench/SEEDS ]; then seeds=$(sed -e 's/#.*//' bench/SEEDS | tr '\n' ' '); fi
           [ -n "$(printf '%s' "$seeds" | tr -d ' ,')" ] || seeds=2
           echo "seeds: $seeds"
+          # A variant: the run_workflow input, else [variant=NAME=VALUE ...] in the commit message.
+          variant="$INPUT_VARIANT"
+          [ -n "$variant" ] || variant=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[variant=\([^]]*\)\].*/\1/p' | head -n 1)
+          [ -z "$variant" ] || echo "variant: $variant"
           python3 bench/bench.py bench20m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
             --out-json "$RUNNER_TEMP/evidence/bench-20m.json" \
             --seeds "$seeds" --runs "$RUNS" --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" $cold \
+            --variant-env "$variant" \
             --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
       - name: Report
         if: always()
@@ -205,10 +214,13 @@ jobs:
     timeout-minutes: 90
     env:
       SEED_60M: ${{ inputs.seed_60m || '2' }}
+      PAIRS: ${{ inputs.pairs || '6' }}
+      PAIR_BUDGET_S: ${{ inputs.pair_budget_s || '300' }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0   # bench/BEST_SHA may name any earlier commit
       - name: Disk space (60M events is about 5.7 GB of CSV)
         run: |
           df -h / "$RUNNER_TEMP"
@@ -240,12 +252,22 @@ jobs:
         run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
       - name: Build diagnostics image
         run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
+      - name: Build prior-best image (bench/BEST_SHA)
+        id: prior
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: bash bench/build_prior.sh ss-prior:latest
       - name: Benchmark (60M events)
+        env:
+          PRIOR_IMAGE: ${{ steps.prior.outputs.image }}
+          PRIOR_SHA: ${{ steps.prior.outputs.sha }}
+          PRIOR_STATUS: ${{ steps.prior.outputs.status }}
         run: |
           image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
           python3 bench/bench.py bench60m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
-            --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M"
+            --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M" \
+            --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" \
+            --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
       - name: Report
         if: always()
         run: |
@@ -281,17 +303,23 @@ jobs:
         with:
           pattern: ss-*
           path: ${{ runner.temp }}/reports
-      - name: Reports of this commit's push run (pull_request events from this repository)
-        if: needs.correctness.result == 'skipped'
+      - name: Reports of other runs for this commit
+        # A commit can be tested by more than one run: its push, a 60M run started by hand, and
+        # the pull_request event, which runs no tests of its own for a branch of this repository.
+        # The comment is one per commit, so it gathers what all of them found.
+        continue-on-error: true
         run: |
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$HEAD_SHA" --limit 20 \
-            --json databaseId,event,status \
-            --jq '[.[] | select(.event != "pull_request" and .status == "completed")][0].databaseId // empty')
-          if [ -n "$run_id" ]; then
-            echo "taking the reports of run $run_id"
-            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --pattern 'ss-*' --dir "$RUNNER_TEMP/reports"
-          else
-            echo "::notice::the push run for $HEAD_SHA has not finished; it posts the comment itself when it does"
+          mkdir -p "$RUNNER_TEMP/reports"
+          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$HEAD_SHA" --limit 20 \
+            --json databaseId,status --jq '.[] | select(.status == "completed") | .databaseId')
+          for run_id in $others; do
+            [ "$run_id" = "$GITHUB_RUN_ID" ] && continue
+            echo "adding the reports of run $run_id"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --pattern 'ss-*' --dir "$RUNNER_TEMP/reports/run-$run_id" \
+              || echo "run $run_id has no reports to add"
+          done
+          if [ -z "$(find "$RUNNER_TEMP/reports" -name '*.json' -print -quit)" ]; then
+            echo "::notice::no finished run has results for $HEAD_SHA yet; the run that tests it posts the comment when it finishes"
           fi
       - name: Sticky pull-request comment
         run: |

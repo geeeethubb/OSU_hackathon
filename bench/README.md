@@ -60,6 +60,9 @@ Every number states its cache condition.
   every file is read once. Before and after each series the harness asks the kernel, with
   `mincore` over every input file, how much of the input is resident in the page cache, and prints
   that percentage next to the numbers. A fresh container does not mean a cold cache.
+- Every run's output is kept until it has been diffed against `/reference`. After each run it is
+  written back to disk and released from the page cache (`fsync`, then `POSIX_FADV_DONTNEED`), so
+  that dozens of kept outputs never push the input out of the cache while runs are being timed.
 - **First run**: the first of the three headline runs is the first time the image's binary runs
   in the job. It is reported next to the median of the later runs.
 - **Cold**: one extra run after `sync; echo 3 > /proc/sys/vm/drop_caches`, labelled as such and
@@ -103,6 +106,10 @@ For each seed in the seed list (practice scale, `--events 20000000 --clicks 5000
    check (A is the prior). Reported: median per version, each paired saving (prior − this), the
    median paired saving, how many pairs this commit won, and the A/A variation to read it against.
    If both images hold a byte-identical `/pipeline`, there is nothing to compare and it says so.
+   A **variant** can be compared the same way without building anything: the `variant_env`
+   input, or `[variant=NAME=VALUE]` in the commit message, pairs this commit's image against
+   itself with that extra environment (a runtime switch of the engine, say). Its runs must still
+   exit 0 and match `/reference`, but a failure there is a warning, not a failed commit.
 6. **Stages**: one extra run with `SS_TIMING=1` (also of the prior best).
 7. **Memory**: one extra run as `docker create` + `docker start -a` while a thread samples the
    container's cgroup every 5 ms: `memory.peak` (which counts page cache charged to the
@@ -141,12 +148,16 @@ wall is kept for every sample.
 - **bench-60m** (final scale; `run_60m` input, or `[60m]` in the commit message): `--events
   60000000 --clicks 15000000`, one run with the scorer's flags. Reports the exit code, container
   time against the 180 s cap, peak memory, output and scratch use, disk free, the rules'
-  self-check, stages from one extra run, and the diff against `/reference`. The reference is the
-  correctness tool, not a scored run, so it gets all the memory the runner has (`--memory` of RAM
-  minus 1 GiB, plus the swap); if it still does not finish, the report says that correctness at
-  this scale rests on the self-check alone.
+  self-check, stages from one extra run, and the diff against `/reference`. Then the same paired
+  comparisons as bench-20m, at this scale: the A/A check, and `bench/BEST_SHA` against this
+  commit. They are what makes a 60M time usable, because two jobs rarely get the same machine.
+  The reference is the correctness tool, not a scored run, so it gets all the memory the runner
+  has (`--memory` of RAM minus 1 GiB, plus the swap); if it still does not finish, the report
+  says that correctness at this scale rests on the self-check alone.
 - **report**: one sticky pull-request comment per commit SHA, found again by a hidden marker and
-  updated in place.
+  updated in place. When several runs tested the same commit (its push, then a 60M run started
+  by hand), the comment gathers them: for bench-20m the result with the most paired evidence,
+  for the other jobs the latest, each with a link to its run.
 
 A pull request from a branch of this repository is tested by its push event; the pull_request
 event only syncs the comment. Without a root `Dockerfile` the pipeline steps are skipped and only

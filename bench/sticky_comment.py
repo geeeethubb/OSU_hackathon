@@ -44,28 +44,46 @@ def marker(sha):
     return f"<!-- ss-ci-evidence:{sha} -->"
 
 
-def load_results(reports_dir):
-    results = {}
+def load_results(reports_dir, sha=None):
+    """One result per job. Several runs can have tested the same commit (a push, then a 60M run by
+    hand): for bench-20m the result with the most paired evidence wins, otherwise the latest, so a
+    later, smaller run adds its jobs to the comment without replacing a fuller report."""
+    found = {}
     for path in sorted(Path(reports_dir).rglob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if isinstance(data, dict) and data.get("job"):
-            results[data["job"]] = data
+            found.setdefault(data["job"], []).append(data)
+
+    def weight(item):
+        seeds = item.get("seeds") or [] if item.get("job") == "bench-20m" else []
+        return (sum(1 for seed in seeds if seed.get("ab")), sum(1 for seed in seeds if seed.get("aa")), len(seeds),
+                item.get("utc") or "")
+
+    results = {}
+    for job, items in found.items():
+        same_commit = [item for item in items if item.get("sha") == sha] if sha else []
+        results[job] = max(same_commit or items, key=weight)
     return results
 
 
 def build_body(sha, reports_dir):
     """SHA first, then the compact line, then each job's report without its own first line."""
-    results = load_results(reports_dir)
+    results = load_results(reports_dir, sha)
     names = [name for name in ORDER if name in results] + sorted(name for name in results if name not in ORDER)
     if not names:
         return None, None
     correctness, b20, b60 = results.get("correctness"), results.get("bench-20m"), results.get("bench-60m")
     verdicts = " · ".join(f"{name} {report.verdict(results[name].get('ok'))}" for name in names)
-    run_url = next((results[name].get("run_url") for name in names if results[name].get("run_url")), "")
-    parts = [f"{sha} — CI evidence for this commit — {verdicts}" + (f" — [Actions run]({run_url})" if run_url else "")]
+    urls = []
+    for name in names:
+        url = results[name].get("run_url")
+        if url and url not in urls:
+            urls.append(url)
+    runs = ", ".join(f"[Actions run {url.rsplit('/', 1)[-1]}]({url})" for url in urls)
+    parts = [f"{sha} — CI evidence for this commit — {verdicts}" + (f" — {runs}" if runs else "")]
     other = [results[name].get("sha") for name in names if results[name].get("sha") and results[name].get("sha") != sha]
     if other:
         parts.append(f"**Warning: these results say they belong to `{other[0]}`, not to this commit.**")
