@@ -415,8 +415,9 @@ pub struct Runner {
     place: ScratchI,
     kernel: ScratchC,
     /// Whether the main persons of direct runs go to the session kernel in
-    /// batches. `SS_BATCH=0` does them one at a time instead, for A/B runs:
-    /// the same rows either way.
+    /// batches. `SS_BATCH=0` does them one at a time instead and
+    /// `SS_BATCH=<n>` sets how many persons a batch holds, for A/B runs: the
+    /// same rows either way.
     batched: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
@@ -451,11 +452,15 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(kernel: ScratchC, index_shift: u32) -> Self {
+    pub fn new(mut kernel: ScratchC, index_shift: u32) -> Self {
+        let batch = std::env::var("SS_BATCH").ok().and_then(|value| value.parse::<usize>().ok());
+        if let Some(persons) = batch.filter(|&persons| persons > 0) {
+            kernel.set_batch_persons(persons);
+        }
         Self {
             place: ScratchI::new(index_shift),
             kernel,
-            batched: !std::env::var_os("SS_BATCH").is_some_and(|value| value == "0"),
+            batched: batch != Some(0),
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),

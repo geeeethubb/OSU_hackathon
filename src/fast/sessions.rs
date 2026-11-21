@@ -985,7 +985,15 @@ impl ScratchC {
     /// would finish it first.
     #[inline(always)]
     pub fn batch_is_full(&self) -> bool {
-        self.batch.persons == BATCH_PERSONS || self.batch.sessions + PERSON_SESSIONS > BATCH_SESSIONS
+        self.batch.persons == self.batch.limit || self.batch.sessions + PERSON_SESSIONS > BATCH_SESSIONS
+    }
+
+    /// How many persons a batch holds before it is finished: 1 to
+    /// `BATCH_PERSONS_MOST`, other values are brought into that range. For
+    /// A/B runs; the rows do not depend on it.
+    pub fn set_batch_persons(&mut self, persons: usize) {
+        assert_eq!(self.batch.persons, 0, "a batch of persons was left unfinished");
+        self.batch.limit = persons.clamp(1, BATCH_PERSONS_MOST);
     }
 
     /// What `Person::add` and `Person::purchase` write to: the batch's
@@ -1134,8 +1142,10 @@ impl Sessions {
     }
 }
 
-/// Most persons a batch holds, and most sessions.
+/// Persons a batch holds unless told otherwise, and most sessions.
 const BATCH_PERSONS: usize = 32;
+/// The most persons a batch can be set to hold (`ScratchC::set_batch_persons`).
+const BATCH_PERSONS_MOST: usize = 256;
 const BATCH_SESSIONS: usize = 2048;
 /// Most sessions of one person whose timestamps are in order and at most
 /// `TS_MASK`: every session but the first begins more than `GAP` later.
@@ -1172,6 +1182,8 @@ struct Batch {
     first_session: Vec<u32>,
     click_ends: Vec<u32>,
     persons: usize,
+    /// Persons at which the batch counts as full.
+    limit: usize,
     /// The persons with clicks, and one spare entry.
     clicked: Vec<u32>,
     clicked_count: usize,
@@ -1200,12 +1212,13 @@ impl Batch {
             entries: vec![[0; 2]; BATCH_SESSIONS + 1],
             sessions: 0,
             events: 0,
-            names: vec![0; BATCH_PERSONS],
-            organic: vec![0; BATCH_PERSONS],
-            first_session: vec![0; BATCH_PERSONS + 1],
-            click_ends: vec![0; BATCH_PERSONS + 1],
+            names: vec![0; BATCH_PERSONS_MOST],
+            organic: vec![0; BATCH_PERSONS_MOST],
+            first_session: vec![0; BATCH_PERSONS_MOST + 1],
+            click_ends: vec![0; BATCH_PERSONS_MOST + 1],
             persons: 0,
-            clicked: vec![0; BATCH_PERSONS + 1],
+            limit: BATCH_PERSONS,
+            clicked: vec![0; BATCH_PERSONS_MOST + 1],
             clicked_count: 0,
             clicks: Vec::new(),
             purchases: Vec::new(),
@@ -2429,8 +2442,9 @@ mod tests {
             top_category: Vec::new(),
             campaign_days: vec![[0; 4]; world.campaigns * world.day_count],
         };
-        // Decides where a batch is finished early.
+        // Decides how many persons a batch holds and where one is finished early.
         let mut rng = Rng(partitions.iter().map(|partition| partition.events.len() as u64).sum());
+        scratch.set_batch_persons(rng.pick(&[1, 3, BATCH_PERSONS, BATCH_PERSONS_MOST]));
         for partition in partitions {
             // Per person: its events with their purchase words, and its clicks.
             let mut people: BTreeMap<u32, (Vec<(u32, Option<u64>)>, Vec<[u64; 2]>)> = BTreeMap::new();
@@ -2985,6 +2999,7 @@ mod tests {
             let mut rng = Rng(1000 + seed);
             let tuning = Tuning { lookup_min: rng.pick(&[0, 64, 2048, usize::MAX]), ..Tuning::DEFAULT };
             let (mut batched, mut single) = (ScratchC::with(params(), tuning), ScratchC::with(params(), tuning));
+            batched.set_batch_persons(rng.pick(&[1, 2, 7, BATCH_PERSONS, BATCH_PERSONS_MOST, usize::MAX]));
             let (mut out_batched, mut out_single) = (new_out(), new_out());
             let mut serial = 0;
             for number in 0..rng.range(1, 150) {
