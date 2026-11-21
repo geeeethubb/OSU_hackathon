@@ -941,13 +941,11 @@ impl ScratchC {
             self.finish_batch(out, click_exotic);
         }
         let batch = &mut self.batch;
-        let owner = (batch.persons as u64) << OWNER_SHIFT;
-        batch.start[batch.sessions] = ts;
-        batch.meta[batch.sessions] = owner | batch.events;
+        let word = (batch.persons as u64) << OWNER_SHIFT | batch.events;
+        batch.entries[batch.sessions] = [u64::from(ts), word];
         Person {
             open: batch.sessions,
-            owner,
-            events: batch.events + 1,
+            word: word + 1,
             latest: ts,
             events_before: batch.events,
             purchases_before: batch.purchases.len(),
@@ -991,10 +989,10 @@ impl ScratchC {
     }
 
     /// What `Person::add` and `Person::purchase` write to: the batch's
-    /// session starts, its session words and its purchases.
+    /// sessions and its purchases.
     #[inline(always)]
-    pub fn batch_scratch(&mut self) -> (&mut [u32], &mut [u64], &mut Vec<[u64; 2]>) {
-        (&mut self.batch.start, &mut self.batch.meta, &mut self.batch.purchases)
+    pub fn batch_scratch(&mut self) -> (&mut [[u64; 2]], &mut Vec<[u64; 2]>) {
+        (&mut self.batch.entries, &mut self.batch.purchases)
     }
 
     /// Ends the person `begin_person` started: its name code and its clicks,
@@ -1015,7 +1013,7 @@ impl ScratchC {
         batch.clicked_count += usize::from(has_clicks);
         batch.persons = number + 1;
         batch.sessions = person.open + 1;
-        batch.events = person.events;
+        batch.events = person.word & EVENTS_MASK;
     }
 
     /// Drops the person `begin_person` started, as if it had never begun:
@@ -1159,13 +1157,11 @@ const EVENTS_MASK: u64 = (1 << OWNER_SHIFT) - 1;
 /// rows, purchases, rows to output. Only attribution still goes person by
 /// person, for the persons that have clicks.
 struct Batch {
-    /// The batch's sessions, person after person: start, and
-    /// `person << OWNER_SHIFT | events of the batch before the session`.
-    /// Both have one entry more than `BATCH_SESSIONS`: the next session's
-    /// values are written before it is known to begin, and one more word
-    /// closes the last session.
-    start: Vec<u32>,
-    meta: Vec<u64>,
+    /// The batch's sessions, person after person: `[start, person <<
+    /// OWNER_SHIFT | events of the batch before the session]`. One entry
+    /// more than `BATCH_SESSIONS`: the next session is written before it is
+    /// known to begin, and one more entry closes the last session.
+    entries: Vec<[u64; 2]>,
     sessions: usize,
     events: u64,
     /// Per person: its name code, 1 if it has no clicks (its sessions are
@@ -1201,8 +1197,7 @@ struct Batch {
 impl Batch {
     fn new() -> Self {
         Self {
-            start: vec![0; BATCH_SESSIONS + 1],
-            meta: vec![0; BATCH_SESSIONS + 1],
+            entries: vec![[0; 2]; BATCH_SESSIONS + 1],
             sessions: 0,
             events: 0,
             names: vec![0; BATCH_PERSONS],
@@ -1228,8 +1223,7 @@ impl Batch {
 
     /// Bytes of scratch held.
     fn bytes(&self) -> usize {
-        held(&self.start)
-            + held(&self.meta)
+        held(&self.entries)
             + held(&self.names)
             + held(&self.organic)
             + held(&self.first_session)
@@ -1255,10 +1249,9 @@ impl Batch {
 pub struct Person {
     /// The open session's place in the batch.
     open: usize,
-    /// The person's number in the batch, as it stands in a session word.
-    owner: u64,
-    /// Events of the batch up to the person's latest one.
-    events: u64,
+    /// The word of a session that begins at the next event: the person's
+    /// number in the batch above the batch's events so far.
+    word: u64,
     /// The latest timestamp.
     latest: u32,
     /// The batch's events and purchases before the person.
@@ -1267,29 +1260,28 @@ pub struct Person {
 }
 
 impl Person {
-    /// The person's next event; `start` and `meta` are the first two of
+    /// The person's next event; `sessions` is the first of
     /// `ScratchC::batch_scratch`. `false`, with nothing changed, when it is
     /// earlier than the one before it: the events are not in time order,
     /// and the person has to be aborted and done from all its timestamps.
     /// Timestamps must be at most `TS_MASK`.
     #[inline(always)]
-    pub fn add(&mut self, start: &mut [u32], meta: &mut [u64], ts: u32) -> bool {
+    pub fn add(&mut self, sessions: &mut [[u64; 2]], ts: u32) -> bool {
         if ts < self.latest {
             return false;
         }
-        // The next session's start and word are written before the gap
-        // decides whether a session begins here.
+        // The next session is written before the gap decides whether a
+        // session begins here.
         let cut = ts - self.latest > GAP;
-        start[self.open + 1] = ts;
-        meta[self.open + 1] = self.owner | self.events;
+        sessions[self.open + 1] = [u64::from(ts), self.word];
         self.open += usize::from(cut);
-        self.events += 1;
+        self.word += 1;
         self.latest = ts;
         true
     }
 
     /// The event just given is a purchase: `word` is `price | category << 32`
-    /// and `purchases` the third of `ScratchC::batch_scratch`.
+    /// and `purchases` the second of `ScratchC::batch_scratch`.
     #[inline(always)]
     pub fn purchase(&self, purchases: &mut Vec<[u64; 2]>, word: u64) {
         purchases.push([self.open as u64, word]);
@@ -1298,7 +1290,7 @@ impl Person {
     /// How many events the person has so far.
     #[inline(always)]
     pub fn events(&self) -> u64 {
-        self.events - self.events_before
+        (self.word & EVENTS_MASK) - self.events_before
     }
 }
 
@@ -1312,7 +1304,7 @@ fn finish_batch(
     click_exotic: &[Box<[u8]>],
 ) {
     let (sessions, persons) = (batch.sessions, batch.persons);
-    batch.meta[sessions] = (persons as u64) << OWNER_SHIFT | batch.events;
+    batch.entries[sessions] = [0, (persons as u64) << OWNER_SHIFT | batch.events];
     batch.first_session[persons] = sessions as u32;
 
     // Sessions to rows: one row per person and day with a session start.
@@ -1321,8 +1313,9 @@ fn finish_batch(
     let mut rows = 0;
     let (mut previous_owner, mut previous_day) = (u32::MAX, u32::MAX);
     for session in 0..sessions {
-        let owner = (batch.meta[session] >> OWNER_SHIFT) as u32;
-        let day = (batch.start[session] + params.day_offset) / DAY;
+        let [start, word] = batch.entries[session];
+        let owner = (word >> OWNER_SHIFT) as u32;
+        let day = (start as u32 + params.day_offset) / DAY;
         batch.row_first[rows] = session as u32;
         batch.row_day[rows] = day;
         batch.row_owner[rows] = owner;
@@ -1371,7 +1364,9 @@ fn finish_batch(
         let count = to - from;
         let (first_row, end_row) = (batch.row_of[from] as usize, batch.row_of[to - 1] as usize + 1);
         let person_rows = end_row - first_row;
-        work.start[..count].copy_from_slice(&batch.start[from..to]);
+        for (start, entry) in work.start[..count].iter_mut().zip(&batch.entries[from..to]) {
+            *start = entry[0] as u32;
+        }
         work.start[count..count + LANES].fill(u32::MAX);
         for row in 0..=person_rows {
             work.row_first[row] = batch.row_first[first_row + row] - from as u32;
@@ -1394,7 +1389,7 @@ fn finish_batch(
 
     // Rows to output, a column at a time.
     let row_sessions = |row: usize| batch.row_first[row + 1] - batch.row_first[row];
-    let events_before = |row: usize| batch.meta[batch.row_first[row] as usize] & EVENTS_MASK;
+    let events_before = |row: usize| batch.entries[batch.row_first[row] as usize][1] & EVENTS_MASK;
     out.names.extend((0..rows).map(|row| batch.names[batch.row_owner[row] as usize]));
     out.days.extend((0..rows).map(|row| (params.first_day + i64::from(batch.row_day[row])) as i32));
     out.sessions.extend((0..rows).map(|row| i64::from(row_sessions(row))));
@@ -2492,12 +2487,12 @@ mod tests {
         clicks: &[[u64; 2]],
     ) -> bool {
         let mut person = scratch.begin_person(out, exotic, stream[0].0);
-        let (start, meta, bought) = scratch.batch_scratch();
+        let (sessions, bought) = scratch.batch_scratch();
         if let Some(word) = stream[0].1 {
             person.purchase(bought, word);
         }
         for &(ts, purchase) in &stream[1..] {
-            if !person.add(start, meta, ts) {
+            if !person.add(sessions, ts) {
                 scratch.abort_person(person);
                 return false;
             }

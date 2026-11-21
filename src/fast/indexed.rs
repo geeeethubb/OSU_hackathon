@@ -45,27 +45,57 @@ const COMPLEX: u64 = 1 << 63;
 /// purchase word.
 pub type Record = [u64; 3];
 
+/// Slot word 0, from the bottom: the record's valid bit, its timestamp, the
+/// bit that says its user is a user number, and the tag of the partition
+/// that placed it.
+const VALID: u64 = 1;
+const NUMBERED: u64 = 1 << 32;
+const TAG_SHIFT: u32 = 33;
+const TAG_MAX: u64 = (1 << (64 - TAG_SHIFT)) - 1;
+/// The record's own bits of that word.
+const RECORD_BITS: u64 = (1 << TAG_SHIFT) - 1;
+/// What decides whether a slot holds a valid event of a generated user ID
+/// that the partition at hand placed: its tag and the two flags.
+const EVENT_BITS: u64 = !RECORD_BITS | NUMBERED | VALID;
+
 /// Where a partition's records are placed by index.
 pub struct ScratchI {
-    /// The winning record per index.
+    /// The winning record per index: its two words, with the partition's
+    /// tag where word 0 had the index.
     slots: Vec<[u64; 2]>,
     /// The purchase word of the winning record, for purchases.
     purchases: Vec<u64>,
-    /// One bit per slot: a record was placed there.
-    occupied: Vec<u64>,
+    /// The tag of the partition being read. A slot holds a record of this
+    /// partition exactly when it carries this tag: tags count up from 1, so
+    /// whatever an earlier partition left in a slot is never taken for a
+    /// record, and nothing is cleared between partitions.
+    tag: u64,
 }
 
 impl ScratchI {
-    /// For partitions of `1 << index_shift` indexes (at least 64).
+    /// For partitions of `1 << index_shift` indexes.
     pub fn new(index_shift: u32) -> Self {
         let slots = 1usize << index_shift;
-        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], occupied: vec![0; slots / 64] }
+        Self { slots: vec![[0; 2]; slots], purchases: vec![0; slots], tag: 0 }
+    }
+
+    /// Word 0 of a slot that holds a valid event of a generated user ID of
+    /// the partition being read, apart from its timestamp.
+    #[inline(always)]
+    fn event(&self) -> u64 {
+        self.tag << TAG_SHIFT | NUMBERED | VALID
     }
 }
 
 /// Places a partition's records by index. Returns whether there were any.
 fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
-    scratch.occupied.fill(0);
+    if scratch.tag == TAG_MAX {
+        // Out of tags (2^31 partitions on one thread): start over.
+        scratch.slots.fill([0; 2]);
+        scratch.tag = 0;
+    }
+    scratch.tag += 1;
+    let tag = scratch.tag;
     let mut any = false;
     for list in lists {
         for block in list.blocks() {
@@ -77,13 +107,12 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
                 let purchase = if has_purchase == 1 { block[at + 2] } else { 0 };
                 at += 2 + has_purchase;
                 let slot = (word0 >> 48) as usize & (scratch.slots.len() - 1);
-                let bit = 1u64 << (slot & 63);
+                let held = scratch.slots[slot];
                 // Step 2 of the rules: the copy with the smallest ingest_ts
                 // wins (the first seen among equal ones, which are identical).
-                let first = scratch.occupied[slot >> 6] & bit == 0;
-                if first || ((word1 >> 1) & INGEST_MASK) < ((scratch.slots[slot][1] >> 1) & INGEST_MASK) {
-                    scratch.occupied[slot >> 6] |= bit;
-                    scratch.slots[slot] = [word0, word1];
+                let first = held[0] >> TAG_SHIFT != tag;
+                if first || ((word1 >> 1) & INGEST_MASK) < ((held[1] >> 1) & INGEST_MASK) {
+                    scratch.slots[slot] = [(word0 & RECORD_BITS) | tag << TAG_SHIFT, word1];
                     // Only a purchase writes its word: every reader looks at
                     // `purchases[slot]` only when the slot's winner has the
                     // purchase bit, and that winner wrote it here. What an
@@ -504,6 +533,7 @@ impl Runner {
         let mut main = 0u64;
         let mut person = Person::default();
         let mut alone = Sessions::default();
+        let event = self.place.event();
         let slot_count = self.place.slots.len();
         let mut slot = 0usize;
         while slot < slot_count {
@@ -511,36 +541,37 @@ impl Runner {
                 // The main person's next events, for as long as nothing else
                 // comes: its sessions grow as the slots are read, and its
                 // timestamps are never collected.
-                let place = &self.place;
+                let (slots, bought) = (&self.place.slots[..], &self.place.purchases[..]);
                 // `number >> 6` of this user's IDs with an alias below 64.
                 let user_bits = current << 3;
-                // Timestamp and purchase bit of a slot that is occupied and
-                // holds a valid event of a generated user ID under one of
-                // the main person's aliases.
+                // Timestamp and purchase bit of a slot that holds a valid
+                // event of a generated user ID that this partition placed,
+                // under one of the main person's aliases.
                 let event_at = |slot: usize| {
-                    let [word0, word1] = place.slots[slot];
-                    let occupied = place.occupied[slot >> 6] >> (slot & 63);
+                    let [word0, word1] = slots[slot];
+                    // The timestamp if the slot holds such an event; a value
+                    // above every timestamp if it holds anything else.
+                    let ts = (word0 ^ event).rotate_right(1);
                     let number = word1 >> 22;
-                    let ours = occupied & word0 & (word0 >> 32) & (main >> (number & 63)) & 1;
-                    (ours != 0 && number >> 6 == user_bits).then_some(((word0 >> 1) & TS_MASK, word1 & 1))
+                    let ours = ts <= TS_MASK && number >> 6 == user_bits && (main >> (number & 63)) & 1 != 0;
+                    ours.then_some((ts, word1 & 1))
                 };
                 if BATCHED {
-                    let (start, meta, bought) = self.kernel.batch_scratch();
-                    while slot < slot_count {
-                        let Some((ts, is_purchase)) = event_at(slot) else {
+                    let sessions = self.kernel.batch_scratch().0;
+                    while slot < slots.len() {
+                        // A purchase is taken below, one slot at a time: the
+                        // loop then has nothing to call.
+                        let Some((ts, 0)) = event_at(slot) else {
                             break;
                         };
-                        if !person.add(start, meta, ts as u32) {
+                        if !person.add(sessions, ts as u32) {
                             break;
-                        }
-                        if is_purchase == 1 {
-                            person.purchase(bought, place.purchases[slot]);
                         }
                         slot += 1;
                     }
                 } else {
                     let (start, count) = self.kernel.session_scratch();
-                    while slot < slot_count {
+                    while slot < slots.len() {
                         let Some((ts, is_purchase)) = event_at(slot) else {
                             break;
                         };
@@ -548,7 +579,7 @@ impl Runner {
                             break;
                         }
                         if is_purchase == 1 {
-                            self.purchases.push([ts, place.purchases[slot]]);
+                            self.purchases.push([ts, bought[slot]]);
                         }
                         slot += 1;
                     }
@@ -559,18 +590,16 @@ impl Runner {
             }
             // Everything else, one slot at a time.
             let this = slot;
-            let bits = self.place.occupied[this >> 6] >> (this & 63);
-            if bits & 1 == 0 {
-                // Nothing here: on to the word's next record, or to the next word.
-                slot = if bits == 0 { (this | 63) + 1 } else { this + bits.trailing_zeros() as usize };
-                continue;
-            }
-            slot = this + 1;
+            slot += 1;
             let [word0, word1] = self.place.slots[this];
-            // The winner's own valid bit decides: an invalid winner drops the event.
-            if word0 & 1 == 0 {
+            // Nothing placed here by this partition, or a winner that is not
+            // valid: the winner's own valid bit decides, and an invalid
+            // winner drops the event.
+            if word0 >> TAG_SHIFT != self.place.tag || word0 & VALID == 0 {
                 continue;
             }
+            // The record's own word 0 again.
+            let word0 = word0 & RECORD_BITS;
             let is_purchase = word1 & 1;
             let purchase = if is_purchase == 1 { self.place.purchases[this] } else { 0 };
             if (word0 >> 32) & 1 == 0 {
@@ -629,8 +658,7 @@ impl Runner {
                 main = self.main_mask;
                 true
             } else if BATCHED {
-                let (start, meta, _) = self.kernel.batch_scratch();
-                person.add(start, meta, ts as u32)
+                person.add(self.kernel.batch_scratch().0, ts as u32)
             } else {
                 let (start, count) = self.kernel.session_scratch();
                 alone.add(start, count, ts as u32)
@@ -651,7 +679,7 @@ impl Runner {
             }
             if is_purchase == 1 {
                 if BATCHED {
-                    person.purchase(self.kernel.batch_scratch().2, purchase);
+                    person.purchase(self.kernel.batch_scratch().1, purchase);
                 } else {
                     self.purchases.push([ts, purchase]);
                 }
@@ -714,12 +742,12 @@ impl Runner {
         self.ts.clear();
         self.purchases.clear();
         self.others.clear();
+        let event = self.place.event();
         for slot in from..to {
             let [word0, word1] = self.place.slots[slot];
-            let occupied = (self.place.occupied[slot >> 6] >> (slot & 63)) & 1;
-            if occupied & word0 & (word0 >> 32) & 1 == 1 {
+            if word0 & EVENT_BITS == event {
                 let purchase = if word1 & 1 == 1 { self.place.purchases[slot] } else { 0 };
-                records.push([word0, word1, purchase]);
+                records.push([word0 & RECORD_BITS, word1, purchase]);
             }
         }
     }
@@ -949,41 +977,38 @@ pub fn stats(keys: &Keys, links: &LinkTable, indexed_lists: &[Vec<PartList>], pa
         if !place(&lists, &mut scratch) {
             continue;
         }
-        for word_index in 0..scratch.occupied.len() {
-            let mut bits = scratch.occupied[word_index];
-            while bits != 0 {
-                let slot = word_index * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                occupied += 1;
-                let [word0, word1] = scratch.slots[slot];
-                if word0 & 1 == 0 {
-                    continue;
-                }
-                valid += 1;
-                if (word0 >> 32) & 1 == 0 {
-                    other_user += 1;
-                    continue;
-                }
-                numbered += 1;
-                let user = word1 >> 31;
-                let ts = (word0 >> 1) & TS_MASK;
-                if user != previous_user {
-                    runs += 1;
-                    ts_back_runs += u64::from(run_ts_back);
-                    multi_name_runs += u64::from(names.len() > 1);
-                    run_ts_back = false;
-                    names.clear();
-                    user_back += u64::from(previous_user != u64::MAX && user < previous_user);
-                    previous_user = user;
-                    previous_ts = 0;
-                }
-                run_ts_back |= ts < previous_ts;
-                previous_ts = ts;
-                let (name, complex) = links.lookup(keys.code_of_user_number(word1 >> 22));
-                complex_events += u64::from(complex);
-                if !complex && !names.contains(&name) {
-                    names.push(name);
-                }
+        for &[word0, word1] in &scratch.slots {
+            if word0 >> TAG_SHIFT != scratch.tag {
+                continue;
+            }
+            occupied += 1;
+            if word0 & 1 == 0 {
+                continue;
+            }
+            valid += 1;
+            if (word0 >> 32) & 1 == 0 {
+                other_user += 1;
+                continue;
+            }
+            numbered += 1;
+            let user = word1 >> 31;
+            let ts = (word0 >> 1) & TS_MASK;
+            if user != previous_user {
+                runs += 1;
+                ts_back_runs += u64::from(run_ts_back);
+                multi_name_runs += u64::from(names.len() > 1);
+                run_ts_back = false;
+                names.clear();
+                user_back += u64::from(previous_user != u64::MAX && user < previous_user);
+                previous_user = user;
+                previous_ts = 0;
+            }
+            run_ts_back |= ts < previous_ts;
+            previous_ts = ts;
+            let (name, complex) = links.lookup(keys.code_of_user_number(word1 >> 22));
+            complex_events += u64::from(complex);
+            if !complex && !names.contains(&name) {
+                names.push(name);
             }
         }
     }
