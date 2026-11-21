@@ -421,25 +421,9 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     });
     timing.stage("sessions");
 
-    // Output: one user_daily file per worker, one campaign_daily file.
+    // Output: one user_daily file per thread, one campaign_daily file.
     let c_out = c_out.into_inner();
-    fs::create_dir_all(output.join("user_daily"))?;
-    fs::create_dir_all(output.join("campaign_daily"))?;
-    let failure: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
-    parallel(threads, |thread| {
-        let rows = &c_out[thread];
-        // Worker 0 always writes, so the folder holds a table even with no rows.
-        if rows.names.is_empty() && thread != 0 {
-            return;
-        }
-        if let Err(error) = write_user_daily(&ctx, output, thread, rows, &user_exotic) {
-            failure.lock().unwrap().get_or_insert(error);
-        }
-    });
-    if let Some(error) = failure.into_inner().unwrap() {
-        return Err(error);
-    }
-    write_campaign_daily(&ctx, output, &c_out)?;
+    write_tables(&ctx, output, threads, &c_out, &user_exotic)?;
     timing.stage("output");
     timing.total();
     Ok(true)
@@ -448,7 +432,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
 /// Rows per row group of the output files: small enough that a row group is
 /// encoded in a buffer that stays in the cache, large enough that page
 /// headers and the footer stay negligible.
-const GROUP_ROWS: usize = 1 << 14;
+const GROUP_ROWS: usize = parquet::MAX_GROUP_ROWS;
 
 /// Two characters for every pair of base-37 digits, first digit in the low
 /// byte; digit 0 ("no character") is a zero byte.
@@ -500,62 +484,114 @@ fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a [B
     Text::Short(1 + count)
 }
 
-fn write_user_daily(
+/// Writes both tables. The threads share one list of work: the campaign
+/// table, then every worker's user_daily rows in row-group-sized pieces. A
+/// thread adds the pieces it takes to its own file, so the files come out
+/// about equally large and all threads finish together, whatever the split
+/// of rows between the workers of pass C was.
+fn write_tables(
     ctx: &Ctx,
     output: &Path,
-    thread: usize,
-    rows: &PassCOut,
+    threads: usize,
+    workers: &[PassCOut],
     user_exotic: &[Box<[u8]>],
 ) -> std::io::Result<()> {
-    let path = output.join("user_daily").join(format!("part-{thread:03}.parquet"));
-    // The counts and sums are INT32 unless one of them does not fit.
-    if !user_daily_file(ctx, &path, rows, user_exotic, ColumnType::Int32)? {
-        user_daily_file(ctx, &path, rows, user_exotic, ColumnType::Int64)?;
+    fs::create_dir_all(output.join("user_daily"))?;
+    fs::create_dir_all(output.join("campaign_daily"))?;
+    let mut pieces: Vec<(&PassCOut, usize, usize)> = Vec::new();
+    for worker in workers {
+        let mut start = 0;
+        while start < worker.names.len() {
+            let end = (start + GROUP_ROWS).min(worker.names.len());
+            pieces.push((worker, start, end));
+            start = end;
+        }
+    }
+    // Task 0 is the campaign table, task `n + 1` is piece `n`.
+    let write = |integer: ColumnType, first_task: usize| -> std::io::Result<bool> {
+        let fields = [
+            ("user_id", ColumnType::Str),
+            ("day", ColumnType::Date),
+            ("sessions", integer),
+            ("events", integer),
+            ("revenue_cents", integer),
+            ("top_category", ColumnType::OptStr),
+        ];
+        let next = AtomicUsize::new(first_task);
+        let too_narrow = AtomicBool::new(false);
+        let failure: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
+        parallel(threads, |thread| {
+            let work = || -> std::io::Result<()> {
+                let path = output.join("user_daily").join(format!("part-{thread:03}.parquet"));
+                // Thread 0 always writes a file, so the folder holds a table
+                // even with no rows; so does every thread of a second
+                // attempt, to replace what the first one left behind.
+                let mut writer = None;
+                if thread == 0 || integer == ColumnType::Int64 {
+                    writer = Some(GroupWriter::create(&path, &fields)?);
+                }
+                while !too_narrow.load(Ordering::Relaxed) {
+                    let task = next.fetch_add(1, Ordering::Relaxed);
+                    if task == 0 {
+                        write_campaign_daily(ctx, output, workers)?;
+                        continue;
+                    }
+                    let Some(&(rows, start, end)) = pieces.get(task - 1) else {
+                        break;
+                    };
+                    let writer = match &mut writer {
+                        Some(writer) => writer,
+                        None => writer.insert(GroupWriter::create(&path, &fields)?),
+                    };
+                    if !write_user_daily(ctx, writer, rows, start, end, user_exotic)? {
+                        too_narrow.store(true, Ordering::Relaxed);
+                    }
+                }
+                match writer {
+                    Some(writer) if !too_narrow.load(Ordering::Relaxed) => writer.finish(),
+                    _ => Ok(()),
+                }
+            };
+            if let Err(error) = work() {
+                failure.lock().unwrap().get_or_insert(error);
+            }
+        });
+        match failure.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(!too_narrow.load(Ordering::Relaxed)),
+        }
+    };
+    // The counts and sums are INT32 unless one of them does not fit; then
+    // every user_daily file is written again with INT64 columns.
+    if !write(ColumnType::Int32, 0)? {
+        write(ColumnType::Int64, 1)?;
     }
     Ok(())
 }
 
-/// Writes one user_daily file with integer columns of the given type.
-/// `Ok(false)`: a value does not fit INT32, write the file again with INT64.
-fn user_daily_file(
+/// Adds the user_daily rows `start..end` of one worker to a file as one row
+/// group. `Ok(false)`: the file has INT32 columns and a value does not fit.
+fn write_user_daily(
     ctx: &Ctx,
-    path: &Path,
+    writer: &mut GroupWriter,
     rows: &PassCOut,
+    start: usize,
+    end: usize,
     user_exotic: &[Box<[u8]>],
-    integer: ColumnType,
 ) -> std::io::Result<bool> {
-    let fields = [
-        ("user_id", ColumnType::Str),
-        ("day", ColumnType::Date),
-        ("sessions", integer),
-        ("events", integer),
-        ("revenue_cents", integer),
-        ("top_category", ColumnType::OptStr),
-    ];
-    let mut writer = GroupWriter::create(path, &fields)?;
-    let count = rows.names.len();
-    let group_rows = std::env::var("SS_OUT_ROWS").ok().and_then(|value| value.parse().ok()).unwrap_or(GROUP_ROWS);
-    let mut start = 0;
-    while start < count {
-        let end = (start + group_rows).min(count);
-        let names = &rows.names[start..end];
-        let days = &rows.days[start..end];
-        let sessions = &rows.sessions[start..end];
-        let events = &rows.events[start..end];
-        let revenue = &rows.revenue[start..end];
-        let top_category = &rows.top_category[start..end];
-        // Days with purchases go last in their row group: the other rows then
-        // share one run of zero revenue and one run of null categories.
-        writer.begin(top_category, |&category| category != NO_CATEGORY)?;
-        writer.runs(names, |code, slot| user_name(code, slot, user_exotic))?;
-        writer.dates(days)?;
-        if !writer.ints(sessions)? || !writer.ints(events)? || !writer.sparse_ints(revenue)? {
-            return Ok(false);
-        }
-        writer.strings(&ctx.category_names, top_category, NO_CATEGORY)?;
-        start = end;
+    let top_category = &rows.top_category[start..end];
+    // Days with purchases go last in their row group: the other rows then
+    // share one run of zero revenue and one run of null categories.
+    writer.begin(top_category, |&category| category != NO_CATEGORY)?;
+    writer.runs(&rows.names[start..end], |code, slot| user_name(code, slot, user_exotic))?;
+    writer.dates(&rows.days[start..end])?;
+    if !writer.ints(&rows.sessions[start..end])?
+        || !writer.ints(&rows.events[start..end])?
+        || !writer.sparse_ints(&rows.revenue[start..end])?
+    {
+        return Ok(false);
     }
-    writer.finish()?;
+    writer.strings(&ctx.category_names, top_category, NO_CATEGORY)?;
     Ok(true)
 }
 
@@ -570,33 +606,33 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
         }
     }
     // The rows, in (campaign, day) order, and every channel once.
-    let mut campaign: Vec<u64> = Vec::new();
-    let mut channel: Vec<u32> = Vec::new();
-    let mut day: Vec<i32> = Vec::new();
-    let mut columns: [Vec<i64>; 4] = Default::default();
+    let mut campaign: Vec<u64> = Vec::with_capacity(cells);
+    let mut channel: Vec<u32> = Vec::with_capacity(cells);
+    let mut day: Vec<i32> = Vec::with_capacity(cells);
+    let mut columns: [Vec<i64>; 4] = std::array::from_fn(|_| Vec::with_capacity(cells));
     let mut channels: Vec<&[u8]> = Vec::new();
     let mut channel_index: FastMap<&[u8], u32> = HashMap::default();
-    let mut current = (usize::MAX, 0u32);
-    for (at, total) in totals.iter().enumerate() {
-        // A row exists when at least one session was credited to or assisted by the campaign.
-        if total[0] == 0 && total[3] == 0 {
-            continue;
-        }
-        let id = at / ctx.day_count;
-        if current.0 != id {
-            let name = &ctx.campaign_channels[id][..];
-            let next = channels.len() as u32;
-            let index = *channel_index.entry(name).or_insert_with(|| {
-                channels.push(name);
-                next
+    for (id, days) in totals.chunks_exact(ctx.day_count.max(1)).enumerate() {
+        let mut channel_of_campaign = None;
+        for (offset, total) in days.iter().enumerate() {
+            // A row exists when at least one session was credited to or assisted by the campaign.
+            if total[0] == 0 && total[3] == 0 {
+                continue;
+            }
+            let index = *channel_of_campaign.get_or_insert_with(|| {
+                let name = &ctx.campaign_channels[id][..];
+                let next = channels.len() as u32;
+                *channel_index.entry(name).or_insert_with(|| {
+                    channels.push(name);
+                    next
+                })
             });
-            current = (id, index);
-        }
-        campaign.push(id as u64);
-        channel.push(current.1);
-        day.push((ctx.first_day + (at % ctx.day_count) as i64) as i32);
-        for (column, value) in columns.iter_mut().zip(total) {
-            column.push(*value);
+            campaign.push(id as u64);
+            channel.push(index);
+            day.push((ctx.first_day + offset as i64) as i32);
+            for (column, value) in columns.iter_mut().zip(total) {
+                column.push(*value);
+            }
         }
     }
     let path = output.join("campaign_daily").join("part-000.parquet");
