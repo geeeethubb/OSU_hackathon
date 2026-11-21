@@ -1510,7 +1510,8 @@ macro_rules! lean_ids {
             "vpsubq xmm1, xmm1, xmmword ptr [rsi + rax + {id_ranges}]\n",
             "vpsubq xmm2, xmm1, xmmword ptr [rsi + rax + {id_ranges} + 16]\n",
             "vpcmpgtq xmm2, xmm2, xmmword ptr [rsi + rax + {id_ranges} + 32]\n",
-            "vptest xmm2, xmm2\n",
+            "vmovmskpd eax, xmm2\n",
+            "test eax, eax\n",
             "jnz 2f\n",
             "vmovq r9, xmm1\n",
             "vpextrq r10, xmm1, 1\n",
@@ -1834,15 +1835,22 @@ macro_rules! lean_store {
     };
 }
 
+/// No store: the timing variant that only reads.
+macro_rules! lean_no_store {
+    () => {
+        ""
+    };
+}
+
 /// Row after row from rdi until the frame's `last`, each `view` and `cart`
-/// stored. r15 at the end: 0 when the next row (rdi) is at or past `last`;
+/// stored (by the piece `$store`). r15 at the end: 0 when the next row (rdi) is at or past `last`;
 /// 1 for a row (rdi) the kernel declines; 2 for a purchase and 3 for a row
 /// whose list needs a new block: what was read of it is in the frame, and
 /// the caller stores it and comes back for the row at `next`. Where the
 /// next row starts is in rbx while a row is read; rbx is the compiler's, so
 /// it is saved in the frame and put back at the end.
 macro_rules! lean_run {
-    () => {
+    ($store:ident) => {
         concat!(
             "mov qword ptr [rdx + {saved}], rbx\n",
             "9:\n",
@@ -1853,7 +1861,7 @@ macro_rules! lean_run {
             lean_type!(),
             lean_tail!("cmp r15, rbx\n", "", "", ""),
             "jnz 2f\n",
-            lean_store!(),
+            $store!(),
             "mov rdi, rbx\n",
             "cmp rdi, qword ptr [rdx + {last}]\n",
             "jb 9b\n",
@@ -2132,6 +2140,7 @@ pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut 
 ///      `event_lean_purchase` ends it) or a row whose list needs a new
 ///      block (3, `event_lean_common` stores it). `frame.read(status)` is
 ///      what was read, and the next row is at `frame.next`.
+/// Without `STORE` (timing only) nothing is stored and 3 does not happen.
 ///
 /// # Safety
 /// `LeanFrame::stores(ctx)` holds for the `ctx` of `lean` and `frame`; `p`
@@ -2141,7 +2150,7 @@ pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut 
 /// every other use of the `ParseOut`), or, after `LeanFrame::one_list`, one
 /// writer's worth of words: a cursor and the end of its block.
 #[inline(always)]
-pub unsafe fn event_lean_run(
+pub unsafe fn event_lean_run<const STORE: bool>(
     lean: *const LeanTables,
     p: *const u8,
     last: *const u8,
@@ -2152,22 +2161,38 @@ pub unsafe fn event_lean_run(
     (*frame).writers = writers;
     let status: u64;
     let at: *const u8;
-    lean_asm!(
-        [lean_run!(),]
-        inout("rdi") p => at,
-        in("rsi") lean,
-        in("rdx") frame,
-        lateout("r15") status,
-        out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-        out("r12") _, out("r13") _, out("r14") _,
-        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
-        last = const std::mem::offset_of!(LeanFrame, last),
-        writers = const std::mem::offset_of!(LeanFrame, writers),
-        part_mask = const std::mem::offset_of!(LeanFrame, part_mask),
-        low_mask = const std::mem::offset_of!(LeanFrame, low_mask),
-        read = const std::mem::offset_of!(LeanFrame, handed),
-        saved = const std::mem::offset_of!(LeanFrame, saved),
-    );
+    if STORE {
+        lean_asm!(
+            [lean_run!(lean_store),]
+            inout("rdi") p => at,
+            in("rsi") lean,
+            in("rdx") frame,
+            lateout("r15") status,
+            out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+            last = const std::mem::offset_of!(LeanFrame, last),
+            writers = const std::mem::offset_of!(LeanFrame, writers),
+            part_mask = const std::mem::offset_of!(LeanFrame, part_mask),
+            low_mask = const std::mem::offset_of!(LeanFrame, low_mask),
+            read = const std::mem::offset_of!(LeanFrame, handed),
+            saved = const std::mem::offset_of!(LeanFrame, saved),
+        );
+    } else {
+        lean_asm!(
+            [lean_run!(lean_no_store),]
+            inout("rdi") p => at,
+            in("rsi") lean,
+            in("rdx") frame,
+            lateout("r15") status,
+            out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+            last = const std::mem::offset_of!(LeanFrame, last),
+            read = const std::mem::offset_of!(LeanFrame, handed),
+            saved = const std::mem::offset_of!(LeanFrame, saved),
+        );
+    }
     (status, at)
 }
 

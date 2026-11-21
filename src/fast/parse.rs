@@ -432,6 +432,8 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
             events_lean_loop::<2, INDEXED>(ctx, buffer, position, end, out)
         }
+        // Timing only: the loop in assembly without its store.
+        _ if run && ctx.diag == 7 => events_assembly_run::<7>(ctx, buffer, position, end, out),
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 7 && assembly => {
             events_assembly_loop::<7>(ctx, buffer, position, end, out)
         }
@@ -439,8 +441,8 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
             events_lean_loop::<7, INDEXED>(ctx, buffer, position, end, out)
         }
         // Timing only: the store into one block (elsewhere SS_DIAG=8 stores as usual).
-        _ if run && ctx.diag == 8 => events_assembly_run::<true>(ctx, buffer, position, end, out),
-        _ if run => events_assembly_run::<false>(ctx, buffer, position, end, out),
+        _ if run && ctx.diag == 8 => events_assembly_run::<8>(ctx, buffer, position, end, out),
+        _ if run => events_assembly_run::<0>(ctx, buffer, position, end, out),
         _ if assembly => events_assembly_loop::<MODE>(ctx, buffer, position, end, out),
         _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
@@ -448,16 +450,17 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
 
 /// The lean kernel in assembly (index mode) when rows are stored: the loop
 /// over the rows and the store are in the assembly too, which comes back
-/// here only for a row that needs something else.
+/// here only for a row that needs something else. That is `KIND` 0.
 ///
-/// `DUMMY` is for timing only (`SS_DIAG=8`): the same loop and the same
-/// store, but every record goes into one block that is written over and
-/// over, and what comes back here is read and dropped. Against `SS_DIAG=7`
-/// (the kernel without any store) and `SS_DIAG=1` (the real lists) it tells
-/// what the store's instructions cost and what its lists cost.
+/// The other two kinds are for timing only and keep nothing. `KIND` 8
+/// (`SS_DIAG=8`): the same loop and the same store, but every record goes
+/// into one block that is written over and over. `KIND` 7 (`SS_DIAG=7`):
+/// the same loop without the store's instructions. With `SS_DIAG=1` (the
+/// real lists, then stop) the three tell what the kernel costs, what the
+/// store's instructions add, and what the lists add.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn events_assembly_run<const DUMMY: bool>(
+fn events_assembly_run<const KIND: u32>(
     ctx: &Ctx,
     buffer: &[u8],
     mut position: usize,
@@ -470,10 +473,10 @@ fn events_assembly_run<const DUMMY: bool>(
     let mut row = EventRow::default();
     // The assembly reads up to 16 bytes before a row.
     while position < stop.min(16) {
-        position = if DUMMY {
-            event_row_plain::<7, true>(ctx, buffer, position, out, &mut row)
-        } else {
+        position = if KIND == 0 {
             event_row_plain::<MODE_STORE, true>(ctx, buffer, position, out, &mut row)
+        } else {
+            event_row_plain::<7, true>(ctx, buffer, position, out, &mut row)
         };
     }
     if position < stop {
@@ -483,7 +486,7 @@ fn events_assembly_run<const DUMMY: bool>(
         let mut block = [0u64; 512];
         let block_start = block.as_mut_ptr();
         let mut one_writer = [block_start, block_start.wrapping_add(block.len()), block_start, block_start];
-        if DUMMY {
+        if KIND == 8 {
             frame.one_list();
         }
         let frame = &mut frame as *mut LeanFrame;
@@ -495,20 +498,25 @@ fn events_assembly_run<const DUMMY: bool>(
         let mut p = unsafe { base.add(position) };
         let last = unsafe { base.add(stop) };
         while p < last {
-            let writers = if DUMMY { one_writer.as_mut_ptr().cast() } else { out.indexed.as_mut_ptr() };
-            let (status, at) = unsafe { event_lean_run(lean, p, last, frame, writers) };
+            let (status, at) = unsafe {
+                match KIND {
+                    0 => event_lean_run::<true>(lean, p, last, frame, out.indexed.as_mut_ptr()),
+                    8 => event_lean_run::<true>(lean, p, last, frame, one_writer.as_mut_ptr().cast()),
+                    _ => event_lean_run::<false>(lean, p, last, frame, std::ptr::null_mut()),
+                }
+            };
             p = match status {
                 0 => at,
-                3 if DUMMY => {
-                    // The block is full: from its start again; the row is dropped.
-                    one_writer[0] = block_start;
-                    unsafe { (*frame).next }
-                }
-                3 => unsafe {
+                3 if KIND == 0 => unsafe {
                     // The row's list needs a new block: `emit_indexed` gets it one.
                     event_lean_common::<MODE_STORE>((*frame).read(status), out, &mut row);
                     (*frame).next
                 },
+                3 => {
+                    // The one block is full: from its start again; the row is dropped.
+                    one_writer[0] = block_start;
+                    unsafe { (*frame).next }
+                }
                 _ => unsafe {
                     // A purchase (what was read of it is in the frame) or a declined row.
                     let position = at.offset_from(base) as usize;
@@ -516,12 +524,12 @@ fn events_assembly_run<const DUMMY: bool>(
                     let (ts, ingest, index, user, keep) =
                         (read.ts, read.ingest_seconds, read.index, read.user_number, read.keep);
                     let frame = frame as *const LeanFrame;
-                    let next = if DUMMY {
-                        event_row_rare::<7>(ctx, frame, buffer, position, out, &mut row, status, ts, ingest, index, user, keep)
-                    } else {
+                    let next = if KIND == 0 {
                         event_row_rare::<MODE_STORE>(
                             ctx, frame, buffer, position, out, &mut row, status, ts, ingest, index, user, keep,
                         )
+                    } else {
+                        event_row_rare::<7>(ctx, frame, buffer, position, out, &mut row, status, ts, ingest, index, user, keep)
                     };
                     base.add(next)
                 },
@@ -530,7 +538,7 @@ fn events_assembly_run<const DUMMY: bool>(
         position = unsafe { p.offset_from(base) } as usize;
         std::hint::black_box(&block);
     }
-    // The timing variant folds what it reads into `row.event`; keep it alive.
+    // The timing variants fold what they read into `row.event`; keep it alive.
     std::hint::black_box(row.event);
     position
 }
