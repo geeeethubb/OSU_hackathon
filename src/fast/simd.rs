@@ -1488,15 +1488,14 @@ macro_rules! lean_ids {
             // a byte's high half (xmm1): the kind it may be (table in xmm13)
             // and what makes its value of it (xmm15); by its low half, which
             // a byte over 127 has none of: the kinds it may be (xmm14).
+            // xmm3 collects what is wrong with the IDs (all ones in a byte
+            // that is no character); the timestamps' step tests it.
             "vpsrlw xmm1, xmm0, 4\n",
             "vpand xmm1, xmm1, xmm9\n",
             "vpshufb xmm2, xmm13, xmm1\n",
             "vpshufb xmm3, xmm14, xmm0\n",
-            "vpand xmm2, xmm2, xmm3\n",
-            "vpcmpeqb xmm2, xmm2, xmmword ptr [rsi + {zeros}]\n",
-            "vpmovmskb eax, xmm2\n",
-            "test eax, eax\n",
-            "jnz 2f\n",
+            "vpand xmm3, xmm3, xmm2\n",
+            "vpcmpeqb xmm3, xmm3, xmmword ptr [rsi + {zeros}]\n",
             "vpshufb xmm1, xmm15, xmm1\n",
             "vpaddb xmm1, xmm1, xmm0\n",
             // The two numbers the bytes spell.
@@ -1512,9 +1511,7 @@ macro_rules! lean_ids {
             "vpsubq xmm1, xmm1, xmmword ptr [rsi + rax + {id_ranges}]\n",
             "vpsubq xmm2, xmm1, xmmword ptr [rsi + rax + {id_ranges} + 16]\n",
             "vpcmpgtq xmm2, xmm2, xmmword ptr [rsi + rax + {id_ranges} + 32]\n",
-            "vmovmskpd eax, xmm2\n",
-            "test eax, eax\n",
-            "jnz 2f\n",
+            "vpor xmm3, xmm3, xmm2\n",
             "vmovq r9, xmm1\n",
             "vpextrq r10, xmm1, 1\n",
             // `unscramble` with the number in the top 40 bits, where the
@@ -1548,20 +1545,20 @@ macro_rules! lean_ids {
 
 /// Both timestamps through the vector units, with the constants at r14: the
 /// sums of ts in xmm0, the first of them in rax too, those of ingest_ts in
-/// xmm4.
+/// xmm4. Declines the row if a byte is over its limit, a number over its
+/// ceiling, or the IDs left something in ymm3.
 macro_rules! lean_times {
     () => {
         concat!(
             "vpxor ymm0, ymm0, ymmword ptr [r14 + {f_pattern}]\n",
-            "vpminub ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
-            "vpcmpeqb ymm1, ymm1, ymm0\n",
+            "vpsubusb ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
             "vpshufb ymm0, ymm0, ymmword ptr [r14 + {f_shuffle}]\n",
             "vpmaddubsw ymm0, ymm0, ymm8\n",
             "vpcmpgtw ymm2, ymm0, ymmword ptr [r14 + {f_ceilings}]\n",
-            "vpandn ymm1, ymm2, ymm1\n",
-            "vpmovmskb eax, ymm1\n",
-            "cmp eax, -1\n",
-            "jne 2f\n",
+            "vpor ymm1, ymm1, ymm2\n",
+            "vpor ymm1, ymm1, ymm3\n",
+            "vptest ymm1, ymm1\n",
+            "jnz 2f\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_first}]\n",
             "vpackusdw ymm0, ymm0, ymm0\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_second}]\n",
