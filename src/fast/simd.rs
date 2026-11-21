@@ -14,6 +14,7 @@ use std::arch::x86_64::*;
 use std::hint::select_unpredictable;
 
 use super::codes::id_code;
+use super::arena::PartWriter;
 use super::keys::{pre, unscramble, MASK as NUMBER_MASK};
 use super::parse::{emit_code_click, emit_indexed, emit_number_click, emit_raw, ClickRecord, EventRow, ParseOut};
 use super::Ctx;
@@ -716,13 +717,15 @@ pub struct LeanTables {
     late_limit: u64,
     /// Ten times the first byte of a pair plus the second.
     tens: [u8; 32],
-    /// Added to a byte: its distance from `0`, from `a`; and its base-36
-    /// value if it is a letter.
-    id_digit: [u8; 16],
-    nine: [u8; 16],
-    id_letter: [u8; 16],
-    twenty_five: [u8; 16],
-    id36_letter_value: [u8; 16],
+    /// The characters of an ID, classed by their two halves. By a byte's
+    /// high four bits: the one kind of character it may then be (1 a digit,
+    /// 2 a letter up to `o`, 4 a letter from `p`), and what to add to it for
+    /// its base-36 value. By its low four bits: the kinds it may be.
+    low_nibbles: [u8; 16],
+    id_kind_high: [u8; 16],
+    id_kind_low: [u8; 16],
+    id_value: [u8; 16],
+    zeros: [u8; 16],
     /// Base 36, most significant character first: pairs, fours, eights.
     id36_pairs: [u8; 16],
     id36_fours: [u32; 4],
@@ -755,7 +758,8 @@ const NONE: i16 = i16::MAX;
 // F1, bytes 4..20: `-MM-DDTHH:MM:SSZ`. The numbers come out as hour,
 // minute, second, nothing, month, day, nothing, nothing; the first weights
 // make minutes of the day, the second, `month * 32 + day` and nothing of
-// them, the second weights the second of the day and the same again.
+// them, the second weights the second of the day, the same `month * 32 +
+// day`, and nothing twice.
 const PLAIN_PATTERN: [u8; 16] = *b"-00-00T00:00:00Z";
 const PLAIN_LIMIT: [u8; 16] = [0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0];
 const PLAIN_SHUFFLE: [u8; 16] = [7, 8, 10, 11, 13, 14, SKIP, SKIP, 1, 2, 4, 5, SKIP, SKIP, SKIP, SKIP];
@@ -764,12 +768,13 @@ const PLAIN_FIRST: [i16; 8] = [60, 1, 1, 0, 32, 1, 0, 0];
 const PLAIN_SECOND: [i16; 8] = [60, 1, 1, 0, 0, 0, 0, 0];
 // Thirteen digits, in the sixteen bytes that end with them: the first digit
 // alone, nothing, then six pairs; four numbers of up to four digits; the
-// first five digits as one number and the last eight as another.
+// first five digits as one number, nothing where F1 has its day, nothing,
+// and the last eight digits as another number.
 const DIGITS_PATTERN: [u8; 16] = [0, 0, 0, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30];
 const DIGITS_LIMIT: [u8; 16] = [FREE, FREE, FREE, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
 const DIGITS_SHUFFLE: [u8; 16] = [SKIP, 3, SKIP, SKIP, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const DIGITS_FIRST: [i16; 8] = [1, 0, 100, 1, 100, 1, 100, 1];
-const DIGITS_SECOND: [i16; 8] = [10_000, 1, 10_000, 1, 0, 0, 0, 0];
+const DIGITS_SECOND: [i16; 8] = [10_000, 1, 0, 0, 0, 0, 10_000, 1];
 
 /// The constants of one form of ts, for the kernel in assembly: what the
 /// sixteen bytes it takes of a timestamp are XORed with, the largest value
@@ -777,9 +782,11 @@ const DIGITS_SECOND: [i16; 8] = [10_000, 1, 10_000, 1, 0, 0, 0, 0];
 /// and the weights that add the numbers up in two steps. The low half of
 /// each is for ts in this form, the high half for ingest_ts, which is always
 /// F1. Then, for ts alone, what makes milliseconds since the window's start
-/// of the two sums `low` and `high`, with the form's day table (the real
-/// one, or a single entry of zeros):
-/// `(day[high & index_mask].seconds + low) * scale + (high & high_mask) - start`,
+/// of the sums, which are four numbers `low`, `day`, nothing and `high`
+/// (F1: the second of the day, `month * 32 + day`, and no `high`; 13
+/// digits: the first five digits, no `day`, the last eight digits), with
+/// the form's day table (the real one, or a single entry of zeros):
+/// `(table[day].seconds + low) * scale + high - start`,
 /// and which bits of that day's year text ts must start with.
 #[repr(C, align(64))]
 struct TimeForm {
@@ -789,9 +796,7 @@ struct TimeForm {
     ceilings: [i16; 16],
     first: [i16; 16],
     second: [i16; 16],
-    index_mask: u32,
-    year_mask: u32,
-    high_mask: u64,
+    year_mask: u64,
     scale: i64,
     start: i64,
 }
@@ -828,9 +833,7 @@ impl TimeForm {
             ceilings: words(ceilings, PLAIN_CEILINGS),
             first: words(first, PLAIN_FIRST),
             second: words(second, PLAIN_SECOND),
-            index_mask: if of_day { 511 } else { 0 },
-            year_mask: if of_day { u32::MAX } else { 0 },
-            high_mask: if of_day { 0 } else { u64::MAX },
+            year_mask: if of_day { u64::from(u32::MAX) } else { 0 },
             scale,
             start,
         }
@@ -926,11 +929,12 @@ impl LeanTables {
             late_bias: base_ms - window_start + (1 << 62),
             late_limit: LATE_MS as u64 + (1 << 62) + 1,
             tens,
-            id_digit: [0u8.wrapping_sub(b'0'); 16],
-            nine: [9; 16],
-            id_letter: [0u8.wrapping_sub(b'a'); 16],
-            twenty_five: [25; 16],
-            id36_letter_value: [10u8.wrapping_sub(b'a'); 16],
+            low_nibbles: [15; 16],
+            // `0`..`9` are 0x30..0x39, `a`..`o` 0x61..0x6F, `p`..`z` 0x70..0x7A.
+            id_kind_high: [0, 0, 0, 1, 0, 0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0],
+            id_kind_low: [1 | 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 2 | 4, 2, 2, 2, 2, 2],
+            id_value: [0, 0, 0, 0u8.wrapping_sub(b'0'), 0, 0, 10u8.wrapping_sub(b'a'), 10u8.wrapping_sub(b'a'), 0, 0, 0, 0, 0, 0, 0, 0],
+            zeros: [0; 16],
             id36_pairs: [36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1, 36, 1],
             id36_fours: [0x0001_0510; 4],
             id36_eights: [1_679_616; 2],
@@ -1377,7 +1381,10 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
 // two against each other on every line they have.
 //
 // Registers: rdi the row, rsi the tables, rdx the frame; rax and r15 are
-// scratch throughout. After `lean_head`: r9 and r10 where the texts of the
+// scratch throughout. The vector constants every row uses are in ymm5 to
+// ymm15 from before the first row on (`lean_asm!` loads them): comma, quote
+// and newline bytes, the tens, the low half-byte mask, the three base-36
+// weights, and the three tables that class an ID's characters. After `lean_head`: r9 and r10 where the texts of the
 // IDs start, rcx and r14 where they end, r12 where ts starts and r8 where
 // it ends (all as offsets), r13 ingest_ts and r11 the comma after it (as
 // addresses). After `lean_ids`: r9 the event index and r10 the user number,
@@ -1388,32 +1395,31 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
 // ---------------------------------------------------------------------------
 
 /// Masks, the early look for the newline, where the first four fields are.
+/// `$next` puts where the next row then starts (`rdi + rax + 65`) in its place.
 macro_rules! lean_head {
-    () => {
+    ($next:literal) => {
         concat!(
             // Masks of the commas (r8) and quotes (r9) of bytes 0..64.
             "vmovdqu ymm0, ymmword ptr [rdi]\n",
             "vmovdqu ymm1, ymmword ptr [rdi + 32]\n",
-            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {comma}]\n",
-            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {comma}]\n",
+            "vpcmpeqb ymm2, ymm0, ymm5\n",
+            "vpcmpeqb ymm3, ymm1, ymm5\n",
             "vpmovmskb eax, ymm2\n",
             "vpmovmskb r8d, ymm3\n",
             "shl r8, 32\n",
             "or r8, rax\n",
-            "vpcmpeqb ymm2, ymm0, ymmword ptr [rsi + {quote}]\n",
-            "vpcmpeqb ymm3, ymm1, ymmword ptr [rsi + {quote}]\n",
+            "vpcmpeqb ymm2, ymm0, ymm6\n",
+            "vpcmpeqb ymm3, ymm1, ymm6\n",
             "vpmovmskb eax, ymm2\n",
             "vpmovmskb r9d, ymm3\n",
             "shl r9, 32\n",
             "or r9, rax\n",
             // Where the next row starts if this one's newline is the first
             // of bytes 64..96.
-            "vmovdqu ymm2, ymmword ptr [rdi + 64]\n",
-            "vpcmpeqb ymm2, ymm2, ymmword ptr [rsi + {newline}]\n",
+            "vpcmpeqb ymm2, ymm7, ymmword ptr [rdi + 64]\n",
             "vpmovmskb eax, ymm2\n",
             "tzcnt eax, eax\n",
-            "lea rax, [rdi + rax + 65]\n",
-            "mov qword ptr [rdx + {next}], rax\n",
+            $next,
             // Quotes at the starts (r10) of the first four fields and before
             // the first three commas: both or neither. r11 is q3.
             "lea r10, [r8 + r8 + 1]\n",
@@ -1478,25 +1484,24 @@ macro_rules! lean_ids {
             "cmp byte ptr [rdi + r10], 117\n",
             "jne 2f\n",
             // Base-36 values of the sixteen bytes; all must be characters
-            // (of 7 characters, the first byte is the prefix, a letter).
-            "vpaddb xmm1, xmm0, xmmword ptr [rsi + {id_digit}]\n",
-            "vpminub xmm2, xmm1, xmmword ptr [rsi + {nine}]\n",
-            "vpcmpeqb xmm2, xmm2, xmm1\n",
-            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id_letter}]\n",
-            "vpminub xmm4, xmm3, xmmword ptr [rsi + {twenty_five}]\n",
-            "vpcmpeqb xmm4, xmm4, xmm3\n",
-            "vpand xmm1, xmm1, xmm2\n",
-            "vpaddb xmm3, xmm0, xmmword ptr [rsi + {id36_letter_value}]\n",
-            "vpand xmm3, xmm3, xmm4\n",
-            "vpor xmm1, xmm1, xmm3\n",
-            "vpor xmm2, xmm2, xmm4\n",
-            "vpmovmskb eax, xmm2\n",
-            "cmp eax, 0xFFFF\n",
-            "jne 2f\n",
+            // (of 7 characters, the first byte is the prefix, a letter). By
+            // a byte's high half (xmm1): the kind it may be (table in xmm13)
+            // and what makes its value of it (xmm15); by its low half, which
+            // a byte over 127 has none of: the kinds it may be (xmm14).
+            // xmm3 collects what is wrong with the IDs (all ones in a byte
+            // that is no character); the timestamps' step tests it.
+            "vpsrlw xmm1, xmm0, 4\n",
+            "vpand xmm1, xmm1, xmm9\n",
+            "vpshufb xmm2, xmm13, xmm1\n",
+            "vpshufb xmm3, xmm14, xmm0\n",
+            "vpand xmm3, xmm3, xmm2\n",
+            "vpcmpeqb xmm3, xmm3, xmmword ptr [rsi + {zeros}]\n",
+            "vpshufb xmm1, xmm15, xmm1\n",
+            "vpaddb xmm1, xmm1, xmm0\n",
             // The two numbers the bytes spell.
-            "vpmaddubsw xmm1, xmm1, xmmword ptr [rsi + {id36_pairs}]\n",
-            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {id36_fours}]\n",
-            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {id36_eights}]\n",
+            "vpmaddubsw xmm1, xmm1, xmm10\n",
+            "vpmaddwd xmm1, xmm1, xmm11\n",
+            "vpmuludq xmm2, xmm1, xmm12\n",
             "vpsrlq xmm1, xmm1, 32\n",
             "vpaddq xmm1, xmm1, xmm2\n",
             // By both lengths: less the prefix's part, and in the range of
@@ -1506,9 +1511,7 @@ macro_rules! lean_ids {
             "vpsubq xmm1, xmm1, xmmword ptr [rsi + rax + {id_ranges}]\n",
             "vpsubq xmm2, xmm1, xmmword ptr [rsi + rax + {id_ranges} + 16]\n",
             "vpcmpgtq xmm2, xmm2, xmmword ptr [rsi + rax + {id_ranges} + 32]\n",
-            "vmovmskpd eax, xmm2\n",
-            "test eax, eax\n",
-            "jnz 2f\n",
+            "vpor xmm3, xmm3, xmm2\n",
             "vmovq r9, xmm1\n",
             "vpextrq r10, xmm1, 1\n",
             // `unscramble` with the number in the top 40 bits, where the
@@ -1541,26 +1544,26 @@ macro_rules! lean_ids {
 }
 
 /// Both timestamps through the vector units, with the constants at r14: the
-/// two sums of ts in rax and of ingest_ts in rcx.
+/// sums of ts in xmm0, the first of them in rax too, those of ingest_ts in
+/// xmm4. Declines the row if a byte is over its limit, a number over its
+/// ceiling, or the IDs left something in ymm3.
 macro_rules! lean_times {
     () => {
         concat!(
             "vpxor ymm0, ymm0, ymmword ptr [r14 + {f_pattern}]\n",
-            "vpminub ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
-            "vpcmpeqb ymm1, ymm1, ymm0\n",
+            "vpsubusb ymm1, ymm0, ymmword ptr [r14 + {f_limit}]\n",
             "vpshufb ymm0, ymm0, ymmword ptr [r14 + {f_shuffle}]\n",
-            "vpmaddubsw ymm0, ymm0, ymmword ptr [rsi + {tens}]\n",
+            "vpmaddubsw ymm0, ymm0, ymm8\n",
             "vpcmpgtw ymm2, ymm0, ymmword ptr [r14 + {f_ceilings}]\n",
-            "vpandn ymm1, ymm2, ymm1\n",
-            "vpmovmskb eax, ymm1\n",
-            "cmp eax, -1\n",
-            "jne 2f\n",
+            "vpor ymm1, ymm1, ymm2\n",
+            "vpor ymm1, ymm1, ymm3\n",
+            "vptest ymm1, ymm1\n",
+            "jnz 2f\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_first}]\n",
             "vpackusdw ymm0, ymm0, ymm0\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_second}]\n",
-            "vmovq rax, xmm0\n",
-            "vextracti128 xmm0, ymm0, 1\n",
-            "vmovq rcx, xmm0\n",
+            "vextracti128 xmm4, ymm0, 1\n",
+            "vmovd eax, xmm0\n",
         )
     };
 }
@@ -1580,14 +1583,10 @@ macro_rules! lean_ts {
             "vmovdqu xmm0, xmmword ptr [rdi + r8 - 16]\n",
             "vinserti128 ymm0, ymm0, xmmword ptr [r13 + 4], 1\n",
             lean_times!(),
-            // The two sums of ts (rax low, r8 high) as milliseconds since
-            // the window's start, and the year text of its day.
-            "mov r8, rax\n",
-            "shr r8, 32\n",
-            "mov eax, eax\n",
-            "mov r15d, r8d\n",
-            "and r15d, dword ptr [r14 + {f_index_mask}]\n",
-            "and r8, qword ptr [r14 + {f_high_mask}]\n",
+            // The sums of ts (rax low, r15 day, r8 high) as milliseconds
+            // since the window's start, and the year text of its day.
+            "vpextrd r15d, xmm0, 1\n",
+            "vpextrd r8d, xmm0, 3\n",
             "mov r12d, dword ptr [rdi + r12]\n",
             "xor r12d, dword ptr [r14 + r15*8 + {f_day}]\n",
             "and r12d, dword ptr [r14 + {f_year_mask}]\n",
@@ -1606,9 +1605,8 @@ macro_rules! lean_ts {
 macro_rules! lean_ingest {
     () => {
         concat!(
-            "mov r8, rcx\n",
-            "shr r8, 32\n",
-            "mov ecx, ecx\n",
+            "vmovd ecx, xmm4\n",
+            "vpextrd r8d, xmm4, 1\n",
             "mov r12d, dword ptr [r13]\n",
             "cmp r12d, dword ptr [rsi + r8*8 + {day}]\n",
             "jne 2f\n",
@@ -1648,24 +1646,25 @@ macro_rules! lean_type {
 /// The 32 bytes from the comma after the type (r11): the product, one comma,
 /// the price and the newline, which must be where the next row was taken to
 /// start. Leaves the flags of the last check: zero for a row that is
-/// regular, and then r15 is zero too. The three arguments are what a
+/// regular, and then r15 is zero too. `$next` compares r15 with where the
+/// next row was taken to start. The other three arguments are what a
 /// purchase stores on the way: after the newline is found (r8d), after the
 /// comma is (r13d, as a bit), after the fields' opening quotes are (r8d).
 macro_rules! lean_tail {
-    ($reach:literal, $comma:literal, $opened:literal) => {
+    ($next:literal, $reach:literal, $comma:literal, $opened:literal) => {
         concat!(
             "vmovdqu ymm0, ymmword ptr [r11]\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {newline}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm7\n",
             "vpmovmskb r8d, ymm1\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {comma}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm5\n",
             "vpmovmskb r13d, ymm1\n",
-            "vpcmpeqb ymm1, ymm0, ymmword ptr [rsi + {quote}]\n",
+            "vpcmpeqb ymm1, ymm0, ymm6\n",
             "vpmovmskb r14d, ymm1\n",
             "tzcnt r8d, r8d\n",
             "jc 2f\n",
             $reach,
             "lea r15, [r11 + r8 + 1]\n",
-            "cmp r15, qword ptr [rdx + {next}]\n",
+            $next,
             "jne 2f\n",
             // Without the type's comma (bit 0): exactly one comma.
             "bzhi r13d, r13d, r8d\n",
@@ -1708,9 +1707,7 @@ macro_rules! lean_offset {
             "vinserti128 ymm0, ymm0, xmmword ptr [r13 + 4], 1\n",
             lean_times!(),
             // Local seconds on a table day (rax).
-            "mov r8, rax\n",
-            "shr r8, 32\n",
-            "mov eax, eax\n",
+            "vpextrd r8d, xmm0, 1\n",
             "mov r15d, dword ptr [rdi + r12]\n",
             "cmp r15d, dword ptr [rsi + r8*8 + {day}]\n",
             "jne 2f\n",
@@ -1722,7 +1719,7 @@ macro_rules! lean_offset {
             "vpminub xmm1, xmm0, xmmword ptr [rsi + {offset_limit}]\n",
             "vpcmpeqb xmm1, xmm1, xmm0\n",
             "vpshufb xmm0, xmm0, xmmword ptr [rsi + {offset_shuffle}]\n",
-            "vpmaddubsw xmm0, xmm0, xmmword ptr [rsi + {tens}]\n",
+            "vpmaddubsw xmm0, xmm0, xmm8\n",
             "vpcmpgtw xmm2, xmm0, xmmword ptr [rsi + {offset_ceilings}]\n",
             "vpandn xmm1, xmm2, xmm1\n",
             "vpmovmskb r8d, xmm1\n",
@@ -1747,8 +1744,9 @@ macro_rules! lean_offset {
 
 /// A purchase: `,purchase,` or `,"purchase",`, then the same 32 bytes, of
 /// which the frame gets what the caller needs to read product and price.
+/// `$next` is the tail's; `$then` is where a purchase that is regular goes.
 macro_rules! lean_purchase {
-    () => {
+    ($next:literal, $then:literal) => {
         concat!(
             "3:\n",
             "mov r8, qword ptr [r11]\n",
@@ -1768,13 +1766,14 @@ macro_rules! lean_purchase {
             "7:\n",
             "mov qword ptr [rdx + {region}], r11\n",
             lean_tail!(
+                $next,
                 "mov dword ptr [rdx + {reach}], r8d\n",
                 "mov dword ptr [rdx + {last_comma}], r13d\n",
                 "mov dword ptr [rdx + {opened}], r8d\n"
             ),
             "jnz 2f\n",
             "mov r15d, 2\n",
-            "jmp 8f\n",
+            $then,
         )
     };
 }
@@ -1785,19 +1784,187 @@ macro_rules! lean_purchase {
 macro_rules! lean_row {
     () => {
         concat!(
-            lean_head!(),
+            lean_head!("lea rax, [rdi + rax + 65]\nmov qword ptr [rdx + {next}], rax\n"),
             lean_ids!(),
             lean_ts!(),
             lean_ingest!(),
             lean_type!(),
-            lean_tail!("", "", ""),
+            lean_tail!("cmp r15, qword ptr [rdx + {next}]\n", "", "", ""),
             "jz 8f\n",
             "jmp 2f\n",
             lean_offset!(),
-            lean_purchase!(),
+            lean_purchase!("cmp r15, qword ptr [rdx + {next}]\n", "jmp 8f\n"),
             "2:\n",
             "mov r15d, 1\n",
             "8:\n",
+        )
+    };
+}
+
+/// A `view` or `cart` into the list of its index partition: the two words
+/// `emit_indexed` stores. From the index in the top 40 bits: the partition
+/// (the bits from the partition shift up), its writer (the cursor, then the
+/// end of its block), and the index within the partition at bit 48. A full
+/// block is the caller's to replace (22).
+macro_rules! lean_store {
+    () => {
+        concat!(
+            "pext r8, r9, qword ptr [rdx + {part_mask}]\n",
+            "shl r8, 5\n",
+            "add r8, qword ptr [rdx + {writers}]\n",
+            "mov r11, qword ptr [r8]\n",
+            "lea r13, [r11 + 16]\n",
+            "cmp r13, qword ptr [r8 + 8]\n",
+            "ja 22f\n",
+            "mov qword ptr [r8], r13\n",
+            "shl r9, 24\n",
+            "and r9, qword ptr [rdx + {low_mask}]\n",
+            // ts, valid and user-is-number: all of them, or nothing.
+            "lea rax, [rax + rax + 1]\n",
+            "bts rax, 32\n",
+            "and rax, r12\n",
+            "or rax, r9\n",
+            "mov qword ptr [r11], rax\n",
+            // The user (kept by a valid row only) at bit 22, the ingest seconds at bit 1.
+            "and r10, r12\n",
+            "shr r10, 2\n",
+            "lea r10, [r10 + rcx*2]\n",
+            "mov qword ptr [r11 + 8], r10\n",
+        )
+    };
+}
+
+/// No store: the timing variant that only reads.
+macro_rules! lean_no_store {
+    () => {
+        ""
+    };
+}
+
+/// Row after row from rdi until the frame's `last`, each `view` and `cart`
+/// stored (by the piece `$store`). r15 at the end: 0 when the next row (rdi) is at or past `last`;
+/// 1 for a row (rdi) the kernel declines; 2 for a purchase and 3 for a row
+/// whose list needs a new block: what was read of it is in the frame, and
+/// the caller stores it and comes back for the row at `next`. Where the
+/// next row starts is in rbx while a row is read; rbx is the compiler's, so
+/// it is saved in the frame and put back at the end.
+macro_rules! lean_run {
+    ($store:ident) => {
+        concat!(
+            "mov qword ptr [rdx + {saved}], rbx\n",
+            "9:\n",
+            lean_head!("lea rbx, [rdi + rax + 65]\n"),
+            lean_ids!(),
+            lean_ts!(),
+            lean_ingest!(),
+            lean_type!(),
+            lean_tail!("cmp r15, rbx\n", "", "", ""),
+            "jnz 2f\n",
+            $store!(),
+            "mov rdi, rbx\n",
+            "cmp rdi, qword ptr [rdx + {last}]\n",
+            "jb 9b\n",
+            "xor r15d, r15d\n",
+            "jmp 8f\n",
+            lean_offset!(),
+            lean_purchase!("cmp r15, rbx\n", "jmp 23f\n"),
+            "22:\n",
+            "mov r15d, 3\n",
+            "23:\n",
+            "mov qword ptr [rdx + {next}], rbx\n",
+            "shr r9, 24\n",
+            "shr r10, 24\n",
+            "mov qword ptr [rdx + {read}], rax\n",
+            "mov qword ptr [rdx + {read} + 8], rcx\n",
+            "mov qword ptr [rdx + {read} + 16], r9\n",
+            "mov qword ptr [rdx + {read} + 24], r10\n",
+            "mov qword ptr [rdx + {read} + 32], r12\n",
+            "jmp 8f\n",
+            "2:\n",
+            "mov r15d, 1\n",
+            "8:\n",
+            "mov rbx, qword ptr [rdx + {saved}]\n",
+            // The compiler does not know the vector registers were used here.
+            "vzeroupper\n",
+        )
+    };
+}
+
+/// One `asm!` of the kernel: its pieces (after the vector constants every
+/// row uses, which stay in registers), its operands, and the places in the
+/// tables and in the frame that every use of it names.
+macro_rules! lean_asm {
+    ([$($template:expr,)*] $($operands:tt)*) => {
+        std::arch::asm!(
+            "vmovdqu ymm5, ymmword ptr [rsi + {comma}]",
+            "vmovdqu ymm6, ymmword ptr [rsi + {quote}]",
+            "vmovdqu ymm7, ymmword ptr [rsi + {newline}]",
+            "vmovdqu ymm8, ymmword ptr [rsi + {tens}]",
+            "vmovdqu xmm9, xmmword ptr [rsi + {low_nibbles}]",
+            "vmovdqu xmm10, xmmword ptr [rsi + {id36_pairs}]",
+            "vmovdqu xmm11, xmmword ptr [rsi + {id36_fours}]",
+            "vmovdqu xmm12, xmmword ptr [rsi + {id36_eights}]",
+            "vmovdqu xmm13, xmmword ptr [rsi + {id_kind_high}]",
+            "vmovdqu xmm14, xmmword ptr [rsi + {id_kind_low}]",
+            "vmovdqu xmm15, xmmword ptr [rsi + {id_value}]",
+            $($template,)*
+            $($operands)*
+            out("ymm5") _, out("ymm6") _, out("ymm7") _, out("ymm8") _, out("ymm9") _, out("ymm10") _,
+            out("ymm11") _, out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            comma = const std::mem::offset_of!(LeanTables, comma),
+            quote = const std::mem::offset_of!(LeanTables, quote),
+            newline = const std::mem::offset_of!(LeanTables, newline),
+            ingest_close = const std::mem::offset_of!(LeanTables, ingest_close),
+            type_masks = const std::mem::offset_of!(LeanTables, type_masks),
+            type_texts = const std::mem::offset_of!(LeanTables, type_texts),
+            type_step = const std::mem::offset_of!(LeanTables, type_step),
+            purchase = const std::mem::offset_of!(LeanTables, purchase),
+            late_bias = const std::mem::offset_of!(LeanTables, late_bias),
+            late_limit = const std::mem::offset_of!(LeanTables, late_limit),
+            tens = const std::mem::offset_of!(LeanTables, tens),
+            low_nibbles = const std::mem::offset_of!(LeanTables, low_nibbles),
+            id_kind_high = const std::mem::offset_of!(LeanTables, id_kind_high),
+            id_kind_low = const std::mem::offset_of!(LeanTables, id_kind_low),
+            id_value = const std::mem::offset_of!(LeanTables, id_value),
+            zeros = const std::mem::offset_of!(LeanTables, zeros),
+            id36_pairs = const std::mem::offset_of!(LeanTables, id36_pairs),
+            id36_fours = const std::mem::offset_of!(LeanTables, id36_fours),
+            id36_eights = const std::mem::offset_of!(LeanTables, id36_eights),
+            id_ranges = const std::mem::offset_of!(LeanTables, id_ranges),
+            offset_pattern = const std::mem::offset_of!(LeanTables, offset_pattern),
+            offset_limit = const std::mem::offset_of!(LeanTables, offset_limit),
+            offset_shuffle = const std::mem::offset_of!(LeanTables, offset_shuffle),
+            offset_ceilings = const std::mem::offset_of!(LeanTables, offset_ceilings),
+            offset_weights = const std::mem::offset_of!(LeanTables, offset_weights),
+            form_mid = const std::mem::offset_of!(LeanTables, form_of_length) + 128,
+            offset_form = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, offset),
+            plain_start = const std::mem::offset_of!(LeanTables, forms)
+                + std::mem::offset_of!(TimeForms, plain)
+                + std::mem::offset_of!(TimeForm, start),
+            day = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, day),
+            f_pattern = const std::mem::offset_of!(TimeForm, pattern),
+            f_limit = const std::mem::offset_of!(TimeForm, limit),
+            f_shuffle = const std::mem::offset_of!(TimeForm, shuffle),
+            f_ceilings = const std::mem::offset_of!(TimeForm, ceilings),
+            f_first = const std::mem::offset_of!(TimeForm, first),
+            f_second = const std::mem::offset_of!(TimeForm, second),
+            f_year_mask = const std::mem::offset_of!(TimeForm, year_mask),
+            f_scale = const std::mem::offset_of!(TimeForm, scale),
+            f_start = const std::mem::offset_of!(TimeForm, start),
+            f_day = const FORM_DAY,
+            next = const std::mem::offset_of!(LeanFrame, next),
+            window_length = const std::mem::offset_of!(LeanFrame, window_length),
+            inverse_b = const std::mem::offset_of!(LeanFrame, inverse_b),
+            inverse_a = const std::mem::offset_of!(LeanFrame, inverse_a),
+            event_key = const std::mem::offset_of!(LeanFrame, event_key),
+            user_key = const std::mem::offset_of!(LeanFrame, user_key),
+            index_limit = const std::mem::offset_of!(LeanFrame, index_limit),
+            user_limit = const std::mem::offset_of!(LeanFrame, user_limit),
+            region = const std::mem::offset_of!(LeanFrame, region),
+            reach = const std::mem::offset_of!(LeanFrame, reach),
+            last_comma = const std::mem::offset_of!(LeanFrame, last_comma),
+            opened = const std::mem::offset_of!(LeanFrame, opened),
+            options(nostack),
         )
     };
 }
@@ -1825,6 +1992,49 @@ pub struct LeanFrame {
     reach: u32,
     last_comma: u32,
     opened: u32,
+    // For the loop in assembly: where it stops, the writers of the index
+    // partitions, which bits of an index (in the top 40 bits) are its
+    // partition, and which bits of the index at bit 48 a record keeps.
+    last: *const u8,
+    writers: *mut PartWriter,
+    part_mask: u64,
+    low_mask: u64,
+    /// What the loop read of the row it hands back: ts, ingest seconds,
+    /// index, user number and the validity mask.
+    handed: [u64; 5],
+    /// The caller's rbx while the loop runs.
+    saved: u64,
+}
+
+/// Whether a `PartWriter` is what the loop in assembly takes it for: four
+/// words, the cursor first and the end of the block second, a record of two
+/// words going where the cursor is as long as the end is not passed. Asked
+/// of `reserve` itself, once: with room for exactly one record it must hand
+/// out the cursor and move it on, and nothing else (with the end anywhere
+/// else there would be no room, and a new block).
+fn writer_as_assumed() -> bool {
+    static ASSUMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASSUMED.get_or_init(|| {
+        if std::mem::size_of::<PartWriter>() != 32 {
+            return false;
+        }
+        let mut block = [0u64; 8];
+        let base = block.as_mut_ptr();
+        let mut arena = super::arena::Arena::new();
+        // SAFETY: four pointers into `block`, as a writer has them; whatever
+        // their order, `reserve` and `grow` only write `block[1..3]`.
+        let assumed = unsafe {
+            let words: [*mut u64; 4] = [base, base.add(2), base.add(1), base.add(1)];
+            let mut writer: PartWriter = std::mem::transmute(words);
+            let at = writer.reserve(&mut arena, super::EVENT_BLOCK, 2);
+            let after: [*mut u64; 4] = std::mem::transmute(writer);
+            at == base && after == [base.add(2), base.add(2), base.add(1), base.add(1)]
+        };
+        if std::env::var_os("SS_TIMING").is_some() {
+            eprintln!("SS_TIMING note=event_store_in_assembly={assumed}");
+        }
+        assumed
+    })
 }
 
 impl LeanFrame {
@@ -1853,7 +2063,32 @@ impl LeanFrame {
             reach: 0,
             last_comma: 0,
             opened: 0,
+            last: std::ptr::null(),
+            writers: std::ptr::null_mut(),
+            part_mask: u64::MAX << (24 + keys.index_shift),
+            low_mask: ((1u64 << keys.index_shift) - 1) << 48,
+            handed: [0; 5],
+            saved: 0,
         }
+    }
+
+    /// Whether `event_lean_run` can store for this run: the writers are as
+    /// its store takes them, and an index within a partition fits the 16
+    /// bits a record has for it.
+    pub fn stores(ctx: &Ctx) -> bool {
+        ctx.keys.as_ref().is_some_and(|keys| keys.index_shift <= 16) && writer_as_assumed()
+    }
+
+    /// Timing only: every row into the first writer `event_lean_run` is
+    /// given, whatever its index.
+    pub fn one_list(&mut self) {
+        self.part_mask = 0;
+    }
+
+    /// What `event_lean_run` read of the row it handed back with `status`.
+    pub fn read(&self, status: u64) -> LeanRow {
+        let [ts, ingest_seconds, index, user_number, keep] = self.handed;
+        LeanRow { status, ts, ingest_seconds, index, user_number, keep }
     }
 }
 
@@ -1881,13 +2116,14 @@ pub struct LeanRow {
 /// `ctx`.
 #[inline(always)]
 pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut LeanFrame) -> LeanRow {
-    use std::mem::offset_of;
     let (status, ts, ingest_seconds, index, user_number, keep): (u64, u64, u64, u64, u64, u64);
-    std::arch::asm!(
-        lean_row!(),
-        // The numbers come back at the bottom of their words.
-        "shr r9, 24",
-        "shr r10, 24",
+    lean_asm!(
+        [
+            lean_row!(),
+            // The numbers come back at the bottom of their words.
+            "shr r9, 24",
+            "shr r10, 24",
+        ]
         in("rdi") p,
         in("rsi") lean,
         in("rdx") frame,
@@ -1899,62 +2135,73 @@ pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut 
         lateout("r12") keep,
         out("r8") _, out("r11") _, out("r13") _, out("r14") _,
         out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
-        comma = const offset_of!(LeanTables, comma),
-        quote = const offset_of!(LeanTables, quote),
-        newline = const offset_of!(LeanTables, newline),
-        ingest_close = const offset_of!(LeanTables, ingest_close),
-        type_masks = const offset_of!(LeanTables, type_masks),
-        type_texts = const offset_of!(LeanTables, type_texts),
-        type_step = const offset_of!(LeanTables, type_step),
-        purchase = const offset_of!(LeanTables, purchase),
-        late_bias = const offset_of!(LeanTables, late_bias),
-        late_limit = const offset_of!(LeanTables, late_limit),
-        tens = const offset_of!(LeanTables, tens),
-        id_digit = const offset_of!(LeanTables, id_digit),
-        nine = const offset_of!(LeanTables, nine),
-        id_letter = const offset_of!(LeanTables, id_letter),
-        twenty_five = const offset_of!(LeanTables, twenty_five),
-        id36_letter_value = const offset_of!(LeanTables, id36_letter_value),
-        id36_pairs = const offset_of!(LeanTables, id36_pairs),
-        id36_fours = const offset_of!(LeanTables, id36_fours),
-        id36_eights = const offset_of!(LeanTables, id36_eights),
-        id_ranges = const offset_of!(LeanTables, id_ranges),
-        offset_pattern = const offset_of!(LeanTables, offset_pattern),
-        offset_limit = const offset_of!(LeanTables, offset_limit),
-        offset_shuffle = const offset_of!(LeanTables, offset_shuffle),
-        offset_ceilings = const offset_of!(LeanTables, offset_ceilings),
-        offset_weights = const offset_of!(LeanTables, offset_weights),
-        form_mid = const offset_of!(LeanTables, form_of_length) + 128,
-        offset_form = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, offset),
-        plain_start = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, plain) + offset_of!(TimeForm, start),
-        day = const offset_of!(LeanTables, forms) + offset_of!(TimeForms, day),
-        f_pattern = const offset_of!(TimeForm, pattern),
-        f_limit = const offset_of!(TimeForm, limit),
-        f_shuffle = const offset_of!(TimeForm, shuffle),
-        f_ceilings = const offset_of!(TimeForm, ceilings),
-        f_first = const offset_of!(TimeForm, first),
-        f_second = const offset_of!(TimeForm, second),
-        f_index_mask = const offset_of!(TimeForm, index_mask),
-        f_year_mask = const offset_of!(TimeForm, year_mask),
-        f_high_mask = const offset_of!(TimeForm, high_mask),
-        f_scale = const offset_of!(TimeForm, scale),
-        f_start = const offset_of!(TimeForm, start),
-        f_day = const FORM_DAY,
-        next = const offset_of!(LeanFrame, next),
-        window_length = const offset_of!(LeanFrame, window_length),
-        inverse_b = const offset_of!(LeanFrame, inverse_b),
-        inverse_a = const offset_of!(LeanFrame, inverse_a),
-        event_key = const offset_of!(LeanFrame, event_key),
-        user_key = const offset_of!(LeanFrame, user_key),
-        index_limit = const offset_of!(LeanFrame, index_limit),
-        user_limit = const offset_of!(LeanFrame, user_limit),
-        region = const offset_of!(LeanFrame, region),
-        reach = const offset_of!(LeanFrame, reach),
-        last_comma = const offset_of!(LeanFrame, last_comma),
-        opened = const offset_of!(LeanFrame, opened),
-        options(nostack),
     );
     LeanRow { status, ts, ingest_seconds, index, user_number, keep }
+}
+
+/// The lean kernel in assembly on the rows from `p` on, storing every
+/// `view` and `cart` it reads in `out`, until a row starts at or after
+/// `last` or one needs the caller. Returns a status and a row:
+///   0: nothing more to do; the next row is the one returned (at or after `last`).
+///   1: the kernel declines the row returned.
+///   2, 3: the row returned was read but not stored: a purchase (2,
+///      `event_lean_purchase` ends it) or a row whose list needs a new
+///      block (3, `event_lean_common` stores it). `frame.read(status)` is
+///      what was read, and the next row is at `frame.next`.
+/// Without `STORE` (timing only) nothing is stored and 3 does not happen.
+///
+/// # Safety
+/// `LeanFrame::stores(ctx)` holds for the `ctx` of `lean` and `frame`; `p`
+/// is before `last`, and every row start before `last` has `ROW_PAD`
+/// readable bytes after it and 16 before it. `writers` are the writers of
+/// that `ctx`'s index partitions (`ParseOut::indexed`, taken anew after
+/// every other use of the `ParseOut`), or, after `LeanFrame::one_list`, one
+/// writer's worth of words: a cursor and the end of its block.
+#[inline(always)]
+pub unsafe fn event_lean_run<const STORE: bool>(
+    lean: *const LeanTables,
+    p: *const u8,
+    last: *const u8,
+    frame: *mut LeanFrame,
+    writers: *mut PartWriter,
+) -> (u64, *const u8) {
+    (*frame).last = last;
+    (*frame).writers = writers;
+    let status: u64;
+    let at: *const u8;
+    if STORE {
+        lean_asm!(
+            [lean_run!(lean_store),]
+            inout("rdi") p => at,
+            in("rsi") lean,
+            in("rdx") frame,
+            lateout("r15") status,
+            out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+            last = const std::mem::offset_of!(LeanFrame, last),
+            writers = const std::mem::offset_of!(LeanFrame, writers),
+            part_mask = const std::mem::offset_of!(LeanFrame, part_mask),
+            low_mask = const std::mem::offset_of!(LeanFrame, low_mask),
+            read = const std::mem::offset_of!(LeanFrame, handed),
+            saved = const std::mem::offset_of!(LeanFrame, saved),
+        );
+    } else {
+        lean_asm!(
+            [lean_run!(lean_no_store),]
+            inout("rdi") p => at,
+            in("rsi") lean,
+            in("rdx") frame,
+            lateout("r15") status,
+            out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+            last = const std::mem::offset_of!(LeanFrame, last),
+            read = const std::mem::offset_of!(LeanFrame, handed),
+            saved = const std::mem::offset_of!(LeanFrame, saved),
+        );
+    }
+    (status, at)
 }
 
 /// The end of a purchase `event_lean_asm` read (status 2): its price and its
@@ -4144,6 +4391,17 @@ mod tests {
             }
             assert!(check.answered.iter().all(|&count| count > rounds / 20), "{:?}", check.answered);
         });
+    }
+
+    /// The loop in assembly stores only where the writers are laid out as it
+    /// takes them. This build must be one of those: `whole_files_in_chunks`
+    /// is what covers that store.
+    #[test]
+    fn the_writers_are_as_the_assembly_takes_them() {
+        assert!(writer_as_assumed());
+        for window in 0..WINDOWS.len() {
+            assert!(LeanFrame::stores(&Checker::new(window).ctx));
+        }
     }
 
     /// Everything a chunk parse stored, list by list.
