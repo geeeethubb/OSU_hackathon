@@ -36,7 +36,7 @@ use self::io::Mapped;
 use self::parse::{ClickRecord, ParseOut};
 use self::dedup::{PassBOut, ScratchB};
 use self::sessions::{PassCOut, ScratchC, NO_CATEGORY};
-use crate::parquet::{self, Column, OptStrColumn, StrColumn};
+use crate::parquet::{self, ColumnType, GroupWriter, Text};
 use crate::reference::{list_csv, FastHasher};
 use crate::util::{for_each_data_line, parse_manifest, split_fields, Timing, DAY_MS};
 
@@ -445,6 +445,61 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     Ok(true)
 }
 
+/// Rows per row group of the output files: small enough that a row group is
+/// encoded in a buffer that stays in the cache, large enough that page
+/// headers and the footer stay negligible.
+const GROUP_ROWS: usize = 1 << 14;
+
+/// Two characters for every pair of base-37 digits, first digit in the low
+/// byte; digit 0 ("no character") is a zero byte.
+static DIGIT_PAIRS: [u16; 1369] = digit_pairs();
+
+const fn digit_pairs() -> [u16; 1369] {
+    const fn character(digit: usize) -> u16 {
+        if digit == 0 {
+            0
+        } else if digit <= 10 {
+            (b'0' as usize + digit - 1) as u16
+        } else {
+            (b'a' as usize + digit - 11) as u16
+        }
+    }
+    let mut table = [0u16; 1369];
+    let mut at = 0;
+    while at < 1369 {
+        table[at] = character(at / 37) | (character(at % 37) << 8);
+        at += 1;
+    }
+    table
+}
+
+/// What `codes::decode_pattern` appends after the prefix, without a division
+/// by a variable: the characters (first one in the lowest byte) and how many
+/// there are.
+#[inline]
+fn pattern_characters(code: u64) -> (u64, usize) {
+    debug_assert!(code < codes::EXOTIC_BASE);
+    let high = code / codes::P37[4];
+    let low = code % codes::P37[4];
+    let pair = |digits: u64| u64::from(DIGIT_PAIRS[digits as usize]);
+    let characters = pair(high / 1369) | (pair(high % 1369) << 16) | (pair(low / 1369) << 32) | (pair(low % 1369) << 48);
+    // The ID ends at its first zero digit: find the first zero byte.
+    let zero = characters.wrapping_sub(0x0101_0101_0101_0101) & !characters & 0x8080_8080_8080_8080;
+    (characters, (zero.trailing_zeros() / 8) as usize)
+}
+
+/// The user ID behind a name code, for `GroupWriter::runs`.
+#[inline]
+fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a [Box<[u8]>]) -> Text<'a> {
+    if code >= codes::EXOTIC_BASE {
+        return Text::Long(&exotic[(code - codes::EXOTIC_BASE) as usize]);
+    }
+    let (characters, count) = pattern_characters(code);
+    slot[0] = b'u';
+    slot[1..9].copy_from_slice(&characters.to_le_bytes());
+    Text::Short(1 + count)
+}
+
 fn write_user_daily(
     ctx: &Ctx,
     output: &Path,
@@ -452,29 +507,51 @@ fn write_user_daily(
     rows: &PassCOut,
     user_exotic: &[Box<[u8]>],
 ) -> std::io::Result<()> {
-    let count = rows.names.len();
-    let mut user_id = StrColumn::default();
-    let mut top_category = OptStrColumn::default();
-    let mut name: Vec<u8> = Vec::with_capacity(32);
-    for at in 0..count {
-        name.clear();
-        codes::id_bytes(rows.names[at], b'u', user_exotic, &mut name);
-        user_id.push(&name);
-        let category = rows.top_category[at];
-        top_category.push(if category == NO_CATEGORY { None } else { Some(&ctx.category_names[category as usize][..]) });
+    let path = output.join("user_daily").join(format!("part-{thread:03}.parquet"));
+    // The counts and sums are INT32 unless one of them does not fit.
+    let narrow = if parquet::flags() & 2 != 0 { ColumnType::Int64 } else { ColumnType::Int32 };
+    if !user_daily_file(ctx, &path, rows, user_exotic, narrow)? {
+        user_daily_file(ctx, &path, rows, user_exotic, ColumnType::Int64)?;
     }
-    parquet::write_file(
-        &output.join("user_daily").join(format!("part-{thread:03}.parquet")),
-        &[
-            ("user_id", &Column::Str(user_id)),
-            ("day", &Column::Date(rows.days.clone())),
-            ("sessions", &Column::I64(rows.sessions.clone())),
-            ("events", &Column::I64(rows.events.clone())),
-            ("revenue_cents", &Column::I64(rows.revenue.clone())),
-            ("top_category", &Column::OptStr(top_category)),
-        ],
-        count,
-    )
+    Ok(())
+}
+
+/// Writes one user_daily file with integer columns of the given kind.
+/// `Ok(false)`: a value does not fit INT32, write the file again with INT64.
+fn user_daily_file(
+    ctx: &Ctx,
+    path: &Path,
+    rows: &PassCOut,
+    user_exotic: &[Box<[u8]>],
+    integer: ColumnType,
+) -> std::io::Result<bool> {
+    let fields = [
+        ("user_id", ColumnType::Str),
+        ("day", ColumnType::Date),
+        ("sessions", integer),
+        ("events", integer),
+        ("revenue_cents", integer),
+        ("top_category", ColumnType::OptStr),
+    ];
+    let mut writer = GroupWriter::create(path, &fields)?;
+    let count = rows.names.len();
+    let group_rows = std::env::var("SS_OUT_ROWS").ok().and_then(|value| value.parse().ok()).unwrap_or(GROUP_ROWS);
+    let mut start = 0;
+    while start < count {
+        let end = (start + group_rows).min(count);
+        writer.begin(end - start)?;
+        writer.runs(&rows.names[start..end], |code, slot| user_name(code, slot, user_exotic))?;
+        writer.dates(&rows.days[start..end], ctx.first_day as i32)?;
+        for column in [&rows.sessions, &rows.events, &rows.revenue] {
+            if !writer.ints(&column[start..end])? {
+                return Ok(false);
+            }
+        }
+        writer.strings(&ctx.category_names, &rows.top_category[start..end], NO_CATEGORY)?;
+        start = end;
+    }
+    writer.finish()?;
+    Ok(true)
 }
 
 fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::io::Result<()> {
@@ -487,36 +564,122 @@ fn write_campaign_daily(ctx: &Ctx, output: &Path, workers: &[PassCOut]) -> std::
             }
         }
     }
-    let mut campaign_id = StrColumn::default();
-    let mut channel = StrColumn::default();
+    // The rows, in (campaign, day) order, and every channel once.
+    let mut campaign: Vec<u64> = Vec::new();
+    let mut channel: Vec<u32> = Vec::new();
     let mut day: Vec<i32> = Vec::new();
     let mut columns: [Vec<i64>; 4] = Default::default();
+    let mut channels: Vec<&[u8]> = Vec::new();
+    let mut channel_index: FastMap<&[u8], u32> = HashMap::default();
+    let mut current = (usize::MAX, 0u32);
     for (at, total) in totals.iter().enumerate() {
         // A row exists when at least one session was credited to or assisted by the campaign.
         if total[0] == 0 && total[3] == 0 {
             continue;
         }
-        let campaign = at / ctx.day_count;
-        campaign_id.push(&ctx.campaign_ids[campaign]);
-        channel.push(&ctx.campaign_channels[campaign]);
+        let id = at / ctx.day_count;
+        if current.0 != id {
+            let name = &ctx.campaign_channels[id][..];
+            let next = channels.len() as u32;
+            let index = *channel_index.entry(name).or_insert_with(|| {
+                channels.push(name);
+                next
+            });
+            current = (id, index);
+        }
+        campaign.push(id as u64);
+        channel.push(current.1);
         day.push((ctx.first_day + (at % ctx.day_count) as i64) as i32);
         for (column, value) in columns.iter_mut().zip(total) {
             column.push(*value);
         }
     }
-    let count = day.len();
-    let [sessions, purchasing, revenue, assisted] = columns;
-    parquet::write_file(
-        &output.join("campaign_daily").join("part-000.parquet"),
-        &[
-            ("campaign_id", &Column::Str(campaign_id)),
-            ("channel", &Column::Str(channel)),
-            ("day", &Column::Date(day)),
-            ("sessions", &Column::I64(sessions)),
-            ("purchasing_sessions", &Column::I64(purchasing)),
-            ("revenue_cents", &Column::I64(revenue)),
-            ("assisted_sessions", &Column::I64(assisted)),
-        ],
-        count,
-    )
+    let path = output.join("campaign_daily").join("part-000.parquet");
+    let write = |integer: ColumnType| -> std::io::Result<bool> {
+        let fields = [
+            ("campaign_id", ColumnType::Str),
+            ("channel", ColumnType::Str),
+            ("day", ColumnType::Date),
+            ("sessions", integer),
+            ("purchasing_sessions", integer),
+            ("revenue_cents", integer),
+            ("assisted_sessions", integer),
+        ];
+        let mut writer = GroupWriter::create(&path, &fields)?;
+        let mut start = 0;
+        while start < day.len() {
+            let end = (start + GROUP_ROWS).min(day.len());
+            writer.begin(end - start)?;
+            writer.runs(&campaign[start..end], |id, _| Text::Long(&ctx.campaign_ids[id as usize]))?;
+            writer.strings(&channels, &channel[start..end], u32::MAX)?;
+            writer.dates(&day[start..end], ctx.first_day as i32)?;
+            for column in &columns {
+                if !writer.ints(&column[start..end])? {
+                    return Ok(false);
+                }
+            }
+            start = end;
+        }
+        writer.finish()?;
+        Ok(true)
+    };
+    let narrow = if parquet::flags() & 2 != 0 { ColumnType::Int64 } else { ColumnType::Int32 };
+    if !write(narrow)? {
+        write(ColumnType::Int64)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pattern_characters_match_decode_pattern() {
+        let check = |code: u64| {
+            let mut expected = Vec::new();
+            codes::decode_pattern(code, b'u', &mut expected);
+            let (characters, count) = pattern_characters(code);
+            assert_eq!(&characters.to_le_bytes()[..count], &expected[1..], "code {code}");
+            let mut slot = [0xEEu8; parquet::SHORT_TEXT];
+            match user_name(code, &mut slot, &[]) {
+                Text::Short(length) => assert_eq!(&slot[..length], &expected[..]),
+                Text::Long(_) => panic!("a pattern code is short"),
+            }
+        };
+        // Every ID of one or two characters, and the ends of the range.
+        for first in 1..=36u64 {
+            check(first * codes::P37[7]);
+            for second in 0..=36u64 {
+                check(first * codes::P37[7] + second * codes::P37[6]);
+            }
+        }
+        for code in [0, 1, 36, 37, codes::P37[4] - 1, codes::P37[4], codes::P37[4] + 1, codes::EXOTIC_BASE - 1] {
+            check(code);
+        }
+        let ids: [&[u8]; 10] =
+            [b"u0", b"u00", b"u1", b"u10", b"u1z", b"uzzzzzzzz", b"ua", b"u3fezza6p", b"u00000000", b"uz0z0z0z"];
+        for id in ids {
+            let code = codes::pattern_code(id, b'u').unwrap();
+            let mut slot = [0u8; parquet::SHORT_TEXT];
+            match user_name(code, &mut slot, &[]) {
+                Text::Short(length) => assert_eq!(&slot[..length], id),
+                Text::Long(_) => panic!("a pattern code is short"),
+            }
+        }
+        // Random codes, valid or not (a zero digit in the middle ends the ID).
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..2_000_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            check(state % codes::EXOTIC_BASE);
+        }
+        let exotic: Vec<Box<[u8]>> = vec![(&b"U1"[..]).into(), (&b" a long exotic user id "[..]).into()];
+        let mut slot = [0u8; parquet::SHORT_TEXT];
+        match user_name(codes::EXOTIC_BASE + 1, &mut slot, &exotic) {
+            Text::Long(bytes) => assert_eq!(bytes, &exotic[1][..]),
+            Text::Short(_) => panic!("an exotic code is long"),
+        }
+    }
 }
