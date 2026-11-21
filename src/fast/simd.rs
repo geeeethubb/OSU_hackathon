@@ -1152,8 +1152,16 @@ unsafe fn product_category(ctx: &Ctx, p: *const u8, length: usize) -> u32 {
 
 /// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
 /// it). Only rows shorter than 64 bytes take the fast path.
+///
+/// With `INDEXED` (`ctx.keys` must be set), a generated user ID comes back
+/// as its user number (`user_is_number`), so that storing the click does not
+/// have to turn a code back into a number; any other user ID as its code.
 #[inline(always)]
-pub unsafe fn click_row_fast(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -> (usize, u32) {
+pub unsafe fn click_row_fast<const INDEXED: bool>(
+    ctx: &Ctx,
+    p: *const u8,
+    click: &mut ClickRecord,
+) -> (usize, u32) {
     let block0 = _mm256_loadu_si256(p as *const __m256i);
     let block1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
     let newlines = mask(block0, _mm256_set1_epi8(b'\n' as i8)) | (mask(block1, _mm256_set1_epi8(b'\n' as i8)) << 32);
@@ -1219,9 +1227,29 @@ pub unsafe fn click_row_fast(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -
     let user_need = (1u32 << (user_chars & 15)) - 1;
     let user_fast =
         (user_chars.wrapping_sub(1) < 8) & (*p.add(s1) == b'u') & ((known >> 8) & user_need == user_need);
+    if INDEXED {
+        // A generated user ID is handed back as its user number, read from
+        // the characters right-aligned: the same checks as in `event_row_fast`.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let (value, _, known) = two_numbers36(user_text << ((8usize.wrapping_sub(user_chars) & 7) * 8), 0);
+        let number = unscramble(value, keys.user_key);
+        let generated = (*p.add(s1) == b'u')
+            & canonical36(user_chars, user_text as u8, known, value)
+            & ((number >> 9) < keys.user_bound);
+        if generated {
+            *click = ClickRecord {
+                user: number,
+                user_is_number: true,
+                code_and_campaign: click_code | (u64::from(campaign) << 42),
+                ts: (ts_ms - click_window_start) as u32,
+            };
+            return (length, ROW_EMIT);
+        }
+    }
     let user = if user_fast { user_fast_code } else { id_code(field(s1, e1), b'u', &ctx.user_ids) };
     *click = ClickRecord {
         user,
+        user_is_number: false,
         code_and_campaign: click_code | (u64::from(campaign) << 42),
         ts: (ts_ms - click_window_start) as u32,
     };
@@ -1233,7 +1261,9 @@ pub unsafe fn click_row_fast(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -
 #[cfg(test)]
 mod tests {
     use super::super::keys::{scramble, Keys};
-    use super::super::parse::{click_row_slow, event_row_slow, event_row_slow_indexed, SlowIndexed};
+    use super::super::parse::{
+        click_row_slow, click_row_slow_indexed, event_row_slow, event_row_slow_indexed, SlowIndexed,
+    };
     use super::*;
 
     const PRODUCTS: &str = "product_id,category\np1,shoes\np2,books\np10,toys\np12345,games\np50000,games\n\
@@ -1300,8 +1330,10 @@ mod tests {
         buffer: Vec<u8>,
         lines: usize,
         /// Lines each kernel answered itself: general, lean, indexed general,
-        /// indexed lean, click.
-        answered: [usize; 5],
+        /// indexed lean, click, indexed click.
+        answered: [usize; 6],
+        /// Clicks whose user the indexed form turns into a number.
+        numbered: usize,
         /// Generated IDs and good times, for the probes to build rows from.
         event_id: String,
         user_id: String,
@@ -1325,7 +1357,13 @@ mod tests {
             let mut ctx = Ctx::load(&directory).unwrap().expect("a window the engine takes");
             let _ = std::fs::remove_dir_all(&directory);
             let keys =
-                Keys { event_key: 0xD1_40AB_A0D1, user_key: 0x0E_8948_5787, index_bound: 3 << 20, user_bound: 1 << 17 };
+                Keys {
+                event_key: 0xD1_40AB_A0D1,
+                user_key: 0x0E_8948_5787,
+                index_bound: 3 << 20,
+                user_bound: 1 << 17,
+                index_shift: 14,
+            };
             ctx.keys = Some(keys);
             let out = ParseOut::new(&ctx);
             // Generated IDs of 8 characters.
@@ -1340,7 +1378,8 @@ mod tests {
                 out,
                 buffer: Vec::new(),
                 lines: 0,
-                answered: [0; 5],
+                answered: [0; 6],
+                numbered: 0,
                 event_id: format!("e{}", event_id.unwrap()),
                 user_id: format!("u{}", user_id.unwrap()),
                 ts,
@@ -1399,19 +1438,40 @@ mod tests {
             let p = self.load(line, tail);
             let shown = String::from_utf8_lossy(line).into_owned();
             let slow = click_row_slow(&self.ctx, line);
-            let mut click = ClickRecord { user: 0, code_and_campaign: 0, ts: 0 };
-            // SAFETY: `load` left ROW_PAD readable bytes after `p`.
-            let (length, status) = unsafe { click_row_fast(&self.ctx, p, &mut click) };
-            if status != ROW_LONG {
-                assert_eq!(length, line.len(), "click: length of {shown:?}");
+            // Index mode: the same click, a generated user as its number.
+            let slow_indexed = click_row_slow_indexed(&self.ctx, &self.keys, line);
+            if let (Some(plain), Some(indexed)) = (&slow, &slow_indexed) {
+                // The indexed form says what `Keys::user_number_of_code` says.
+                match self.keys.user_number_of_code(plain.user) {
+                    Some(number) => {
+                        assert!(indexed.user_is_number && indexed.user == number, "click {shown:?}");
+                        self.numbered += 1;
+                    }
+                    None => assert_eq!(indexed, plain, "click {shown:?}"),
+                }
             }
-            match status {
-                ROW_EMIT => assert_eq!(Some(click), slow, "click {shown:?}"),
-                ROW_DROP => assert_eq!(None, slow, "click {shown:?}"),
-                ROW_SLOW | ROW_LONG => return,
-                _ => panic!("click: status {status} on {shown:?}"),
+            for indexed in [false, true] {
+                let mut click = ClickRecord::default();
+                // SAFETY: `load` left ROW_PAD readable bytes after `p`.
+                let (length, status) = unsafe {
+                    if indexed {
+                        click_row_fast::<true>(&self.ctx, p, &mut click)
+                    } else {
+                        click_row_fast::<false>(&self.ctx, p, &mut click)
+                    }
+                };
+                if status != ROW_LONG {
+                    assert_eq!(length, line.len(), "click (indexed {indexed}): length of {shown:?}");
+                }
+                let expected = if indexed { &slow_indexed } else { &slow };
+                match status {
+                    ROW_EMIT => assert_eq!(&Some(click), expected, "click (indexed {indexed}) {shown:?}"),
+                    ROW_DROP => assert_eq!(&None, expected, "click (indexed {indexed}) {shown:?}"),
+                    ROW_SLOW | ROW_LONG => continue,
+                    _ => panic!("click (indexed {indexed}): status {status} on {shown:?}"),
+                }
+                self.answered[4 + usize::from(indexed)] += 1;
             }
-            self.answered[4] += 1;
         }
 
         /// One tail per line, in turn.
@@ -1488,6 +1548,8 @@ mod tests {
             probe(&mut check);
             // The probes must reach the kernels, not only the general parser.
             assert!(check.lines > 0);
+            // ... and index mode must have turned users into numbers.
+            assert!(check.numbered > 0, "no click with a user number");
         }
     }
 
