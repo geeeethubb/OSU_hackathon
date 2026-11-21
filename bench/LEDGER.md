@@ -325,3 +325,29 @@ official_receipt_and_score: not yet submitted
   and 20M seeds 2 and 3 MATCH.
 - **Sessions agent, target 2 (attribution overhead):** three exact variants measured, none faster
   (within 0.5%); dropped. The remaining kernel cost is spread over five short per-person loops.
+
+### 20:20 UTC
+
+```text
+candidate_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (candidate B2; the commit to submit)
+baseline_full_sha: 4567e9532f4019fbfd0e92908fd01cc49f24f67d  (official 0.66 s, receipt BB-898B1D4A)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, AMD EPYC 7763, 4 vCPU (2 cores x 2 threads), --cpus 4 --memory 13g; run 44944919924
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 43 unit tests incl. 9 differential parser tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 18/18 pairs won; +74.0 / +77.1 / +80.6 ms (medians 892.2 -> 818.2, 906.5 -> 830.4, 889.5 -> 808.0); each larger than every A/A difference of its seed
+same-image variant (SS_INDEX_SHIFT=15): +5.2 / -0.7 / +5.8 ms: no clear difference on this CPU (2^14 was 7 to 17 ms better on a Xeon)
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,055.2 ms / 2.12 GiB; 214.0 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: fewer instructions in the event and click parsers, sessions in one ordered pass, purchase plane written only for purchases
+decision: keep; named as the commit to submit in the PR at 20:20 UTC
+official_receipt_and_score: not yet submitted
+```
+
+- **Correctness agent, on `4567e953` in the default (index) mode, exact comparison of both tables with the
+  reference pipeline (and its own independent Python reference):** 56 mutated datasets x 4 environments,
+  13 further mutations, 61 "handful of odd rows" datasets, 406 single-edit inputs, 36 plain 1K datasets,
+  136 extra fixtures: 0 disagreements. Index mode stayed engaged or backed out to the general path as
+  designed (restarts on moved events, cross-user copies and swapped event IDs). The same lists are being
+  re-run on this commit.
+- **`bench/build_prior.sh` now fails the job** when the baseline cannot be found or built.
