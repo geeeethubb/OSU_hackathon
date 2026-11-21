@@ -195,6 +195,12 @@ struct Forest<'a> {
     /// An ID found no room within `MAX_SPILL` lines of its home line; the
     /// forest is of no use from then on.
     overflowed: bool,
+    /// Joins that made one tree of two. Each leaves one more ID that is not
+    /// a root, so this is the number of IDs named by another ID, whatever
+    /// the order of the lines and however many repeat or link an ID to itself.
+    merges: usize,
+    /// Trees whose root is `MARKED`.
+    complex_trees: usize,
 }
 
 impl<'a> Forest<'a> {
@@ -219,6 +225,8 @@ impl<'a> Forest<'a> {
             key_mask: (OCCUPIED | BELOW_SPILL | (MAX_SPILL as u64) << SPILL_SHIFT) & !parent_mask,
             exotic,
             overflowed: false,
+            merges: 0,
+            complex_trees: 0,
         }
     }
 
@@ -310,7 +318,9 @@ impl<'a> Forest<'a> {
     #[cold]
     fn mark_tree(&mut self, at: usize) {
         let root = self.find(at);
-        self.set_node(root, self.node(root) | MARKED);
+        let node = self.node(root);
+        self.complex_trees += usize::from(node & MARKED == 0);
+        self.set_node(root, node | MARKED);
     }
 
     /// Makes the trees of slots `a` and `b` one, rooted at the smaller ID.
@@ -331,12 +341,16 @@ impl<'a> Forest<'a> {
         let (root, root_node, child, child_node) =
             if a_is_smaller { (a, node_a, b, node_b) } else { (b, node_b, a, node_a) };
         self.set_node(child, (child_node & !self.parent_mask) | root as u64);
+        self.merges += 1;
         // A tree with no mark is one ID, or has all its members in its root's
         // group. So two unmarked trees make an unmarked tree exactly when
         // their roots share a group.
         let same_group = matches!((group(code_a), group(code_b)), (Some(one), Some(other)) if one == other);
         if !same_group || (node_a | node_b) & MARKED != 0 {
             self.set_node(root, root_node | MARKED);
+            // One complex tree where there were none, one or two.
+            self.complex_trees += 1;
+            self.complex_trees -= usize::from(node_a & MARKED != 0) + usize::from(node_b & MARKED != 0);
         }
     }
 }
@@ -444,17 +458,13 @@ fn build_in_forest(
     }
 
     // The table holds every ID that is not the root of its tree, under the
-    // root's name, and the root of every complex tree under its own.
-    let (mut renamed, mut complex_roots) = (0, 0);
-    for slot in 0..forest.slot_count {
-        let node = forest.node(slot);
-        let is_root = (node & forest.parent_mask) as usize == slot;
-        renamed += usize::from(node != 0 && !is_root);
-        complex_roots += usize::from(node & MARKED != 0 && is_root);
-    }
-    let mut table = LinkTable::with_capacity(renamed + complex_roots);
+    // root's name, and the root of every complex tree under its own. The
+    // joins counted both, so no pass over the forest is needed to size it.
+    let entries = forest.merges + forest.complex_trees;
+    let mut table = LinkTable::with_capacity(entries);
     let mut batch = [(0u64, 0u64); INSERT_BATCH];
     let mut waiting = 0;
+    let mut stored = 0;
     for slot in 0..forest.slot_count {
         if slot + SCAN_LOOKAHEAD < forest.slot_count {
             forest.prefetch_parent(slot + SCAN_LOOKAHEAD);
@@ -476,6 +486,7 @@ fn build_in_forest(
         table.prefetch(user);
         batch[waiting] = (user, if complex { name | COMPLEX_BIT } else { name });
         waiting += 1;
+        stored += 1;
         if waiting == INSERT_BATCH {
             for &(user, name) in &batch {
                 table.insert(user, name);
@@ -486,6 +497,7 @@ fn build_in_forest(
     for &(user, name) in &batch[..waiting] {
         table.insert(user, name);
     }
+    debug_assert_eq!(stored, entries, "the joins miscounted the table's entries");
     Some(table)
 }
 
