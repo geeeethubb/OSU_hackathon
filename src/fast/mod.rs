@@ -40,11 +40,15 @@ use crate::parquet::{self, Column, OptStrColumn, StrColumn};
 use crate::reference::{list_csv, FastHasher};
 use crate::util::{for_each_data_line, parse_manifest, split_fields, Timing, DAY_MS};
 
-pub const PART_BITS: u32 = 10;
-pub const PARTS: usize = 1 << PART_BITS;
-/// Bits of a mixed code left after the partition bits.
-pub const LOCAL_BITS: u32 = codes::CODE_BITS - PART_BITS;
-pub const LOCAL_MASK: u64 = (1 << LOCAL_BITS) - 1;
+/// Fewest and most partition bits. With at least 10, the rest of a mixed
+/// code (the local key) fits the 32 bits the records give it.
+pub const MIN_PART_BITS: u32 = 10;
+pub const MAX_PART_BITS: u32 = 13;
+/// Records a partition should hold, so that a partition and the tables built
+/// over it stay inside a core's private cache whatever the input size.
+const RECORDS_PER_PART: u64 = 16_384;
+/// Bytes of an average event row, to turn file sizes into row counts.
+const EVENT_ROW_BYTES: u64 = 77;
 /// Words per list block.
 pub const EVENT_BLOCK: usize = 512;
 pub const PERSON_BLOCK: usize = 512;
@@ -88,6 +92,11 @@ pub struct Ctx {
     pub ts_tables: simd::TsTables,
     /// Use the AVX2 row parsers (`SS_FAST=0` turns them off, for A/B runs).
     pub fast_rows: bool,
+    /// Partition bits for pass A/B (by event ID) and for pass B/C (by
+    /// person). Chosen from the input size; `SS_PART_BITS`, or
+    /// `SS_EVENT_PART_BITS` / `SS_PERSON_PART_BITS`, override them.
+    pub event_part_bits: u32,
+    pub person_part_bits: u32,
     /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
     pub verify: bool,
     /// Diagnostic runs of the parse stage (`SS_DIAG`), to see where event
@@ -103,6 +112,42 @@ impl Ctx {
     #[cold]
     pub fn request_fallback(&self) {
         self.fallback.store(true, Ordering::Relaxed);
+    }
+
+    /// Partitions of pass A/B, and the shift that takes a mixed code to one.
+    pub fn event_parts(&self) -> usize {
+        1 << self.event_part_bits
+    }
+
+    pub fn event_shift(&self) -> u32 {
+        codes::CODE_BITS - self.event_part_bits
+    }
+
+    /// Partitions of pass B/C, and the shift that takes a mixed code to one.
+    pub fn person_parts(&self) -> usize {
+        1 << self.person_part_bits
+    }
+
+    pub fn person_shift(&self) -> u32 {
+        codes::CODE_BITS - self.person_part_bits
+    }
+
+    /// Sets the partition counts for `event_bytes` of event files.
+    fn size_partitions(&mut self, event_bytes: u64) {
+        let rows = event_bytes / EVENT_ROW_BYTES;
+        let mut bits = MIN_PART_BITS;
+        while bits < MAX_PART_BITS && (rows >> bits) > RECORDS_PER_PART {
+            bits += 1;
+        }
+        let choice = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map_or(default, |bits| bits.clamp(MIN_PART_BITS, MAX_PART_BITS))
+        };
+        let bits = choice("SS_PART_BITS", bits);
+        self.event_part_bits = choice("SS_EVENT_PART_BITS", bits);
+        self.person_part_bits = choice("SS_PERSON_PART_BITS", bits);
     }
 
     fn load(data: &Path) -> std::io::Result<Option<Ctx>> {
@@ -212,6 +257,8 @@ impl Ctx {
             click_ids: Interner::default(),
             #[cfg(target_arch = "x86_64")]
             ts_tables: simd::TsTables::new(window_start, window_start.div_euclid(1_000) - 4 * 86_400),
+            event_part_bits: MIN_PART_BITS,
+            person_part_bits: MIN_PART_BITS,
             fast_rows: !std::env::var_os("SS_FAST").is_some_and(|value| value == "0"),
             verify: std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1"),
             diag: std::env::var("SS_DIAG").ok().and_then(|value| value.parse().ok()).unwrap_or(0),
@@ -294,17 +341,19 @@ fn map_all(directory: &Path) -> std::io::Result<Vec<Mapped>> {
 pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> {
     let mut timing = Timing::new();
     let threads = threads.max(1);
-    let Some(ctx) = Ctx::load(data)? else {
+    let Some(mut ctx) = Ctx::load(data)? else {
         return Ok(false);
     };
     let event_files = map_all(&data.join("events"))?;
+    ctx.size_partitions(event_files.iter().map(|file| file.len() as u64).sum());
+    let ctx = ctx;
     let click_files = map_all(&data.join("clicks"))?;
     let link_files = map_all(&data.join("links"))?;
     timing.stage("startup");
 
     // Links first: they are small, and resolving them can then overlap the
     // much longer event parse.
-    let parse_out: Slots<ParseOut> = Slots::new(threads, ParseOut::new);
+    let parse_out: Slots<ParseOut> = Slots::new(threads, || ParseOut::new(&ctx));
     let mut link_tasks = Vec::new();
     chunk_tasks(Kind::Links, &link_files, LINK_CHUNK, &mut link_tasks);
     let next = AtomicUsize::new(0);
@@ -411,7 +460,8 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
-    let b_out: Slots<PassBOut> = Slots::new(threads, PassBOut::new);
+    let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
+    let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {
         // SAFETY: slot `thread` belongs to this thread for the whole phase.
@@ -420,11 +470,11 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
         let mut lists: Vec<PartList> = Vec::with_capacity(event_lists.len());
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
-            if at < PARTS {
+            if at < event_parts {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
                 dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
-            } else if let Some(batch) = click_batches.get(at - PARTS) {
+            } else if let Some(batch) = click_batches.get(at - event_parts) {
                 dedup::map_clicks(&link_table, batch, out);
             } else {
                 break;
@@ -451,7 +501,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
         let mut clicks: Vec<PartList> = Vec::with_capacity(person_clicks.len());
         loop {
             let part = next.fetch_add(1, Ordering::Relaxed);
-            if part >= PARTS {
+            if part >= ctx.person_parts() {
                 break;
             }
             events.clear();

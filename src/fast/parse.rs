@@ -6,7 +6,7 @@
 
 use super::arena::{Arena, PartWriter};
 use super::codes::{id_code, mix};
-use super::{Ctx, EVENT_BLOCK, LOCAL_BITS, LOCAL_MASK, PARTS};
+use super::{Ctx, EVENT_BLOCK};
 use crate::util::{parse_price, parse_ts, split_fields, LATE_MS, WEEK_MS};
 
 /// One event line that takes part in dedup (well-formed, non-empty event ID).
@@ -43,6 +43,8 @@ pub struct ParseOut {
     /// word 1 = user code (42) | ingest seconds (21) | is purchase (1);
     /// then, for purchases only, word 2 = price (32 low) | category (32 high).
     pub events: Vec<PartWriter>,
+    /// `mixed code >> event_shift` is an event's partition.
+    pub event_shift: u32,
     /// Valid clicks in parse order, three words each: user code, click code
     /// and campaign, ts. They live in the arena like the events do, so the
     /// list never reallocates and sits in huge pages where those exist.
@@ -55,10 +57,11 @@ pub const RAW_CLICK_BLOCK: usize = 512;
 pub const RAW_CLICK_WORDS: usize = 3;
 
 impl ParseOut {
-    pub fn new() -> Self {
+    pub fn new(ctx: &Ctx) -> Self {
         Self {
             arena: Arena::new(),
-            events: vec![PartWriter::EMPTY; PARTS],
+            events: vec![PartWriter::EMPTY; ctx.event_parts()],
+            event_shift: ctx.event_shift(),
             clicks: PartWriter::EMPTY,
             links: Vec::new(),
         }
@@ -73,12 +76,6 @@ pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
         *at = click.user;
         *at.add(1) = click.code_and_campaign;
         *at.add(2) = u64::from(click.ts);
-    }
-}
-
-impl Default for ParseOut {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -123,10 +120,11 @@ pub fn emit_raw(
     purchase: Option<(u32, u32)>,
 ) {
     let mixed = mix(event);
-    let part = (mixed >> LOCAL_BITS) as usize;
-    let word0 = ((mixed & LOCAL_MASK) << 32) | (ts << 1) | valid;
+    let part = (mixed >> out.event_shift) as usize;
+    // The local key: the low 32 bits hold every bit below the partition's.
+    let word0 = (mixed << 32) | (ts << 1) | valid;
     let word1 = (user << 22) | (ingest << 1) | u64::from(purchase.is_some());
-    // SAFETY: a mixed code has `CODE_BITS` bits, so `part < PARTS`, the
+    // SAFETY: a mixed code has `CODE_BITS` bits, so `part` is below the
     // number of writers; `reserve` returns room for the words written.
     unsafe {
         let writer = out.events.get_unchecked_mut(part);

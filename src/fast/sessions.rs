@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 
 use super::arena::PartList;
 use super::codes::{id_cmp, unmix, CODE_MASK};
-use super::{Ctx, LOCAL_BITS};
+use super::Ctx;
 use crate::util::{DAY_MS, SESSION_GAP_MS, WEEK_MS};
 
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -87,6 +87,8 @@ struct Params {
     /// Per category, how many category names are byte-wise smaller: the
     /// order that decides a tie between two categories' sums.
     category_rank: Vec<u32>,
+    /// A person's mixed name code is `partition << person_shift | local key`.
+    person_shift: u32,
 }
 
 impl Params {
@@ -97,6 +99,7 @@ impl Params {
         campaigns: usize,
         organic: usize,
         category_names: &[Box<[u8]>],
+        person_shift: u32,
     ) -> Self {
         let day_offset = window_start - first_day * DAY_MS;
         assert!((0..DAY_MS).contains(&day_offset));
@@ -110,6 +113,7 @@ impl Params {
             organic,
             categories: category_names.len(),
             category_rank,
+            person_shift,
         }
     }
 }
@@ -403,6 +407,7 @@ impl ScratchC {
             ctx.campaign_ids.len(),
             ctx.organic as usize,
             &ctx.category_names,
+            ctx.person_shift(),
         );
         Self::with(params, Tuning::DEFAULT)
     }
@@ -779,7 +784,7 @@ fn partition_core(
     let mut starts = [0usize; 3];
     for index in 0..group.locals.len() {
         let ends = group.ends[index].map(|end| end as usize);
-        let name = unmix(((part as u64) << LOCAL_BITS) | u64::from(group.locals[index]));
+        let name = unmix(((part as u64) << params.person_shift) | u64::from(group.locals[index]));
         person(
             params,
             *tuning,
@@ -903,6 +908,8 @@ mod tests {
     /// rules.md read literally for one partition: sort each person's events,
     /// cut sessions at gaps over 30 minutes, and try every click of the
     /// person against every session.
+    const TEST_PERSON_SHIFT: u32 = 32;
+
     fn reference(world: &World, partition: &Partition, tables: &mut Tables) {
         let organic = world.campaigns - 1;
         let click_id = |code: u64| {
@@ -916,7 +923,7 @@ mod tests {
         }
         for (&local, events) in &mut people {
             events.sort_by_key(|event| event.ts);
-            let name = unmix(((partition.part as u64) << LOCAL_BITS) | u64::from(local));
+            let name = unmix(((partition.part as u64) << TEST_PERSON_SHIFT) | u64::from(local));
             let clicks: Vec<&Click> = partition.clicks.iter().filter(|click| click.local == local).collect();
             let mut category_sums: BTreeMap<(i32, u32), i64> = BTreeMap::new();
             let mut at = 0;
@@ -991,6 +998,7 @@ mod tests {
             world.campaigns,
             world.campaigns - 1,
             &world.category_names,
+            TEST_PERSON_SHIFT,
         );
         let mut scratch = ScratchC::with(params, tuning);
         let mut out = PassCOut {
