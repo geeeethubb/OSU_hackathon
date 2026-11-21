@@ -1354,46 +1354,49 @@ pub unsafe fn click_row_fast<const INDEXED: bool>(
 }
 
 // ---------------------------------------------------------------------------
-// The lean click kernel.
+// The lean click kernels.
 //
-// Like the lean event kernel, it takes only rows of the generator's regular
-// shape and declines every other row, which then goes through
+// Like the lean event kernel, they take only rows of the generator's regular
+// shape and decline every other row, which then goes through
 // `click_row_fast` above (and from there, if need be, through the general
-// parser). A row it takes has been checked byte for byte: every byte of the
+// parser). A row they take has been checked byte for byte: every byte of the
 // row is a comma, a quote or the newline at a position the row's shape
 // fixes, or part of a field whose whole text was compared or classified. So
-// a row the lean kernel answers is well formed, its end is where the kernel
+// a row a lean kernel answers is well formed, its end is where the kernel
 // says, and nothing about it is left to chance.
 //
 // The regular shape:
 //   click_id    `k` and 7 or 8 characters of [0-9a-z]
 //   user_id     `u` and 7 or 8 characters of [0-9a-z]
 //               (index mode: a generated ID, see `Keys`)
-//   campaign_id `c_` and 1 to 6 digits, the first not `0`
+//   campaign_id `c_` and digits, the first not `0`
 //   ts          13 digits, or F1 or F2 on a day of the frame's day table
 //   any field in quotes or not, the first three commas within bytes 4..36
 //   of the row and its newline within bytes 32..64.
+// What varies from row to row at random (the quotes, the ID lengths, the
+// three timestamp forms) is never decided by a branch: the branches left are
+// the checks that almost never fail.
 //
-// The kernel is driven by tables. The distances between the row's first
-// three commas and its newline say what each field must look like (how many
-// characters, quoted or not, which timestamp form), and a table row per
-// field holds what is needed to check exactly that and to read the field:
-// a shuffle that brings the field's characters and the bytes that frame
-// them to fixed places, and what those bytes must be. A distance that
-// belongs to no regular field has a table row that nothing passes. So what
-// varies from row to row at random (the quotes, the ID lengths, the three
-// timestamp forms) is never decided by a branch, nor is there a branch for a
-// row with too few commas or no newline: the branches left are the checks
-// that almost never fail.
+// There are two of them. `click_row_lean` works the row's layout out with
+// arithmetic on the quotes it finds; `click_row_shapes`, the one that runs,
+// looks the layout up in tables and so needs about a third fewer
+// instructions. The first stays for A/B runs: `SS_CLICK_KERNEL=lean`.
 // ---------------------------------------------------------------------------
 
-/// The click kernel of this run: the lean one unless
-/// `SS_CLICK_KERNEL=general` asks for `click_row_fast` alone (for A/B runs).
+/// The third click kernel a fast loop can run, after `KERNEL_GENERAL`
+/// (`click_row_fast` alone) and `KERNEL_LEAN` (`click_row_lean`):
+/// `click_row_shapes`.
+pub const KERNEL_SHAPES: u32 = 2;
+
+/// The click kernel of this run: the shape-table one unless
+/// `SS_CLICK_KERNEL` asks for `click_row_lean` (`lean`) or for
+/// `click_row_fast` alone (`general`), for A/B runs.
 pub fn click_kernel() -> u32 {
     static KERNEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *KERNEL.get_or_init(|| match std::env::var("SS_CLICK_KERNEL").as_deref() {
         Ok("general") => KERNEL_GENERAL,
-        _ => KERNEL_LEAN,
+        Ok("lean") => KERNEL_LEAN,
+        _ => KERNEL_SHAPES,
     })
 }
 
@@ -1425,6 +1428,427 @@ const NO: u8 = 0x80;
 const ANY: u8 = 255;
 /// A ceiling that no number of two digits exceeds.
 const TOP: i16 = i16::MAX;
+
+// The low half of the ISO forms, `-MM-DDTHH:MM:SS` and the byte after the
+// seconds. After the shuffle the lanes are month, day, -, -, hour, minute,
+// second, -. Round one: `month * 32 + day`, -, `hour * 60 + minute`, second.
+// Round two: `month * 32 + day` and the second of the day.
+const ISO_PATTERN: [u8; 16] = *b"-00-00T00:00:00Z";
+const ISO_LIMIT: [u8; 16] = [0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0];
+const ISO_SHUFFLE: [u8; 16] = [1, 2, 4, 5, NO, NO, NO, NO, 7, 8, 10, 11, 13, 14, NO, NO];
+// Month and day must stay below 13 and 32: `month * 32 + day` names the day,
+// and a larger day would name another one (day 33 of September, October 1).
+const ISO_CEILINGS: [i16; 8] = [12, 31, TOP, TOP, 23, 59, 59, TOP];
+const ISO_FIRST: [i16; 8] = [32, 1, 0, 0, 60, 1, 1, 0];
+const ISO_SECOND: [i16; 8] = [1, 0, 60, 1, 0, 0, 0, 0];
+
+/// 62 days in a row touch at most four months, which differ in `month & 3`.
+const CLICK_DAY_SLOTS: usize = 128;
+
+/// What the lean click kernels need of the run's window, made once per
+/// chunk of rows. It lives in the frame of the loop that runs the kernel,
+/// so the compiler knows that nothing the loop stores can change it, and it
+/// keeps the kernels independent of the event kernels' tables.
+pub struct ClickFrame {
+    /// The start of the click window: epoch ms of `window_start - 7 days`.
+    since: i64,
+    /// The click window's length in ms.
+    span: u64,
+    /// The midnight of day 0 of the day table: in ms from `since`, and in
+    /// seconds from the epoch.
+    base: i64,
+    base_seconds: i64,
+    /// The days an ISO timestamp near the window can name: the 62 from 9
+    /// days before the window's first day (the click window and a day of
+    /// UTC offset on either side of any window the engine takes). Slot
+    /// `(month & 3) << 5 | day` has the one table day that lands there, as
+    /// `year text | (month * 32 + day) << 32`, so a slot can only ever
+    /// answer for the day stored in it; `u64::MAX` (which no row can
+    /// produce) where there is none.
+    day_key: [u64; CLICK_DAY_SLOTS],
+    /// Seconds from day 0 to the start of the slot's day.
+    day_seconds: [u32; CLICK_DAY_SLOTS],
+}
+
+impl ClickFrame {
+    pub fn new(ctx: &Ctx) -> Self {
+        let since = ctx.window_start - WEEK_MS;
+        let base_day = ctx.window_start.div_euclid(DAY_MS) - 9;
+        let mut day_key = [u64::MAX; CLICK_DAY_SLOTS];
+        let mut day_seconds = [0u32; CLICK_DAY_SLOTS];
+        for offset in 0..62 {
+            let (year, month, day) = civil_from_days(base_day + offset);
+            // Only a year of four digits has a text a timestamp can hold.
+            if !(0..=9999).contains(&year) {
+                continue;
+            }
+            let digit = |power: i64| b'0' + (year / power % 10) as u8;
+            let text = u32::from_le_bytes([digit(1000), digit(100), digit(10), digit(1)]);
+            let slot = (((month & 3) << 5) | day) as usize;
+            day_key[slot] = u64::from(text) | (((month * 32 + day) as u64) << 32);
+            day_seconds[slot] = (offset * 86_400) as u32;
+        }
+        Self {
+            since,
+            span: (ctx.window_end - since) as u64,
+            base: base_day * DAY_MS - since,
+            base_seconds: base_day * 86_400,
+            day_key,
+            day_seconds,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Rows a lean click kernel declined on this thread.
+    static CLICK_DECLINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `click_row_fast`, out of line: the lean kernels' way out.
+#[inline(never)]
+unsafe fn click_row_declined<const INDEXED: bool>(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -> (usize, u32) {
+    #[cfg(test)]
+    CLICK_DECLINED.with(|count| count.set(count.get() + 1));
+    click_row_fast::<INDEXED>(ctx, p, click)
+}
+
+// The first lean kernel: `click_row_lean`. It takes campaigns of 1 to 4
+// digits. The commas and quotes of bytes 4..36 give it the quotes around
+// each field, and with them where each field's text is.
+
+/// The constants of `click_time`: its low 16 bytes work on the bytes 4..20
+/// of an ISO timestamp, `-MM-DDTHH:MM:SSZ`; its high 16 bytes on one of two
+/// other pieces of the field (see `CLICK_TIME`).
+#[repr(C, align(32))]
+struct TimeConstants {
+    /// XOR with it leaves digit values where digits belong and zeros where
+    /// the expected separators are.
+    pattern: [u8; 32],
+    /// Largest allowed value after the XOR; 255 for a byte that may be anything.
+    limit: [u8; 32],
+    /// Brings the digit pairs to the 16-bit lanes their numbers are wanted in.
+    shuffle: [u8; 32],
+    /// Largest allowed number per 16-bit lane.
+    ceilings: [i16; 16],
+    /// The weights of the two rounds that add the numbers up.
+    first: [i16; 16],
+    second: [i16; 16],
+}
+
+/// `[0]`: the high half reads 13 digits, given with the 3 bytes before
+/// them: the digits in fours, then the first 5 and the last 8.
+/// `[1]`: the high half reads the bytes 16..32 of an ISO timestamp, `:SS`
+/// (which the low half checks) and then, in F2, `+HH:MM`: the offset in
+/// minutes, then in seconds.
+static CLICK_TIME: [TimeConstants; 2] = [
+    TimeConstants {
+        pattern: bytes32(ISO_PATTERN, [0, 0, 0, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48]),
+        limit: bytes32(ISO_LIMIT, [ANY, ANY, ANY, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]),
+        shuffle: bytes32(ISO_SHUFFLE, [NO, NO, NO, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+        ceilings: words16(ISO_CEILINGS, [TOP; 8]),
+        first: words16(ISO_FIRST, [100, 1, 100, 1, 100, 1, 100, 1]),
+        second: words16(ISO_SECOND, [10_000, 1, 10_000, 1, 0, 0, 0, 0]),
+    },
+    TimeConstants {
+        pattern: bytes32(ISO_PATTERN, [0, 0, 0, 0, b'0', b'0', b':', b'0', b'0', 0, 0, 0, 0, 0, 0, 0]),
+        limit: bytes32(ISO_LIMIT, [ANY, ANY, ANY, ANY, 9, 9, 0, 9, 9, ANY, ANY, ANY, ANY, ANY, ANY, ANY]),
+        shuffle: bytes32(ISO_SHUFFLE, [4, 5, 7, 8, NO, NO, NO, NO, NO, NO, NO, NO, NO, NO, NO, NO]),
+        ceilings: words16(ISO_CEILINGS, [23, 59, TOP, TOP, TOP, TOP, TOP, TOP]),
+        first: words16(ISO_FIRST, [60, 1, 0, 0, 0, 0, 0, 0]),
+        second: words16(ISO_SECOND, [60, 0, 0, 0, 0, 0, 0, 0]),
+    },
+];
+
+// What `click_time` knows about a field, as bits: 0..16 and 16..32 are the
+// two halves' bytes (in shape, and of no number over its ceiling), then
+// whether the date is a day of the table and whether byte 19 is a sign.
+const TIME_DAY: u64 = 1 << 32;
+const TIME_SIGN: u64 = 1 << 33;
+
+/// The bits a `ts` field of each length needs; a bit that is never set for
+/// the lengths no regular timestamp has.
+static TIME_NEED: [u64; 64] = {
+    let mut need = [1u64 << 63; 64];
+    // F3: thirteen digits.
+    need[13] = 0xFFFF_0000;
+    // F1: the 16 bytes from byte 4, with the `Z`, on a table day.
+    need[20] = 0xFFFF | TIME_DAY;
+    // F2: the same up to the seconds, a sign, `HH:MM` within bounds.
+    need[25] = 0xFFFF_7FFF | TIME_DAY | TIME_SIGN;
+    need
+};
+
+/// A click's `ts` field for the lean kernel: `length` bytes (fewer than
+/// `TIME_NEED` has entries) at `start`, with 3 readable bytes before them
+/// and 32 from `start` on. Returns the milliseconds from the start of the
+/// click window to it, and whether the field is 13 digits or an F1 or F2
+/// timestamp on a day of the frame's day table; if it is not, the
+/// milliseconds mean nothing.
+#[inline(always)]
+unsafe fn click_time(frame: &ClickFrame, start: *const u8, length: usize) -> (i64, bool) {
+    // Which form a row has is close to random: the form picks the constants
+    // and the second 16 bytes, and nothing here branches on it.
+    let is_digits = length == 13;
+    let constants = &CLICK_TIME[usize::from(!is_digits)];
+    let other = select_unpredictable(is_digits, start.wrapping_sub(3), start.wrapping_add(16));
+    let text = _mm256_inserti128_si256::<1>(
+        _mm256_castsi128_si256(_mm_loadu_si128(start.add(4) as *const __m128i)),
+        _mm_loadu_si128(other as *const __m128i),
+    );
+    let values = _mm256_xor_si256(text, _mm256_load_si256(constants.pattern.as_ptr() as *const __m256i));
+    let limit = _mm256_load_si256(constants.limit.as_ptr() as *const __m256i);
+    let shaped = _mm256_cmpeq_epi8(_mm256_min_epu8(values, limit), values);
+    let pairs = _mm256_shuffle_epi8(values, _mm256_load_si256(constants.shuffle.as_ptr() as *const __m256i));
+    let numbers = _mm256_maddubs_epi16(pairs, _mm256_set1_epi16(0x010A));
+    let over = _mm256_cmpgt_epi16(numbers, _mm256_load_si256(constants.ceilings.as_ptr() as *const __m256i));
+    // A number over its ceiling takes two bits out, and every lane with a
+    // ceiling lies under bits that the forms using it need.
+    let good = _mm256_movemask_epi8(_mm256_andnot_si256(over, shaped)) as u32;
+    let sums = _mm256_madd_epi16(numbers, _mm256_load_si256(constants.first.as_ptr() as *const __m256i));
+    let folded = _mm256_madd_epi16(
+        _mm256_packus_epi32(sums, sums),
+        _mm256_load_si256(constants.second.as_ptr() as *const __m256i),
+    );
+    // `month * 32 + day` below the second of the day. Month and day are
+    // within their bounds if the bits say so, and then the slot's key holds
+    // for one day only.
+    let iso = _mm256_extract_epi64::<0>(folded) as u64;
+    let year = u64::from((start as *const u32).read_unaligned());
+    let slot = (iso & (CLICK_DAY_SLOTS as u64 - 1)) as usize;
+    let day_known = *frame.day_key.get_unchecked(slot) == (year | (iso << 32));
+    let seconds = i64::from(*frame.day_seconds.get_unchecked(slot)) + (iso >> 32) as i64;
+    // The other half: the first 5 digits below the last 8, or the offset in seconds.
+    let extra = _mm256_extract_epi64::<2>(folded) as u64;
+    let low = (extra & 0xFFFF_FFFF) as i64;
+    let digits = low * 100_000_000 + (extra >> 32) as i64;
+    // `+` is 43 and `-` is 45: an offset counts once, forwards or backwards.
+    let sign = *start.add(19);
+    let sign_known = sign.wrapping_sub(b'+') & !2 == 0;
+    let offset = low * select_unpredictable(length == 25, 44 - i64::from(sign), 0);
+    let iso_ms = frame.base + (seconds - offset) * 1_000;
+    let known = u64::from(good) | (u64::from(day_known) << 32) | (u64::from(sign_known) << 33);
+    let need = *TIME_NEED.get_unchecked(length);
+    (select_unpredictable(is_digits, digits - frame.since, iso_ms), known & need == need)
+}
+
+/// The "is a known character" bits the lean click kernel expects of its
+/// three fields, by the number of the campaign's digits (1 to 4): seven
+/// characters of each ID (the eighth depends on the ID's length), and the
+/// campaign's digits at the end of its 4 bytes.
+static CLICK_KNOWN: [u32; 8] = {
+    let mut known = [0u32; 8];
+    let mut digits = 1;
+    while digits <= 4 {
+        known[digits] = 0x7F7F | (((0xF0 >> digits) & 0xF) << 16);
+        digits += 1;
+    }
+    known
+};
+
+/// What the `u` in front of a 7-character user ID adds to its number when
+/// the 8 bytes that end the ID are read as one: 30 (the digit `u`) * 36^7.
+const PREFIX_AS_DIGIT: u64 = 30 * 78_364_164_096;
+
+/// The lean kernel's work on the row starting at `p`: `ROW_DONE` (stored),
+/// `ROW_EMIT` (in `click`) or `ROW_DROP` with the row's length, or
+/// `ROW_DECLINE` for a row that is not of the regular shape.
+#[inline(always)]
+unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    frame: &ClickFrame,
+    p: *const u8,
+    out: &mut ParseOut,
+    click: &mut ClickRecord,
+) -> (usize, u32) {
+    const DECLINED: (usize, u32) = (0, ROW_DECLINE);
+    // The row's structure: the commas and quotes of bytes 4..36, the newline
+    // of bytes 32..64. No regular row has one of its first three commas or
+    // its newline anywhere else, and the checks below leave no byte of the
+    // row unexplained, so nothing is missed by not looking further.
+    let head = p.add(4);
+    let block = _mm256_loadu_si256(head as *const __m256i);
+    let commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(b',' as i8))) as u32;
+    let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(b'"' as i8))) as u32;
+    let newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+        _mm256_loadu_si256(p.add(32) as *const __m256i),
+        _mm256_set1_epi8(b'\n' as i8),
+    )) as u32;
+    let second = commas & commas.wrapping_sub(1);
+    let third = second & second.wrapping_sub(1);
+    if third == 0 || newlines == 0 {
+        return DECLINED;
+    }
+    // The commas are at `head + t0`, `head + t1` and `head + t2`, the
+    // newline at `p + 32 + end`.
+    let t0 = commas.trailing_zeros() as usize;
+    let t1 = second.trailing_zeros() as usize;
+    let t2 = third.trailing_zeros() as usize;
+    let end = newlines.trailing_zeros() as usize;
+
+    // Bit `i` of `after` is a quote right after comma `i`, of `before` right
+    // before it. A field opens with a quote exactly when it closes with one.
+    let after = _pext_u32(quotes >> 1, commas);
+    let before = _pext_u32(quotes << 1, commas);
+    let q0 = usize::from(*p == b'"');
+    let q1 = (after & 1) as usize;
+    let q2 = ((after >> 1) & 1) as usize;
+    let q3 = ((after >> 2) & 1) as usize;
+    let opened = ((after << 1) | q0 as u32) & 15;
+    let closed = (before & 7) | (u32::from(*p.add(31 + end) == b'"') << 3);
+
+    // Where the fields are. The IDs have 7 or 8 characters (`*_extra` more
+    // than 7), the campaign 1 to 4 digits; the lengths wrap for any other row.
+    let click_extra = t0.wrapping_sub(2 * q0 + 4);
+    let user = head.add(t0 + 1 + q1);
+    let user_extra = t1.wrapping_sub(t0 + 2 * q1 + 9);
+    let campaign = head.add(t1 + 1 + q2);
+    let campaign_digits = t2.wrapping_sub(t1 + 2 * q2 + 3);
+    let ts = head.add(t2 + 1 + q3);
+    let ts_length = (end + 27).wrapping_sub(t2 + 2 * q3);
+    if opened != closed
+        || (click_extra | user_extra) > 1
+        || campaign_digits.wrapping_sub(1) > 3
+        || ts_length >= TIME_NEED.len()
+        || *p.add(q0) != b'k'
+        || *user != b'u'
+        || (campaign as *const u16).read_unaligned() != u16::from_le_bytes(*b"c_")
+        || *campaign.add(2) == b'0'
+    {
+        return DECLINED;
+    }
+
+    // Both IDs and the campaign's digits in one pass. An ID is the 8 bytes
+    // after its prefix: its characters, or 7 of them and the quote or comma
+    // that ends the field, which counts as no character. In index mode the
+    // user ID is the 8 bytes that end it instead: its characters, or 7 of
+    // them behind the prefix. The campaign is the 4 bytes that end it (they
+    // start `t2 - q2` bytes into the row): its digits behind what is no
+    // digit (the `_`, the `c`, a quote or a comma).
+    let user_text = if INDEXED { user.add(user_extra) } else { user.add(1) };
+    let ids = _mm_insert_epi64::<1>(_mm_loadl_epi64(p.add(q0 + 1) as *const __m128i), read_u64(user_text) as i64);
+    let campaign_text = (p.add(t2 - q2) as *const u32).read_unaligned();
+    let text = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ids), _mm_cvtsi32_si128(campaign_text as i32));
+    let ones = |byte: u8| (u64::from(byte) * 0x0101_0101_0101_0101) as i64;
+    let per16 = |word: u16| (u64::from(word) * 0x0001_0001_0001_0001) as i64;
+    let per32 = |dword: u32| (u64::from(dword) * 0x0000_0001_0000_0001) as i64;
+    // Signed compares of bytes moved to the bottom of the range: a digit is
+    // one of the 10 values from `0`, a letter one of the 26 from `a`. The
+    // campaign has no letters.
+    let is_digit = _mm256_cmpgt_epi8(_mm256_set1_epi8(-128 + 10), _mm256_add_epi8(text, _mm256_set1_epi8(0x50)));
+    let is_letter = _mm256_cmpgt_epi8(
+        _mm256_setr_epi64x(ones(0x80 + 26), ones(0x80 + 26), ones(0x80), ones(0x80)),
+        _mm256_add_epi8(text, _mm256_set1_epi8(0x1F)),
+    );
+    let known = _mm256_or_si256(is_digit, is_letter);
+    // A character of a code counts from 1 (`0` is 1, `a` is 11, as in
+    // `two_codes`); a digit of a number (a user number in index mode, the
+    // campaign's) is itself, and `a` is 10.
+    let (user_zero, pair, four, eight) = if INDEXED {
+        (b'0', 0x0124, 0x0001_0510, 1_679_616)
+    } else {
+        (b'0' - 1, 0x0125, 0x0001_0559, 1_874_161)
+    };
+    let from_zero = _mm256_sub_epi8(text, _mm256_setr_epi64x(ones(b'0' - 1), ones(user_zero), ones(b'0'), ones(b'0')));
+    let from_letter = _mm256_and_si256(is_letter, _mm256_set1_epi8(b'a' as i8 - b'0' as i8 - 10));
+    let values = _mm256_and_si256(_mm256_sub_epi8(from_zero, from_letter), known);
+    // Most significant character first: pairs, fours, then all eight. The
+    // fours are below 2^21, so the signed multiply is the plain one.
+    let pairs =
+        _mm256_maddubs_epi16(values, _mm256_setr_epi64x(per16(0x0125), per16(pair), per16(0x010A), per16(0x010A)));
+    let fours = _mm256_madd_epi16(
+        pairs,
+        _mm256_setr_epi64x(per32(0x0001_0559), per32(four), per32(0x0001_0064), per32(0x0001_0064)),
+    );
+    let wide = _mm256_add_epi64(
+        _mm256_mul_epi32(fours, _mm256_setr_epi64x(1_874_161, eight, 1, 1)),
+        _mm256_srli_epi64::<32>(fours),
+    );
+    // Every character of the IDs known, and the campaign's digits exactly
+    // where its length says.
+    let user_known = if INDEXED { 0x8000 } else { (user_extra as u32) << 15 };
+    let expected = *CLICK_KNOWN.get_unchecked(campaign_digits) | ((click_extra as u32) << 7) | user_known;
+    if _mm256_movemask_epi8(known) as u32 != expected {
+        return DECLINED;
+    }
+    let click_code = _mm256_extract_epi64::<0>(wide) as u64;
+    let user_wide = _mm256_extract_epi64::<1>(wide) as u64;
+    // The table holds every campaign written this way, so a number that is
+    // not in it, or lies beyond it, is no campaign: `u32::MAX`.
+    let campaign_number = _mm256_extract_epi64::<2>(wide) as usize;
+    let campaigns = &ctx.campaign_by_number;
+    let campaign =
+        if campaign_number < campaigns.len() { *campaigns.get_unchecked(campaign_number) } else { u32::MAX };
+
+    let (since, time_known) = click_time(frame, ts, ts_length);
+    if !time_known {
+        return DECLINED;
+    }
+
+    let user_value = if INDEXED {
+        // The user must be a generated ID: no leading zero, a number of 40
+        // bits, a user index within the keys' bound. Any other ID is the
+        // general kernel's.
+        let keys = ctx.keys.as_ref().unwrap_unchecked();
+        let value = user_wide.wrapping_sub((user_extra as u64).wrapping_sub(1) & PREFIX_AS_DIGIT);
+        let number = unscramble(value, keys.user_key);
+        if *user.add(1) == b'0' || value > NUMBER_MASK || (number >> 9) >= keys.user_bound {
+            return DECLINED;
+        }
+        number
+    } else {
+        user_wide
+    };
+
+    // The row is well formed and ends at the newline found: what is left is
+    // the click's own validity.
+    let length = 32 + end;
+    if since as u64 >= frame.span || campaign == u32::MAX {
+        return (length, ROW_DROP);
+    }
+    let code_and_campaign = click_code | (u64::from(campaign) << 42);
+    if MODE == MODE_STORE {
+        if INDEXED {
+            // SAFETY (of the call): the user index was checked against the keys' bound.
+            emit_number_click(out, user_value, code_and_campaign, since as u64);
+        } else {
+            emit_code_click(out, user_value, code_and_campaign, since as u64);
+        }
+        return (length, ROW_DONE);
+    }
+    *click = ClickRecord { user: user_value, user_is_number: INDEXED, code_and_campaign, ts: since as u32 };
+    (length, ROW_EMIT)
+}
+
+/// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
+/// it): the lean kernel, and `click_row_fast` for the rows it declines. In
+/// `MODE_STORE` a row the lean kernel takes is stored in `out` (`ROW_DONE`);
+/// in `MODE_ROW` it comes back in `click` (`ROW_EMIT`), in index mode with
+/// the user as a user number. Everything else is `click_row_fast`'s answer.
+#[inline(always)]
+pub unsafe fn click_row_lean<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    frame: &ClickFrame,
+    p: *const u8,
+    out: &mut ParseOut,
+    click: &mut ClickRecord,
+) -> (usize, u32) {
+    let (length, status) = click_decode_lean::<MODE, INDEXED>(ctx, frame, p, out, click);
+    if status == ROW_DECLINE {
+        return click_row_declined::<INDEXED>(ctx, p, click);
+    }
+    (length, status)
+}
+
+// The shape-table kernel: `click_row_shapes`. It takes campaigns of 1 to 6
+// digits. The distances between the row's first three commas and its
+// newline say what each field must look like (how many characters, quoted
+// or not, which timestamp form), and a table row per field holds what is
+// needed to check exactly that and to read the field: a shuffle that brings
+// the field's characters and the bytes that frame them to fixed places, and
+// what those bytes must be. A distance that belongs to no regular field has
+// a table row that nothing passes, so there is no branch for a row with too
+// few commas or no newline either.
 
 /// One of the first three fields of a click row, as the lean kernel reads
 /// it out of the 16 bytes that start at the field (the click ID) or at the
@@ -1507,16 +1931,14 @@ const fn campaign_shape(digits: usize, quoted: bool) -> FieldShape {
     shape
 }
 
-/// The click ID by the place of the row's first comma, counted from byte 4:
-/// the ID fills the row up to that comma.
-static CLICK_SHAPES: [FieldShape; 33] = {
+const fn click_shapes() -> [FieldShape; 33] {
     let mut shapes = [NO_FIELD; 33];
     shapes[4] = id_shape(0, b'k', 7, false, false, 0);
     shapes[5] = id_shape(0, b'k', 8, false, false, 0);
     shapes[6] = id_shape(0, b'k', 7, true, false, 0);
     shapes[7] = id_shape(0, b'k', 8, true, false, 0);
     shapes
-};
+}
 
 const fn user_shapes(right: bool) -> [FieldShape; 33] {
     let mut shapes = [NO_FIELD; 33];
@@ -1527,14 +1949,7 @@ const fn user_shapes(right: bool) -> [FieldShape; 33] {
     shapes
 }
 
-/// The user ID by the distance from the first comma to the second: read as
-/// a code (`[0]`), or in index mode as a number (`[1]`).
-static USER_SHAPES: [[FieldShape; 33]; 2] = [user_shapes(false), user_shapes(true)];
-
-/// The campaign by the distance from the second comma to the third, plus 32
-/// if bit 6 of the byte after the second comma is set: it is in `c`, where
-/// a campaign without quotes begins, and not in a quote.
-static CAMPAIGN_SHAPES: [FieldShape; 65] = {
+const fn campaign_shapes() -> [FieldShape; 65] {
     let mut shapes = [NO_FIELD; 65];
     let mut digits = 1;
     while digits <= 6 {
@@ -1543,7 +1958,7 @@ static CAMPAIGN_SHAPES: [FieldShape; 65] = {
         digits += 1;
     }
     shapes
-};
+}
 
 /// The `ts` field of a click row, by the distance from the third comma to
 /// the newline: one of the three forms, in quotes or not. The work is done
@@ -1597,19 +2012,6 @@ const NO_TIME: TimeShape = TimeShape {
     plain: 0,
     before: 0,
 };
-
-// The low half of the ISO forms, `-MM-DDTHH:MM:SS` and the byte after the
-// seconds. After the shuffle the lanes are month, day, -, -, hour, minute,
-// second, -. Round one: `month * 32 + day`, -, `hour * 60 + minute`, second.
-// Round two: `month * 32 + day` and the second of the day.
-const ISO_PATTERN: [u8; 16] = *b"-00-00T00:00:00Z";
-const ISO_LIMIT: [u8; 16] = [0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0];
-const ISO_SHUFFLE: [u8; 16] = [1, 2, 4, 5, NO, NO, NO, NO, 7, 8, 10, 11, 13, 14, NO, NO];
-// Month and day must stay below 13 and 32: `month * 32 + day` names the day,
-// and a larger day would name another one (day 33 of September, October 1).
-const ISO_CEILINGS: [i16; 8] = [12, 31, TOP, TOP, 23, 59, 59, TOP];
-const ISO_FIRST: [i16; 8] = [32, 1, 0, 0, 60, 1, 1, 0];
-const ISO_SECOND: [i16; 8] = [1, 0, 60, 1, 0, 0, 0, 0];
 
 /// `form` 1, 2 or 3 (F1, F2, F3), in quotes or not.
 const fn time_shape(form: u32, quoted: bool) -> TimeShape {
@@ -1711,9 +2113,7 @@ const fn time_shape(form: u32, quoted: bool) -> TimeShape {
     shape
 }
 
-/// By the distance from the third comma to the newline, modulo 64: the
-/// text's length, one for the comma and two more in quotes.
-static TIME_SHAPES: [TimeShape; 64] = {
+const fn time_shapes() -> [TimeShape; 64] {
     let mut shapes = [NO_TIME; 64];
     shapes[14] = time_shape(3, false);
     shapes[16] = time_shape(3, true);
@@ -1722,75 +2122,39 @@ static TIME_SHAPES: [TimeShape; 64] = {
     shapes[26] = time_shape(2, false);
     shapes[28] = time_shape(2, true);
     shapes
+}
+
+/// Every shape of a click row's four fields, in one place, so that one
+/// address serves all the kernel's lookups.
+#[repr(C, align(64))]
+struct ClickShapes {
+    /// The click ID by the place of the row's first comma, counted from
+    /// byte 4: the ID fills the row up to that comma.
+    click: [FieldShape; 33],
+    /// The user ID by the distance from the first comma to the second: read
+    /// as a code (`[0]`), or in index mode as a number (`[1]`).
+    user: [[FieldShape; 33]; 2],
+    /// The campaign by the distance from the second comma to the third,
+    /// plus 32 if bit 6 of the byte after the second comma is set: it is in
+    /// `c`, where a campaign without quotes begins, and not in a quote.
+    campaign: [FieldShape; 65],
+    /// The timestamp by the distance from the third comma to the newline,
+    /// modulo 64: the text's length, one for the comma and two more in quotes.
+    time: [TimeShape; 64],
+}
+
+static CLICK_SHAPES: ClickShapes = ClickShapes {
+    click: click_shapes(),
+    user: [user_shapes(false), user_shapes(true)],
+    campaign: campaign_shapes(),
+    time: time_shapes(),
 };
 
-/// 62 days in a row touch at most four months, which differ in `month & 3`.
-const CLICK_DAY_SLOTS: usize = 128;
-
-/// What the lean click kernel needs of the run's window, made once per
-/// chunk of rows. It lives in the frame of the loop that runs the kernel,
-/// so the compiler knows that nothing the loop stores can change it, and it
-/// keeps the kernel independent of the event kernels' tables.
-pub struct ClickFrame {
-    /// The start of the click window: epoch ms of `window_start - 7 days`.
-    since: i64,
-    /// The click window's length in ms.
-    span: u64,
-    /// The seconds from the epoch to the midnight of day 0 of the day table.
-    base_seconds: i64,
-    /// The days an ISO timestamp near the window can name: the 62 from 9
-    /// days before the window's first day (the click window and a day of
-    /// UTC offset on either side of any window the engine takes). Slot
-    /// `(month & 3) << 5 | day` has the one table day that lands there, as
-    /// `year text | (month * 32 + day) << 32`, so a slot can only ever
-    /// answer for the day stored in it; `u64::MAX` (which no row can
-    /// produce) where there is none.
-    day_key: [u64; CLICK_DAY_SLOTS],
-    /// Seconds from day 0 to the start of the slot's day.
-    day_seconds: [u32; CLICK_DAY_SLOTS],
-}
-
-impl ClickFrame {
-    pub fn new(ctx: &Ctx) -> Self {
-        let since = ctx.window_start - WEEK_MS;
-        let base_day = ctx.window_start.div_euclid(DAY_MS) - 9;
-        let mut day_key = [u64::MAX; CLICK_DAY_SLOTS];
-        let mut day_seconds = [0u32; CLICK_DAY_SLOTS];
-        for offset in 0..62 {
-            let (year, month, day) = civil_from_days(base_day + offset);
-            // Only a year of four digits has a text a timestamp can hold.
-            if !(0..=9999).contains(&year) {
-                continue;
-            }
-            let digit = |power: i64| b'0' + (year / power % 10) as u8;
-            let text = u32::from_le_bytes([digit(1000), digit(100), digit(10), digit(1)]);
-            let slot = (((month & 3) << 5) | day) as usize;
-            day_key[slot] = u64::from(text) | (((month * 32 + day) as u64) << 32);
-            day_seconds[slot] = (offset * 86_400) as u32;
-        }
-        Self { since, span: (ctx.window_end - since) as u64, base_seconds: base_day * 86_400, day_key, day_seconds }
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Rows the lean click kernel declined on this thread.
-    static CLICK_DECLINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// `click_row_fast`, out of line: the lean kernel's way out.
-#[inline(never)]
-unsafe fn click_row_declined<const INDEXED: bool>(ctx: &Ctx, p: *const u8, click: &mut ClickRecord) -> (usize, u32) {
-    #[cfg(test)]
-    CLICK_DECLINED.with(|count| count.set(count.get() + 1));
-    click_row_fast::<INDEXED>(ctx, p, click)
-}
-
-/// The lean kernel's work on the row starting at `p`: `ROW_DONE` (stored),
-/// `ROW_EMIT` (in `click`) or `ROW_DROP` with the row's length, or
+/// The shape-table kernel's work on the row starting at `p`: `ROW_DONE`
+/// (stored), `ROW_EMIT` (in `click`) or `ROW_DROP` with the row's length, or
 /// `ROW_DECLINE` for a row that is not of the regular shape.
 #[inline(always)]
-unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
+unsafe fn click_decode_shapes<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     frame: &ClickFrame,
     p: *const u8,
@@ -1824,10 +2188,12 @@ unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
 
     // The first three fields: their characters to fixed places, and the
     // bytes that frame them (prefix, quotes) against what the shape expects.
-    let click_shape = CLICK_SHAPES.get_unchecked(t0);
-    let user_shape = USER_SHAPES.get_unchecked(usize::from(INDEXED)).get_unchecked(t1 - t0);
+    let shapes = &CLICK_SHAPES;
+    let click_shape = shapes.click.get_unchecked(t0);
+    let user_shape = shapes.user.get_unchecked(usize::from(INDEXED)).get_unchecked(t1 - t0);
     let campaign_at = head.add(t1);
-    let campaign_shape = CAMPAIGN_SHAPES.get_unchecked(t2 - t1 + 32 * usize::from((*campaign_at.add(1) >> 6) & 1));
+    let campaign_shape =
+        shapes.campaign.get_unchecked(t2 - t1 + 32 * usize::from((*campaign_at.add(1) >> 6) & 1));
     let field = |at: *const u8, shape: &FieldShape| {
         _mm_shuffle_epi8(
             _mm_loadu_si128(at as *const __m128i),
@@ -1876,8 +2242,7 @@ unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
     let from_zero = _mm256_sub_epi8(text, _mm256_setr_epi64x(ones(b'0' - 1), ones(user_zero), ones(b'0'), ones(b'0')));
     let from_letter = _mm256_and_si256(is_letter, _mm256_set1_epi8(b'a' as i8 - b'0' as i8 - 10));
     let values = _mm256_and_si256(_mm256_sub_epi8(from_zero, from_letter), known);
-    // Most significant character first: pairs, fours, then all eight. The
-    // fours are below 2^21, so the signed multiply is the plain one.
+    // Most significant character first: pairs, fours, then all eight.
     let pairs =
         _mm256_maddubs_epi16(values, _mm256_setr_epi64x(per16(0x0125), per16(pair), per16(0x010A), per16(0x010A)));
     let fours = _mm256_madd_epi16(
@@ -1885,7 +2250,7 @@ unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
         _mm256_setr_epi64x(per32(0x0001_0559), per32(four), per32(0x0001_0064), per32(0x0001_0064)),
     );
     let wide = _mm256_add_epi64(
-        _mm256_mul_epi32(fours, _mm256_setr_epi64x(1_874_161, eight, 10_000, 10_000)),
+        _mm256_mul_epu32(fours, _mm256_setr_epi64x(1_874_161, eight, 10_000, 10_000)),
         _mm256_srli_epi64::<32>(fours),
     );
     // Framed as expected (bytes 8..16 of the three fields), and characters
@@ -1915,7 +2280,7 @@ unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
 
     // The timestamp: the two halves its shape names, checked byte for byte
     // against the shape and added up by it.
-    let shape = TIME_SHAPES.get_unchecked((end + 28).wrapping_sub(t2) & 63);
+    let shape = shapes.time.get_unchecked((end + 28).wrapping_sub(t2) & 63);
     let low_at = head.add(t2).offset(shape.low_at);
     let halves = _mm256_inserti128_si256::<1>(
         _mm256_castsi128_si256(_mm_loadu_si128(low_at as *const __m128i)),
@@ -1990,20 +2355,17 @@ unsafe fn click_decode_lean<const MODE: u32, const INDEXED: bool>(
 }
 
 /// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
-/// it, and one before it): the lean kernel, and `click_row_fast` for the
-/// rows it declines. In `MODE_STORE` a row the lean kernel takes is stored
-/// in `out` (`ROW_DONE`); in `MODE_ROW` it comes back in `click`
-/// (`ROW_EMIT`), in index mode with the user as a user number. Everything
-/// else is `click_row_fast`'s answer.
+/// it, and one before it): the shape-table kernel, and `click_row_fast` for
+/// the rows it declines. The same answers as `click_row_lean`.
 #[inline(always)]
-pub unsafe fn click_row_lean<const MODE: u32, const INDEXED: bool>(
+pub unsafe fn click_row_shapes<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     frame: &ClickFrame,
     p: *const u8,
     out: &mut ParseOut,
     click: &mut ClickRecord,
 ) -> (usize, u32) {
-    let (length, status) = click_decode_lean::<MODE, INDEXED>(ctx, frame, p, out, click);
+    let (length, status) = click_decode_shapes::<MODE, INDEXED>(ctx, frame, p, out, click);
     if status == ROW_DECLINE {
         return click_row_declined::<INDEXED>(ctx, p, click);
     }
@@ -2084,11 +2446,12 @@ mod tests {
         buffer: Vec<u8>,
         lines: usize,
         /// Lines each kernel answered itself: general, lean, indexed general,
-        /// indexed lean; then the click kernels: general, indexed general,
-        /// lean, indexed lean.
-        answered: [usize; 8],
-        /// Click lines the lean kernels took themselves (general, indexed).
-        lean_clicks: [usize; 2],
+        /// indexed lean; then the click kernels: general, lean, shape-table,
+        /// each without and with index mode.
+        answered: [usize; 10],
+        /// Click lines the lean kernels took themselves: lean, shape-table,
+        /// each without and with index mode.
+        lean_clicks: [usize; 4],
         /// The lean click kernels' view of the window.
         frame: ClickFrame,
         /// Clicks whose user the indexed form turns into a number.
@@ -2132,8 +2495,8 @@ mod tests {
                 out,
                 buffer: Vec::new(),
                 lines: 0,
-                answered: [0; 8],
-                lean_clicks: [0; 2],
+                answered: [0; 10],
+                lean_clicks: [0; 4],
                 frame,
                 numbered: 0,
                 event_id: format!("e{}", event_id.unwrap()),
@@ -2207,8 +2570,9 @@ mod tests {
                 }
             }
             // Kernels 0 and 1: `click_row_fast`; 2 and 3: the lean kernel in
-            // front of it. Odd ones in index mode.
-            for kernel in 0..4 {
+            // front of it; 4 and 5: the shape-table kernel in front of it.
+            // Odd ones in index mode.
+            for kernel in 0..6 {
                 let indexed = kernel % 2 == 1;
                 let mut click = ClickRecord::default();
                 let declined = CLICK_DECLINED.with(|count| count.get());
@@ -2218,7 +2582,11 @@ mod tests {
                         0 => click_row_fast::<false>(&self.ctx, p, &mut click),
                         1 => click_row_fast::<true>(&self.ctx, p, &mut click),
                         2 => click_row_lean::<MODE_ROW, false>(&self.ctx, &self.frame, p, &mut self.out, &mut click),
-                        _ => click_row_lean::<MODE_ROW, true>(&self.ctx, &self.frame, p, &mut self.out, &mut click),
+                        3 => click_row_lean::<MODE_ROW, true>(&self.ctx, &self.frame, p, &mut self.out, &mut click),
+                        4 => {
+                            click_row_shapes::<MODE_ROW, false>(&self.ctx, &self.frame, p, &mut self.out, &mut click)
+                        }
+                        _ => click_row_shapes::<MODE_ROW, true>(&self.ctx, &self.frame, p, &mut self.out, &mut click),
                     }
                 };
                 if status != ROW_LONG {
@@ -2319,39 +2687,40 @@ mod tests {
         assert!(!field(&NO_FIELD) && !time(&NO_TIME));
         let last = |shapes: &[FieldShape]| (0..shapes.len()).rev().find(|&at| field(&shapes[at])).unwrap();
         // The comma of every shape of a field: the last place it can be at.
-        let first_comma = last(&CLICK_SHAPES);
-        let second_comma = first_comma + USER_SHAPES.iter().map(|shapes| last(shapes)).max().unwrap();
-        let third_comma = second_comma + last(&CAMPAIGN_SHAPES[..32]).max(last(&CAMPAIGN_SHAPES[32..64]));
+        let shapes = &CLICK_SHAPES;
+        let first_comma = last(&shapes.click);
+        let second_comma = first_comma + shapes.user.iter().map(|user| last(user)).max().unwrap();
+        let third_comma = second_comma + last(&shapes.campaign[..32]).max(last(&shapes.campaign[32..64]));
         assert_eq!((first_comma, second_comma, third_comma), (7, 19, 30));
         // No first comma: no click shape.
-        assert!(!field(&CLICK_SHAPES[32]));
+        assert!(!field(&shapes.click[32]));
         // No second comma: no user shape, wherever the first one is.
         for t0 in 0..=first_comma {
-            assert!(USER_SHAPES.iter().all(|shapes| !field(&shapes[32 - t0])));
+            assert!(shapes.user.iter().all(|user| !field(&user[32 - t0])));
         }
         // No third comma: no campaign shape, wherever the second one is.
         for t1 in 0..=second_comma {
-            assert!(!field(&CAMPAIGN_SHAPES[32 - t1]) && !field(&CAMPAIGN_SHAPES[32 - t1 + 32]));
+            assert!(!field(&shapes.campaign[32 - t1]) && !field(&shapes.campaign[32 - t1 + 32]));
         }
         // No newline: no timestamp shape, wherever the third comma is; nor
         // for a newline before the third comma (the distance wraps).
         for t2 in 0..=third_comma {
-            assert!(!time(&TIME_SHAPES[(32 + 28 - t2) & 63]));
+            assert!(!time(&shapes.time[(32 + 28 - t2) & 63]));
         }
         for end in 0..32usize {
             for t2 in end + 29..=32 {
-                assert!(!time(&TIME_SHAPES[(end + 28).wrapping_sub(t2) & 63]));
+                assert!(!time(&shapes.time[(end + 28).wrapping_sub(t2) & 63]));
             }
         }
         // Every byte the kernel reads through a shape is within the row's
         // reach: the fields within 16 bytes of where they begin, the halves
         // of a timestamp from one byte before its comma on.
-        for shape in CLICK_SHAPES.iter().chain(USER_SHAPES.iter().flatten()).chain(&CAMPAIGN_SHAPES) {
+        for shape in shapes.click.iter().chain(shapes.user.iter().flatten()).chain(&shapes.campaign) {
             assert!(shape.shuffle.iter().all(|&from| from == NO || from < 16));
             assert!(shape.expected[..8].iter().all(|&byte| byte == 0));
             assert!(shape.known >> 24 == 0);
         }
-        for shape in &TIME_SHAPES {
+        for shape in &shapes.time {
             assert!((5..=6).contains(&shape.low_at) && (-1..=18).contains(&shape.high_at));
         }
     }
@@ -2707,11 +3076,11 @@ mod tests {
             for line in &clicks {
                 let taken = check.lean_clicks;
                 check.click_all(line);
-                // Rows the lean click kernels are made for: they must take
-                // them themselves, in both modes and with every tail.
+                // Rows the lean click kernels are made for: each must take
+                // them itself, in both modes and with every tail.
                 assert_eq!(
                     check.lean_clicks,
-                    [taken[0] + TAILS.len(), taken[1] + TAILS.len()],
+                    taken.map(|count| count + TAILS.len()),
                     "a lean click kernel declined {:?}",
                     String::from_utf8_lossy(line)
                 );
@@ -2801,11 +3170,11 @@ mod tests {
 
     /// A file of rows through `parse_events_chunk`, in chunks: the fast loops
     /// must store exactly what the general parser alone stores.
-    /// Not a test but a measurement: both click kernels over the click files
+    /// Not a test but a measurement: the click kernels over the click files
     /// of the dataset `SS_BENCH_DATA` names, pass after pass in turn in one
-    /// process, in general mode and in index mode. Timed in turn, the two
-    /// see the same machine, whatever else runs on it; the fastest pass of
-    /// each is what the kernel costs. Run it with
+    /// process, in general mode and in index mode. Timed in turn, they see
+    /// the same machine, whatever else runs on it; the fastest pass of each
+    /// is what the kernel costs. Run it with
     /// `SS_BENCH_DATA=<dir> cargo test --release click_kernels_in_turn -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -2842,10 +3211,10 @@ mod tests {
                 eprintln!("index mode: no keys in this dataset");
                 continue;
             }
-            let mut times = [Vec::new(), Vec::new()];
-            let mut stored = [0usize; 2];
+            let mut times = [Vec::new(), Vec::new(), Vec::new()];
+            let mut stored = [0usize; 3];
             for _ in 0..passes {
-                for kernel in [KERNEL_GENERAL, KERNEL_LEAN] {
+                for kernel in [KERNEL_GENERAL, KERNEL_LEAN, KERNEL_SHAPES] {
                     let mut out = ParseOut::new(&ctx);
                     let started = std::time::Instant::now();
                     for file in &clicks {
@@ -2856,9 +3225,9 @@ mod tests {
                         + out.user_clicks.iter_mut().map(|writer| writer.finish().words()).sum::<usize>();
                 }
             }
-            // Both kernels must have stored the same number of words.
-            assert_eq!(stored[0], stored[1]);
-            for (name, times) in ["click_row_fast", "click_row_lean"].iter().zip(&mut times) {
+            // Every kernel must have stored the same number of words.
+            assert!(stored[0] == stored[1] && stored[0] == stored[2], "{stored:?}");
+            for (name, times) in ["click_row_fast  ", "click_row_lean  ", "click_row_shapes"].iter().zip(&mut times) {
                 times.sort_by(f64::total_cmp);
                 let (fastest, median) = (times[0], times[times.len() / 2]);
                 eprintln!(

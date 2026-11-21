@@ -645,12 +645,12 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        click_row_fast, click_row_lean, ClickFrame, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG,
-        ROW_PAD,
+        click_row_fast, click_row_lean, click_row_shapes, ClickFrame, KERNEL_GENERAL, KERNEL_LEAN, MODE_ROW, ROW_DONE,
+        ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD,
     };
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
-    // The lean kernel's view of the window: a local, so that the kernel's
+    // The lean kernels' view of the window: a local, so that a kernel's
     // loads from it are known not to change under the loop's stores.
     let frame = ClickFrame::new(ctx);
     let mut click = ClickRecord::default();
@@ -658,10 +658,10 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
-            if KERNEL == KERNEL_GENERAL {
-                click_row_fast::<INDEXED>(ctx, p, &mut click)
-            } else {
-                click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click)
+            match KERNEL {
+                KERNEL_GENERAL => click_row_fast::<INDEXED>(ctx, p, &mut click),
+                KERNEL_LEAN => click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click),
+                _ => click_row_shapes::<MODE, INDEXED>(ctx, &frame, p, out, &mut click),
             }
         };
         if status == ROW_DONE {
@@ -721,10 +721,11 @@ fn clicks_fast_loop<const MODE: u32, const INDEXED: bool>(
     out: &mut ParseOut,
     kernel: u32,
 ) -> usize {
-    use super::simd::{KERNEL_GENERAL, KERNEL_LEAN};
+    use super::simd::{KERNEL_GENERAL, KERNEL_LEAN, KERNEL_SHAPES};
     match kernel {
         KERNEL_GENERAL => clicks_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
-        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        KERNEL_LEAN => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_SHAPES>(ctx, buffer, position, end, out),
     }
 }
 
