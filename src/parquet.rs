@@ -1169,4 +1169,225 @@ mod tests {
             assert!(!fits_int32(value));
         }
     }
+
+    /// A small deterministic generator for the sample tables.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// How one sample table is filled.
+    #[derive(Clone, Copy)]
+    struct Shape {
+        name: &'static str,
+        rows: usize,
+        group_rows: usize,
+        integer: ColumnType,
+        /// Rows per run of equal keys: 1 to this many.
+        longest_run: u64,
+        /// Key texts longer than the short slot (and one empty text).
+        long_keys: bool,
+        /// Entries of the label dictionary; a label is null in this share of the rows, per thousand.
+        labels: usize,
+        null_share: u64,
+        /// The tail of a row group is the rows with a label (or else a random 20%).
+        tail_is_labelled: bool,
+        /// Distinct values of `count`, and whether some of them are large.
+        counts: u64,
+        far_counts: bool,
+        /// Days spread over this many dates.
+        days: u64,
+        /// `sum` may be nonzero in rows without a label.
+        sums_anywhere: bool,
+    }
+
+    const SAMPLE_FIELDS: [&str; 7] = ["id", "key", "label", "tag", "day", "count", "sum"];
+
+    /// Writes one sample file and its rows as JSON; returns `false` when an
+    /// INT32 column could not hold a value.
+    fn write_sample(directory: &Path, shape: &Shape) -> bool {
+        let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ (shape.rows as u64) << 20 ^ shape.name.len() as u64);
+        let labels: Vec<String> = (0..shape.labels).map(|at| format!("label {at} \u{e9}\u{65e5}")).collect();
+        let tags: Vec<String> = (0..7).map(|at| "tag".repeat(at)).collect();
+        let far = |value: u64| if shape.integer == ColumnType::Int64 { -(1i64 << 40) - value as i64 } else { 70_000 + 13 * value as i64 };
+        let rows = shape.rows;
+        let (mut keys, mut key_texts) = (Vec::with_capacity(rows), Vec::new());
+        let (mut label, mut tag, mut day) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut count, mut sum, mut id) = (Vec::new(), Vec::new(), Vec::new());
+        while keys.len() < rows {
+            let key = key_texts.len() as u64;
+            let text = match (shape.long_keys, key % 5) {
+                (true, 0) => format!("a long key that does not fit the short slot, number {key} \u{fc}"),
+                (true, 1) if key == 1 => String::new(),
+                _ => format!("k{key}"),
+            };
+            key_texts.push(text);
+            for _ in 0..(1 + random.below(shape.longest_run)).min((rows - keys.len()) as u64) {
+                keys.push(key);
+                let has_label = shape.labels > 0 && random.below(1000) >= shape.null_share;
+                label.push(if has_label { random.below(shape.labels as u64) as u32 } else { u32::MAX });
+                tag.push(random.below(tags.len() as u64) as u32);
+                day.push(20_000 + random.below(shape.days) as i32 - if shape.days > 1000 { 30_000 } else { 0 });
+                let which = random.below(shape.counts);
+                count.push(if shape.far_counts && which % 3 == 0 { far(which) } else { which as i64 });
+                let amount = if shape.integer == ColumnType::Int64 { (1 << 33) + random.below(1 << 40) as i64 } else { 1 + random.below(60_000) as i64 };
+                sum.push(if has_label || (shape.sums_anywhere && random.below(4) == 0) { amount } else { 0 });
+                id.push(id.len() as i64);
+            }
+        }
+        let tail_draw: Vec<bool> = (0..rows).map(|_| random.below(5) == 0).collect();
+        let marks: Vec<bool> =
+            (0..rows).map(|row| if shape.tail_is_labelled { label[row] != u32::MAX } else { tail_draw[row] }).collect();
+
+        let fields = [
+            ("id", shape.integer),
+            ("key", ColumnType::Str),
+            ("label", ColumnType::OptStr),
+            ("tag", ColumnType::Str),
+            ("day", ColumnType::Date),
+            ("count", shape.integer),
+            ("sum", shape.integer),
+        ];
+        assert_eq!(fields.map(|field| field.0), SAMPLE_FIELDS);
+        let mut writer = GroupWriter::create(&directory.join(format!("{}.parquet", shape.name)), &fields).unwrap();
+        let mut start = 0;
+        while start < rows {
+            let end = (start + shape.group_rows).min(rows);
+            writer.begin(&marks[start..end], |&mark| mark).unwrap();
+            if !writer.ints(&id[start..end]).unwrap() {
+                return false;
+            }
+            let text = |key: u64, slot: &mut [u8; SHORT_TEXT]| {
+                let text = key_texts[key as usize].as_bytes();
+                if text.len() <= SHORT_TEXT && key % 2 == 0 {
+                    slot[..text.len()].copy_from_slice(text);
+                    Text::Short(text.len())
+                } else {
+                    Text::Long(text)
+                }
+            };
+            writer.runs(&keys[start..end], text).unwrap();
+            writer.strings(&labels, &label[start..end], u32::MAX).unwrap();
+            writer.strings(&tags, &tag[start..end], u32::MAX).unwrap();
+            writer.dates(&day[start..end]).unwrap();
+            if !writer.ints(&count[start..end]).unwrap() || !writer.sparse_ints(&sum[start..end]).unwrap() {
+                return false;
+            }
+            start = end;
+        }
+        writer.finish().unwrap();
+
+        // The same rows as JSON: one array per row, in the order of SAMPLE_FIELDS.
+        let mut json = String::from("[\n");
+        for row in 0..rows {
+            let label_text =
+                if label[row] == u32::MAX { "null".to_string() } else { format!("\"{}\"", labels[label[row] as usize]) };
+            json.push_str(&format!(
+                "[{}, \"{}\", {}, \"{}\", {}, {}, {}]{}\n",
+                id[row],
+                key_texts[keys[row] as usize],
+                label_text,
+                tags[tag[row] as usize],
+                day[row],
+                count[row],
+                sum[row],
+                if row + 1 < rows { "," } else { "" }
+            ));
+        }
+        json.push_str("]\n");
+        std::fs::write(directory.join(format!("{}.json", shape.name)), json).unwrap();
+        true
+    }
+
+    /// Sample files for `scripts/check_parquet_samples.py`, which reads them
+    /// with polars and pyarrow and compares the rows with the JSON next to
+    /// them. They reach the paths the two output tables never take: long
+    /// runs, long and empty texts, nulls outside the head, INT64 columns,
+    /// integers outside the direct map, every index width, PLAIN fallbacks.
+    ///
+    /// Run: `SS_PARQUET_SAMPLES=<empty dir> cargo test --release parquet_samples`
+    /// and then `python scripts/check_parquet_samples.py <dir>`. Without the
+    /// variable the files go to a temporary folder and are only written.
+    #[test]
+    fn parquet_samples() {
+        let directory = match std::env::var_os("SS_PARQUET_SAMPLES") {
+            Some(directory) => std::path::PathBuf::from(directory),
+            None => std::env::temp_dir().join(format!("ss-parquet-samples-{}", std::process::id())),
+        };
+        std::fs::create_dir_all(&directory).unwrap();
+        let base = Shape {
+            name: "",
+            rows: 40_000,
+            group_rows: MAX_GROUP_ROWS,
+            integer: ColumnType::Int32,
+            longest_run: 6,
+            long_keys: false,
+            labels: 21,
+            null_share: 820,
+            tail_is_labelled: true,
+            counts: 180,
+            far_counts: false,
+            days: 14,
+            sums_anywhere: false,
+        };
+        let mut shapes = vec![
+            Shape { name: "like_user_daily", ..base },
+            Shape { name: "one_row", rows: 1, ..base },
+            Shape { name: "five_rows", rows: 5, null_share: 400, ..base },
+            Shape { name: "small_groups", rows: 3_000, group_rows: 9, ..base },
+            Shape { name: "groups_of_one", rows: 70, group_rows: 1, null_share: 500, ..base },
+            Shape { name: "long_runs", rows: 30_000, longest_run: 400, long_keys: true, ..base },
+            Shape { name: "scattered", tail_is_labelled: false, sums_anywhere: true, long_keys: true, ..base },
+            Shape { name: "no_nulls", null_share: 0, ..base },
+            Shape { name: "all_nulls", null_share: 1000, ..base },
+            Shape { name: "no_labels_at_all", labels: 0, ..base },
+            Shape { name: "many_labels", labels: 300, null_share: 100, ..base },
+            Shape { name: "huge_dictionary", labels: 70_000, null_share: 100, rows: 20_000, ..base },
+            Shape { name: "many_days", days: 5_000, ..base },
+            Shape { name: "far_counts", far_counts: true, counts: 150, ..base },
+            Shape { name: "too_many_far_counts", far_counts: true, counts: 600, ..base },
+            Shape { name: "distinct_counts", counts: 1 << 30, ..base },
+            Shape { name: "wide", integer: ColumnType::Int64, far_counts: true, sums_anywhere: true, ..base },
+            Shape { name: "wide_small", integer: ColumnType::Int64, rows: 12, ..base },
+        ];
+        // Every index width from 1 to 14 bits.
+        const WIDTH_NAMES: [&str; 14] =
+            ["w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10", "w11", "w12", "w13", "w14"];
+        for (bits, name) in WIDTH_NAMES.iter().enumerate() {
+            shapes.push(Shape { name, rows: MAX_GROUP_ROWS + 3, counts: 1 << (bits + 1), ..base });
+        }
+        for shape in &shapes {
+            assert!(write_sample(&directory, shape), "{}", shape.name);
+        }
+        // A table without rows.
+        let fields = [("id", ColumnType::Int32), ("key", ColumnType::Str), ("label", ColumnType::OptStr)];
+        GroupWriter::create(&directory.join("empty.parquet"), &fields).unwrap().finish().unwrap();
+        std::fs::write(directory.join("empty.json"), "[]\n").unwrap();
+        // A value that does not fit INT32 is reported, not written.
+        let fields = [("count", ColumnType::Int32)];
+        let path = directory.join("too_narrow.parquet");
+        for (values, fits) in [(vec![1i64, 2, i64::from(i32::MAX)], true), (vec![1, i64::from(i32::MAX) + 1, 3], false)] {
+            let mut writer = GroupWriter::create(&path, &fields).unwrap();
+            writer.begin(&values, |_| false).unwrap();
+            assert_eq!(writer.ints(&values).unwrap(), fits);
+            drop(writer);
+            let mut writer = GroupWriter::create(&path, &fields).unwrap();
+            writer.begin(&values, |_| false).unwrap();
+            assert_eq!(writer.sparse_ints(&values).unwrap(), fits);
+        }
+        std::fs::remove_file(&path).unwrap();
+        if std::env::var_os("SS_PARQUET_SAMPLES").is_none() {
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
 }
