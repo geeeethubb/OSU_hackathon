@@ -281,8 +281,10 @@ pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
     Some(Keys { event_key, user_key, index_bound, user_bound, index_shift })
 }
 
-/// 16,384 events per index partition: two words per slot make 256 KiB.
-pub const DEFAULT_INDEX_SHIFT: u32 = 14;
+/// 32,768 events per index partition: two words per slot make 512 KiB. In CI
+/// (run 44940841473) 2^15 was 3 to 6 ms faster than 2^14 and 2^13 was 6 to
+/// 12 ms slower (run 44940838388): fewer write streams in the parse.
+pub const DEFAULT_INDEX_SHIFT: u32 = 15;
 
 #[cfg(test)]
 mod tests {

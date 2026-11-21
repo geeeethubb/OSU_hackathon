@@ -1422,7 +1422,7 @@ mod tests {
             let mut ctx = Ctx::load(&directory).unwrap().expect("a window the engine takes");
             let _ = std::fs::remove_dir_all(&directory);
             let keys =
-                Keys { event_key: 0xD1_40AB_A0D1, user_key: 0x0E_8948_5787, index_bound: 3 << 20, user_bound: 1 << 17 };
+                Keys { event_key: 0xD1_40AB_A0D1, user_key: 0x0E_8948_5787, index_bound: 3 << 20, user_bound: 1 << 17, index_shift: 14 };
             ctx.keys = Some(keys);
             let out = ParseOut::new(&ctx);
             // Generated IDs of 8 characters.
