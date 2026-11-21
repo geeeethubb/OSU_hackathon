@@ -122,6 +122,34 @@ pub fn click_indexed_form(keys: &Keys, click: ClickRecord) -> ClickRecord {
     }
 }
 
+/// Stores a click whose user is known by its code: three words in the
+/// worker's click list.
+#[inline(always)]
+pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts: u64) {
+    let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
+    // SAFETY: `reserve` returned room for three words.
+    unsafe {
+        *at = user;
+        *at.add(1) = code_and_campaign;
+        *at.add(2) = ts;
+    }
+}
+
+/// Index mode: stores a click of a generated user ID, known by its user
+/// number: two words in the list of its run of user indexes.
+///
+/// # Safety
+/// The number's user index (`number >> 9`) must be below the keys' bound.
+#[inline(always)]
+pub unsafe fn emit_number_click(out: &mut ParseOut, number: u64, code_and_campaign: u64, ts: u64) {
+    // SAFETY: the keys' bound sized `user_clicks`; `reserve` returned room
+    // for two words.
+    let writer = out.user_clicks.get_unchecked_mut((number >> (9 + CLICK_SHIFT)) as usize);
+    let at = writer.reserve(&mut out.arena, USER_CLICK_BLOCK, 2);
+    *at = ts | ((number & ((1 << (9 + CLICK_SHIFT)) - 1)) << 32);
+    *at.add(1) = code_and_campaign;
+}
+
 #[inline(always)]
 pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
     // A kernel that read the user number from the text says so; any other
@@ -131,24 +159,11 @@ pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
     } else {
         out.keys.as_ref().and_then(|keys| keys.user_number_of_code(click.user))
     };
-    if let Some(number) = number {
-        // SAFETY: the number's user index is below the keys' bound, which
-        // sized `user_clicks`; `reserve` returned room for two words.
-        unsafe {
-            let writer = out.user_clicks.get_unchecked_mut((number >> (9 + CLICK_SHIFT)) as usize);
-            let at = writer.reserve(&mut out.arena, USER_CLICK_BLOCK, 2);
-            *at = u64::from(click.ts) | ((number & ((1 << (9 + CLICK_SHIFT)) - 1)) << 32);
-            *at.add(1) = click.code_and_campaign;
-        }
-        return;
-    }
-    let user = click.user;
-    let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
-    // SAFETY: `reserve` returned room for three words.
-    unsafe {
-        *at = user;
-        *at.add(1) = click.code_and_campaign;
-        *at.add(2) = u64::from(click.ts);
+    match number {
+        // SAFETY: the number's user index is below the keys' bound: the
+        // kernels and `user_number_of_code` hand out no other numbers.
+        Some(number) => unsafe { emit_number_click(out, number, click.code_and_campaign, u64::from(click.ts)) },
+        None => emit_code_click(out, click.user, click.code_and_campaign, u64::from(click.ts)),
     }
 }
 
@@ -614,28 +629,46 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
     });
 }
 
-/// The fast loop over click rows, specialized for index mode (`INDEXED`: the
-/// kernel reads a generated user ID as its user number, and `ctx.keys` must
-/// be set). Returns where the general parser must continue.
+/// The fast loop over click rows, specialized for what happens to a parsed
+/// row (`simd::MODE_STORE`: the kernel stores it; `simd::MODE_ROW`: it comes
+/// back and is checked against the general parser first), for index mode
+/// (`INDEXED`: a generated user ID is read as its user number, and
+/// `ctx.keys` must be set) and for one of the click kernels
+/// (`simd::KERNEL_*`). Returns where the general parser must continue.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn clicks_rows_loop<const INDEXED: bool>(
+fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     ctx: &Ctx,
     buffer: &[u8],
     mut position: usize,
     end: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{click_row_fast, ROW_DROP, ROW_EMIT, ROW_LONG, ROW_PAD};
+    use super::simd::{
+        click_row_fast, click_row_lean, ClickFrame, KERNEL_GENERAL, MODE_ROW, ROW_DONE, ROW_DROP, ROW_EMIT, ROW_LONG,
+        ROW_PAD,
+    };
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
-    let verify = ctx.verify;
+    // The lean kernel's view of the window: a local, so that the kernel's
+    // loads from it are known not to change under the loop's stores.
+    let frame = ClickFrame::new(ctx);
     let mut click = ClickRecord::default();
     while position < limit && position < safe {
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
-        let (length, status) =
-            unsafe { click_row_fast::<INDEXED>(ctx, buffer.as_ptr().add(position), &mut click) };
-        if status == ROW_EMIT && !verify {
+        let (length, status) = unsafe {
+            let p = buffer.as_ptr().add(position);
+            if KERNEL == KERNEL_GENERAL {
+                click_row_fast::<INDEXED>(ctx, p, &mut click)
+            } else {
+                click_row_lean::<MODE, INDEXED>(ctx, &frame, p, out, &mut click)
+            }
+        };
+        if status == ROW_DONE {
+            position += length + 1;
+            continue;
+        }
+        if status == ROW_EMIT && MODE != MODE_ROW {
             emit_click(out, &click);
             position += length + 1;
             continue;
@@ -654,8 +687,8 @@ fn clicks_rows_loop<const INDEXED: bool>(
             ROW_DROP => None,
             _ => click_row_slow(ctx, line),
         };
-        if verify && (status == ROW_EMIT || status == ROW_DROP) {
-            // In index mode the kernel must hand back exactly the indexed
+        if MODE == MODE_ROW && (status == ROW_EMIT || status == ROW_DROP) {
+            // In index mode a kernel must hand back exactly the indexed
             // form of what the general parser reads.
             let slow = match &ctx.keys {
                 Some(keys) if INDEXED => click_row_slow_indexed(ctx, keys, line),
@@ -677,15 +710,34 @@ fn clicks_rows_loop<const INDEXED: bool>(
     position
 }
 
+/// `clicks_rows_loop` with the click kernel of this run.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn clicks_fast_loop<const MODE: u32, const INDEXED: bool>(
+    ctx: &Ctx,
+    buffer: &[u8],
+    position: usize,
+    end: usize,
+    out: &mut ParseOut,
+) -> usize {
+    use super::simd::{click_kernel, KERNEL_GENERAL, KERNEL_LEAN};
+    match click_kernel() {
+        KERNEL_GENERAL => clicks_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
+        _ => clicks_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out),
+    }
+}
+
 pub fn parse_clicks_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
     if ctx.fast_rows {
-        position = if ctx.keys.is_some() {
-            clicks_rows_loop::<true>(ctx, buffer, position, end, out)
-        } else {
-            clicks_rows_loop::<false>(ctx, buffer, position, end, out)
+        use super::simd::{MODE_ROW, MODE_STORE};
+        position = match (ctx.keys.is_some(), ctx.verify) {
+            (true, true) => clicks_fast_loop::<MODE_ROW, true>(ctx, buffer, position, end, out),
+            (true, false) => clicks_fast_loop::<MODE_STORE, true>(ctx, buffer, position, end, out),
+            (false, true) => clicks_fast_loop::<MODE_ROW, false>(ctx, buffer, position, end, out),
+            (false, false) => clicks_fast_loop::<MODE_STORE, false>(ctx, buffer, position, end, out),
         };
     }
     lines_from(buffer, position, end, |line| {
