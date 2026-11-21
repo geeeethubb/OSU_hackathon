@@ -541,8 +541,16 @@ def sixty_text(b60):
         return "run failed before the pipeline started" if not b60.get("ok") else "not run"
     check = "MATCH /reference" if (entry.get("compare") and all(item.get("match") for item in entry["compare"])) else (
         "self-check OK" if (entry.get("self_check") or {}).get("ok") else "self-check FAILED")
-    return (f"seed {entry.get('seed')}: container {secs(run.get('docker_s'))}, exit {run.get('exit_code')}, peak {size(monitor_peak(run))}, "
+    text = (f"seed {entry.get('seed')}: container {secs(run.get('docker_s'))}, exit {run.get('exit_code')}, peak {size(monitor_peak(run))}, "
             f"{check}")
+    ab = entry.get("ab")
+    if ab:
+        text += (f"; against the baseline in the same job {millis(ab.get('median_a_minus_b_ms'), signed=True)} ms "
+                 f"({ab.get('b_faster_pairs')}/{ab.get('n')} pairs, medians {millis(ab.get('median_a_ms'))} → {millis(ab.get('median_b_ms'))}; "
+                 f"A/A median abs {millis((entry.get('aa') or {}).get('median_abs_diff_ms'))} ms)")
+    if b60.get("run_url"):
+        text += f" [run {b60['run_url'].rsplit('/', 1)[-1]}]({b60['run_url']})"
+    return text
 
 
 def compact_rows(result, correctness=None, b60=None):
@@ -772,9 +780,27 @@ def render_bench60m(result):
         lines += [f"| {name} | {value} |" for name, value in rows]
         for item in [item for item in entry.get("compare") or [] if not item.get("match")][:2]:
             lines += ["", "```", item.get("output", ""), "```"]
+        prior = result.get("prior") or {}
+        if prior.get("status") == "built":
+            lines += ["", f"Prior best (`bench/BEST_SHA`): `{prior.get('sha')}`, built in this job"
+                          + (", but its `/pipeline` is byte-identical to this commit's, so there is nothing to compare."
+                             if prior.get("same_binary") else ".")]
+        plan = entry.get("pair_plan") or {}
+        if plan.get("requested") and plan.get("aa_pairs", 0) < plan["requested"]:
+            lines += ["", f"A run takes about {plan.get('per_run_s')} s here, so the {plan.get('budget_s'):.0f} s pair budget allowed "
+                          f"{plan.get('aa_pairs')} A/A pairs and {plan.get('ab_pairs')} prior-vs-candidate pairs instead of {plan['requested']}."]
+        if entry.get("aa"):
+            lines += ["", f"### Seed {entry.get('seed')}: A/A noise check at 60M", ""] + aa_lines(entry["aa"])
+        if entry.get("ab"):
+            lines += ["", f"### Seed {entry.get('seed')}: prior best versus this commit at 60M", ""]
+            lines += ab_lines(entry["ab"], entry.get("aa"), prior.get("sha"), result.get("sha"))
         staged = entry.get("timing_run") or run
         if staged.get("ss_timing"):
-            lines += [""] + stage_lines(staged, "Stage timings from one extra run with `SS_TIMING=1`")
+            lines += ["", f"### Seed {entry.get('seed')}: stages at 60M", ""]
+            lines += stage_lines(staged, "Stage timings from one extra run with `SS_TIMING=1`")
+        if (entry.get("prior_timing_run") or {}).get("ss_timing"):
+            lines += ["", "<details><summary>Stage timings of the prior best</summary>", ""]
+            lines += stage_lines(entry["prior_timing_run"], "Prior best, one extra run with `SS_TIMING=1`") + ["", "</details>"]
     return "\n".join(lines) + "\n"
 
 

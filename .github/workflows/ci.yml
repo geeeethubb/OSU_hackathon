@@ -214,10 +214,13 @@ jobs:
     timeout-minutes: 90
     env:
       SEED_60M: ${{ inputs.seed_60m || '2' }}
+      PAIRS: ${{ inputs.pairs || '6' }}
+      PAIR_BUDGET_S: ${{ inputs.pair_budget_s || '300' }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0   # bench/BEST_SHA may name any earlier commit
       - name: Disk space (60M events is about 5.7 GB of CSV)
         run: |
           df -h / "$RUNNER_TEMP"
@@ -249,12 +252,22 @@ jobs:
         run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
       - name: Build diagnostics image
         run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
+      - name: Build prior-best image (bench/BEST_SHA)
+        id: prior
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: bash bench/build_prior.sh ss-prior:latest
       - name: Benchmark (60M events)
+        env:
+          PRIOR_IMAGE: ${{ steps.prior.outputs.image }}
+          PRIOR_SHA: ${{ steps.prior.outputs.sha }}
+          PRIOR_STATUS: ${{ steps.prior.outputs.status }}
         run: |
           image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
           python3 bench/bench.py bench60m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
-            --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M"
+            --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M" \
+            --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" \
+            --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
       - name: Report
         if: always()
         run: |
