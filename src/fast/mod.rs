@@ -69,6 +69,9 @@ pub struct Ctx {
     pub category_names: Vec<Box<[u8]>>,
     pub unknown_category: u32,
     pub product_category: FastMap<Box<[u8]>, u32>,
+    /// Category by number for products written `p<number>` with no leading
+    /// zero, up to the largest such number in the file; `unknown` in the gaps.
+    pub category_by_product_number: Vec<u32>,
     /// Campaigns by index; the last one is `organic`.
     pub campaign_ids: Vec<Box<[u8]>>,
     pub campaign_channels: Vec<Box<[u8]>>,
@@ -132,6 +135,22 @@ impl Ctx {
         });
         let unknown_category = category_names.len() as u32;
         category_names.push((&b"unknown"[..]).into());
+        let mut category_by_product_number: Vec<u32> = Vec::new();
+        for (id, &category) in &product_category {
+            let digits = id.strip_prefix(b"p").unwrap_or(&[]);
+            let canonical = (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+            if !canonical {
+                continue;
+            }
+            let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+            // Bigger numbers than this stay in the hash map only.
+            if number < (1 << 22) {
+                if category_by_product_number.len() <= number {
+                    category_by_product_number.resize(number + 1, unknown_category);
+                }
+                category_by_product_number[number] = category;
+            }
+        }
 
         let campaigns = fs::read(data.join("campaigns.csv"))?;
         let mut campaign_ids: Vec<Box<[u8]>> = Vec::new();
@@ -181,6 +200,7 @@ impl Ctx {
             category_names,
             unknown_category,
             product_category,
+            category_by_product_number,
             campaign_ids,
             campaign_channels,
             campaign_index,

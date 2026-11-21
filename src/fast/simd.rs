@@ -492,9 +492,7 @@ pub unsafe fn event_row_fast<const MODE: u32>(
         let price = field(c5 + 1 + q6, length - c5 - 1 - 2 * q6);
         match parse_price(price) {
             Some(price) => {
-                let product = field(c4 + 1 + q5, product_length);
-                let category = ctx.product_category.get(product).copied().unwrap_or(ctx.unknown_category);
-                purchase = Some((price, category));
+                purchase = Some((price, product_category(ctx, p.add(c4 + 1 + q5), product_length)));
             }
             None => valid = false,
         }
@@ -522,24 +520,48 @@ pub unsafe fn event_row_fast<const MODE: u32>(
     (length, ROW_EMIT)
 }
 
-/// `c_` followed by 1 to 7 digits with no leading zero, as its number;
-/// `None` for any other text.
+/// The number written as 1 to 7 ASCII digits with no leading zero at `p`;
+/// `None` for any other text of that length.
 #[inline(always)]
-unsafe fn campaign_number(p: *const u8, length: usize) -> Option<usize> {
-    let digits = length.wrapping_sub(2);
-    if digits.wrapping_sub(1) >= 7 || (p as *const u16).read_unaligned() != u16::from_le_bytes(*b"c_") {
+unsafe fn small_number(p: *const u8, digits: usize) -> Option<usize> {
+    if digits.wrapping_sub(1) >= 7 {
         return None;
     }
     // Digits at the top of the word, zero-filled below, then the usual
     // 8-digit multiply reduction.
-    let values = (read_u64(p.add(2)) ^ 0x3030_3030_3030_3030) << ((8 - digits) * 8);
+    let values = (read_u64(p) ^ 0x3030_3030_3030_3030) << ((8 - digits) * 8);
     let not_digit = (values.wrapping_add(0x7676_7676_7676_7676) | values) & 0x8080_8080_8080_8080;
-    if not_digit != 0 || *p.add(2) == b'0' {
+    if not_digit != 0 || *p == b'0' {
         return None;
     }
     let pairs = (values.wrapping_mul(10) + (values >> 8)) & 0x00FF_00FF_00FF_00FF;
     let fours = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_FFFF_0000_FFFF;
     Some((fours.wrapping_mul(10_000) + (fours >> 32)) as u32 as usize)
+}
+
+/// `c_<number>` as its number; `None` for any other text.
+#[inline(always)]
+unsafe fn campaign_number(p: *const u8, length: usize) -> Option<usize> {
+    if length < 3 || (p as *const u16).read_unaligned() != u16::from_le_bytes(*b"c_") {
+        return None;
+    }
+    small_number(p.add(2), length - 2)
+}
+
+/// The category of a purchase's product: a direct table for IDs written
+/// `p<number>`, the exact map for anything else.
+#[inline(always)]
+unsafe fn product_category(ctx: &Ctx, p: *const u8, length: usize) -> u32 {
+    if length >= 2 && *p == b'p' {
+        if let Some(number) = small_number(p.add(1), length - 1) {
+            if number < ctx.category_by_product_number.len() {
+                // The table holds every product written this way, so a miss is `unknown`.
+                return *ctx.category_by_product_number.get_unchecked(number);
+            }
+        }
+    }
+    let product = std::slice::from_raw_parts(p, length);
+    ctx.product_category.get(product).copied().unwrap_or(ctx.unknown_category)
 }
 
 /// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
