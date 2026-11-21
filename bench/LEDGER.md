@@ -425,3 +425,55 @@ official_receipt_and_score: not yet submitted
 - **Next, by expected size:** session work fused into the winner scan (sessions agent), fewer
   instructions per row in the event and click parsers (two agents), links resolved per user range in
   parallel (links agent), fixed costs (exit without teardown work, output overlapped with the index pass).
+
+### 21:30 UTC
+
+- **Isolation of the last candidates (EPYC 7763, 4 vCPU, against `2dae9298`):** candidate C2 (`a67dad3`,
+  run 44949386535) lost every pair: -17.0 / -9.9 / -10.8 ms (0/18), 60M -19.0 ms. The same tree without
+  the parser step `c890351` (branch `cand-t1`, run 44950017407): +8.5 / +1.3 / +4.2 ms (12/18 pairs;
+  inside the A/A range, so "not slower, gain not demonstrated"). The parser step (lean kernel in two
+  halves run out of step, own store loop) is therefore a measured regression of about 15 to 20 ms on this
+  CPU although the laptop liked it; it is reverted on the PR branch (`0d6ac6a`). 2^15-event partitions
+  at the 60M scale only (`exp-shift60`, run 44947867416): +4.6 ms at 60M, 4/6 pairs: no effect, dropped.
+- **Elapsed critical path, measured** (run 44950017407, one instrumented run, seed 2; AMD EPYC 7763,
+  4 logical CPUs = 2 cores x 2 threads, --cpus 4; these are elapsed times, not summed worker times):
+
+  | step | elapsed ms | what finishes last / what waits |
+  |---|---:|---|
+  | container before and after the process | 104.3 | a no-op container on this runner: 73.8, so 30.5 is this process starting and exiting |
+  | startup (manifest, event files mapped, keys) | 3.9 | serial |
+  | link parse, lookup tables loaded beside it | 15.8 | all threads on links; one thread on the tables |
+  | parse stage | 457.6 | parse workers finish at 436.7; the link builder had finished at 208.7 and its summary thread 82 ms later: nobody waits for links; then the click index, 20.9, all threads |
+  | odd events, complex clicks | 2.5 | serial, small |
+  | index pass | 228.7 | partitions done at 217.9 (all threads); joining edge runs 0.2 (serial); edge runs incl. the five whales 10.5 (one thread per whale) |
+  | general-path remainder | 2.0 | all threads |
+  | output | 13.5 | all threads |
+  | in-process total | 723.9 | |
+
+  Parsing finishes last in its stage, sessions (the index pass) are the second block, links and output
+  are not on the critical path. Summed worker time for scale only: event parse 1,435, click parse 309,
+  index pass 867 (of which placing 131 and the session kernel 456), link builder 209 + 82 CPU-ms.
+- **Inferred, not measured:** the fit "official is about 0.17 s plus 0.57 of the CI time" rests on three
+  official scores with two decimals each; what part of the 0.17 s is container lifecycle on the scorer
+  is unknown. Not yet demonstrated: any 8-thread effect (the scorer's 4 cores x 2 threads cannot be
+  reproduced on a 2-core runner or on the 8-core laptop).
+- **Audit asked for: decode after dedup instead of before.** What must be decided at once for every row:
+  whether the line is malformed (field count, quote balance, empty event_id), because a malformed copy
+  never takes part in dedup; the event ID (which copy group) and ingest_ts (which copy wins). Everything
+  else (user, ts, type, product, price, the validity verdict) is needed only for the winning copy. Maximum
+  removable work: the non-winning rows only, i.e. the extra copies, 2 to 4% of events with 1 to 3 copies,
+  about 3 to 6% of rows, times the roughly 60% of a row's decode that could wait: 2 to 4% of the event
+  parse (about 8 to 15 ms of the 437 ms above) before paying for a second visit to each winning row,
+  which is a random access into the input (two cache lines per row) plus a second structure scan of that
+  row. Net effect not demonstrated and expected negative; no prototype.
+- **Buffered partition ownership:** the atomic direct-scatter result stands only against that
+  implementation. For a buffered owner design the test to pass first is the same harness with per-owner
+  batches; its upper bound is the placing pass plus the list writes it would replace, 131 CPU-ms of
+  placing and a part of the parse stores, about 35 to 60 ms elapsed on this runner. Not started.
+- **In CI now (this commit), candidate D against `2dae9298`:** the structural changes of cand-t1 plus
+  the links agent's `build_indexed` (`3bf5146`): links between two IDs of one user are resolved per user
+  in shards with no shared table, only users touched by other links go through the single table, and
+  the per-user summary comes out of the same pass (no summary thread). It runs on one thread beside the
+  parse. Laptop: link builder 100-130 + 25 ms before, 55-98 ms after (noisy machine). Laptop checks in
+  the scored configuration: 45 unit tests, 36/36, 43/43, dev, 20M seeds 2 and 3 and 60M MATCH, 24 small
+  generated datasets MATCH the reference pipeline.
