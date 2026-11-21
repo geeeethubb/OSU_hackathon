@@ -11,8 +11,6 @@
 //! without such keys simply runs through the general engine, and every use of
 //! an index is checked for the properties it relies on.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
 use super::codes::{CHAR_VALUE, P37};
 use crate::util::split_fields;
 
@@ -97,25 +95,34 @@ pub fn code37_of_value(value: u64) -> u64 {
 /// stands for is canonical (no leading zero) and the number fits 40 bits.
 #[inline]
 pub fn value_of_code37(code: u64) -> Option<u64> {
+    // The eight base-37 digits, most significant first. Every divisor is a
+    // constant, so no division instruction is involved.
+    let (high, low) = (code / 1_874_161, code % 1_874_161);
+    let digits = [
+        high / 50_653,
+        (high / 1_369) % 37,
+        (high / 37) % 37,
+        high % 37,
+        low / 50_653,
+        (low / 1_369) % 37,
+        (low / 37) % 37,
+        low % 37,
+    ];
     let mut value = 0u64;
-    let mut rest = code;
-    let mut first = true;
     let mut count = 0;
-    for power in (0..8).rev() {
-        let digit = rest / P37[power];
-        rest %= P37[power];
+    for digit in digits {
+        // Digit 0 is "no character": the text ends there.
         if digit == 0 {
             break;
         }
-        if first && digit == 1 && rest != 0 {
-            // A leading `0` followed by more characters.
-            return None;
-        }
-        first = false;
         value = value * 36 + (digit - 1);
         count += 1;
     }
-    (count > 0 && value <= MASK).then_some(value)
+    // Not canonical: no characters, or a leading `0` followed by more.
+    if count == 0 || (digits[0] == 1 && count > 1) {
+        return None;
+    }
+    (value <= MASK).then_some(value)
 }
 
 /// What the engine needs to read indexes out of IDs.
@@ -127,6 +134,9 @@ pub struct Keys {
     pub index_bound: u64,
     /// User indexes (`user number >> 9`) are below this.
     pub user_bound: u64,
+    /// Event indexes per index partition, as a shift (`SS_INDEX_SHIFT`,
+    /// 10 to 16; a partition's slot table should stay in the L2 cache).
+    pub index_shift: u32,
 }
 
 impl Keys {
@@ -144,13 +154,20 @@ impl Keys {
         ((number >> 9) < self.user_bound).then_some(number)
     }
 
-    /// The user index of a user's base-37 code, if the ID is a generated one.
+    /// The user number (`index * 512 + alias`) behind a user's base-37 code,
+    /// if the ID is a generated one.
     #[inline]
-    pub fn user_index_of_code(&self, code: u64) -> Option<u64> {
+    pub fn user_number_of_code(&self, code: u64) -> Option<u64> {
         if code >= super::codes::EXOTIC_BASE {
             return None;
         }
-        self.user_number(value_of_code37(code)?).map(|number| number >> 9)
+        self.user_number(value_of_code37(code)?)
+    }
+
+    /// The user index of a user's base-37 code, if the ID is a generated one.
+    #[inline]
+    pub fn user_index_of_code(&self, code: u64) -> Option<u64> {
+        self.user_number_of_code(code).map(|number| number >> 9)
     }
 
     /// The base-37 code of the ID with this user number.
@@ -160,102 +177,112 @@ impl Keys {
     }
 }
 
-/// Searches `candidates(i)` for `i` in `0..count` for the first number of
-/// the first sample; a key is accepted when every sample unscrambles to
-/// something `in_range` accepts. Returns the key if exactly one fits.
-fn search(
-    samples: &[u64],
-    count: u64,
-    threads: usize,
-    candidate: impl Fn(u64) -> u64 + Sync,
-    in_range: impl Fn(u64) -> bool + Sync,
-) -> Option<u64> {
-    let first = pre(samples[0]);
-    let rest: Vec<u64> = samples[1..].iter().map(|&sample| pre(sample)).collect();
-    let found = AtomicU64::new(0);
-    let several = AtomicBool::new(false);
-    let threads = threads.max(1) as u64;
-    std::thread::scope(|scope| {
-        for thread in 0..threads {
-            let (rest, found, several, candidate, in_range) = (&rest, &found, &several, &candidate, &in_range);
-            scope.spawn(move || {
-                let from = count * thread / threads;
-                let to = count * (thread + 1) / threads;
-                for at in from..to {
-                    let key = first ^ (candidate(at).wrapping_mul(MULTIPLIER_A) & MASK);
-                    // Almost every wrong key fails on the first other sample.
-                    if rest.iter().all(|&other| in_range((other ^ key).wrapping_mul(INVERSE_A) & MASK)) {
-                        // Keys are 40-bit; bit 63 marks "found".
-                        let marked = key | (1 << 63);
-                        let previous = found.swap(marked, Ordering::Relaxed);
-                        if previous != 0 && previous != marked {
-                            several.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
+/// The first `number` in `0..bound`, counting up in steps of one with
+/// `number * multiplier` as the anchor's pre-image, whose key makes every
+/// sample fit. `anchor` and `samples` are `pre` values; `fits` judges an
+/// unscrambled sample. Stops at the first key that fits: with a dozen
+/// samples a wrong key fits with a probability far below 2^-100, and a wrong
+/// key could only cost time, since every later use of an index is checked.
+fn first_key(anchor: u64, samples: &[u64], bound: u64, multiplier: u64, fits: impl Fn(u64) -> bool) -> Option<u64> {
+    let unscrambled = |sample: u64, key: u64| (sample ^ key).wrapping_mul(INVERSE_A) & MASK;
+    // The sample tried first: almost every wrong key fails on it.
+    let probe = *samples.iter().find(|&&sample| sample != anchor)?;
+    let mut product = 0u64;
+    for _ in 0..bound {
+        let key = anchor ^ product;
+        if fits(unscrambled(probe, key)) && samples.iter().all(|&sample| fits(unscrambled(sample, key))) {
+            return Some(key);
         }
-    });
-    let key = found.load(Ordering::Relaxed);
-    (key != 0 && !several.load(Ordering::Relaxed)).then_some(key & MASK)
+        product = product.wrapping_add(multiplier) & MASK;
+    }
+    None
 }
 
 /// Looks for the keys in the first lines of an events file. `event_bytes` is
 /// the total size of the event files (it bounds the number of events).
-pub fn recover(first_lines: &[u8], event_bytes: u64, threads: usize) -> Option<Keys> {
-    const WANTED: usize = 12;
-    let mut events: Vec<u64> = Vec::with_capacity(WANTED);
-    let mut users: Vec<u64> = Vec::with_capacity(WANTED);
-    // Skip the header; stop at the last complete line of the excerpt.
+///
+/// The search is cheap because of how the numbers are laid out. Most rows
+/// carry a user's first ID, whose number `index * 512` ends in nine zero
+/// bits; the scramble's first step keeps those zeros, so the low nine bits
+/// of such a row's pre-image are the user key's, and the row seen most often
+/// gives them away. The rest of the user key is found by counting the
+/// anchor's user index up from zero. Event indexes are handed out user by
+/// user, so the sample with the smallest user index has a small event index:
+/// counting up from zero reaches it quickly.
+pub fn recover(first_lines: &[u8], event_bytes: u64) -> Option<Keys> {
+    // (event pre-image, user pre-image) of every row whose IDs are canonical.
+    let mut samples: Vec<(u64, u64)> = Vec::new();
+    // Skip the header; the last line of the excerpt may be cut short, and a
+    // cut ID could still look canonical: leave it out.
     let mut lines = first_lines.split(|&byte| byte == b'\n');
     lines.next()?;
-    for line in lines {
-        if events.len() >= WANTED && users.len() >= WANTED {
+    let mut lines = lines.peekable();
+    while let Some(line) = lines.next() {
+        if lines.peek().is_none() {
             break;
         }
         let Some([event_id, user_id, ..]) = split_fields::<7>(line) else { continue };
-        if events.len() < WANTED && event_id.first() == Some(&b'e') {
-            if let Some(value) = base36_value(&event_id[1..]) {
-                if !events.contains(&value) {
-                    events.push(value);
-                }
-            }
+        if event_id.first() != Some(&b'e') || user_id.first() != Some(&b'u') {
+            continue;
         }
-        if users.len() < WANTED && user_id.first() == Some(&b'u') {
-            if let Some(value) = base36_value(&user_id[1..]) {
-                if !users.contains(&value) {
-                    users.push(value);
-                }
-            }
+        if let (Some(event), Some(user)) = (base36_value(&event_id[1..]), base36_value(&user_id[1..])) {
+            samples.push((pre(event), pre(user)));
         }
     }
-    if events.len() < 8 || users.len() < 8 {
+    if samples.len() < 16 {
         return None;
     }
     // No well-formed event row is shorter than about 50 bytes, and the
     // generator makes one user per 30 events (at least 20 users).
     let index_bound = event_bytes / 48 + 1024;
     let user_bound = index_bound / 8 + 64;
-    let event_key = search(&events, index_bound, threads, |index| index, |index| index < index_bound)?;
-    // Half of a person's rows use alias 0 and most people have under 8 IDs;
-    // try each of the first samples as the one with a small alias.
-    let mut user_key = None;
-    for pivot in 0..4 {
-        users.swap(0, pivot);
-        user_key = search(
-            &users,
-            user_bound * 8,
-            threads,
-            |at| ((at >> 3) << 9) | (at & 7),
-            |number| (number >> 9) < user_bound,
-        );
-        users.swap(0, pivot);
-        if user_key.is_some() {
-            break;
-        }
+
+    // The user key's low nine bits: the most frequent low bits of a pre-image.
+    let mut counts = [0u32; 512];
+    for &(_, user) in &samples {
+        counts[(user & 511) as usize] += 1;
     }
-    Some(Keys { event_key, user_key: user_key?, index_bound, user_bound })
+    let low = (0..512u64).max_by_key(|&bits| counts[bits as usize])?;
+    if (counts[low as usize] as usize) * 4 < samples.len() {
+        return None;
+    }
+    let users: Vec<u64> = samples.iter().map(|&(_, user)| user).collect();
+    let anchor = *users.iter().find(|&&user| user & 511 == low)?;
+    let user_fits = |number: u64| (number >> 9) < user_bound;
+    let user_key = first_key(anchor, &users, user_bound, 512u64.wrapping_mul(MULTIPLIER_A) & MASK, user_fits)?;
+
+    // The event of the smallest user index is the anchor of the event key.
+    let user_index = |user: u64| ((user ^ user_key).wrapping_mul(INVERSE_A) & MASK) >> 9;
+    let &(anchor, _) = samples.iter().min_by_key(|&&(_, user)| user_index(user))?;
+    let events: Vec<u64> = samples.iter().map(|&(event, _)| event).collect();
+    let event_key = first_key(anchor, &events, index_bound, MULTIPLIER_A & MASK, |index| index < index_bound)?;
+
+    // Index mode needs more than the keys: event indexes must be handed out
+    // user by user, so along the index order the user index never decreases.
+    // The engine checks that on every surviving event later and starts over
+    // if it fails; looking at the samples first means data that is laid out
+    // differently never gets that far. A few samples may break the order
+    // without harm (a late copy of an event can name another user and then
+    // loses the dedup), data without the layout breaks it at every other
+    // step: one in fifty is the line between the two.
+    let mut layout: Vec<(u64, u64)> = samples
+        .iter()
+        .map(|&(event, user)| ((event ^ event_key).wrapping_mul(INVERSE_A) & MASK, user_index(user)))
+        .collect();
+    layout.sort_unstable();
+    let backward = layout.windows(2).filter(|pair| pair[1].1 < pair[0].1).count();
+    if backward * 50 > layout.len() {
+        return None;
+    }
+    let index_shift = std::env::var("SS_INDEX_SHIFT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(DEFAULT_INDEX_SHIFT, |shift| shift.clamp(10, 16));
+    Some(Keys { event_key, user_key, index_bound, user_bound, index_shift })
 }
+
+/// 16,384 events per index partition: two words per slot make 256 KiB.
+pub const DEFAULT_INDEX_SHIFT: u32 = 14;
 
 #[cfg(test)]
 mod tests {
@@ -311,22 +338,37 @@ mod tests {
             out
         };
         for row in 0..40u64 {
-            let index = row * 7919 % 50_000;
-            let user = (row * 131 % 1_500) * 512 + row % 3;
+            let user_index = row * 131 % 1_500;
+            let index = user_index * 30 + row % 7;
+            let user = user_index * 512 + if row % 3 == 0 { row % 5 } else { 0 };
             text.extend_from_slice(b"e");
             text.extend_from_slice(&base36(scramble(index, event_key)));
             text.extend_from_slice(b",u");
             text.extend_from_slice(&base36(scramble(user, user_key)));
             text.extend_from_slice(b",1,2026-10-03T23:58:10Z,view,p1,\n");
         }
-        let keys = recover(&text, 4_000_000, 3).unwrap();
+        let keys = recover(&text, 4_000_000).unwrap();
         assert_eq!(keys.event_key, event_key);
         assert_eq!(keys.user_key, user_key);
+        // The same IDs with event indexes that do not follow the users: no index mode.
+        let mut shuffled = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+".to_vec();
+        for row in 0..40u64 {
+            let user_index = row * 131 % 1_500;
+            let index = row * 7919 % 50_000;
+            shuffled.extend_from_slice(b"e");
+            shuffled.extend_from_slice(&base36(scramble(index, event_key)));
+            shuffled.extend_from_slice(b",u");
+            shuffled.extend_from_slice(&base36(scramble(user_index * 512, user_key)));
+            shuffled.extend_from_slice(b",1,2026-10-03T23:58:10Z,view,p1,
+");
+        }
+        assert!(recover(&shuffled, 4_000_000).is_none());
         // IDs that do not come from one scramble have no key.
         let mut noise = b"h\n".to_vec();
         for row in 0..40u64 {
             noise.extend_from_slice(format!("e{row}x{},u{}q,1,2,view,p1,\n", row * 3, row * 5).as_bytes());
         }
-        assert!(recover(&noise, 4_000_000, 2).is_none());
+        assert!(recover(&noise, 4_000_000).is_none());
     }
 }
