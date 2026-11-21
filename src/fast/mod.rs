@@ -520,32 +520,19 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let (link_table, summary_thread, click_index) = std::thread::scope(|scope| {
+    let (link_table, click_index) = std::thread::scope(|scope| {
+        // The links are resolved beside the parse, on one thread. In index
+        // mode almost every link joins two IDs of one user, and those are
+        // done user by user with no shared table (`links::build_indexed`), a
+        // fraction of the work of the single table the general path builds.
         let builder = scope.spawn(|| {
             let started = Instant::now();
-            // Index mode sorts the link components by user index: a
-            // component inside one user index is simple.
             let table = match &ctx.keys {
-                Some(keys) => {
-                    links::build_grouped(&link_pairs, &ctx.user_ids, &|code| keys.user_index_of_code(code))
-                }
+                Some(keys) => links::build_indexed(&link_pairs, &ctx.user_ids, keys, 0),
                 None => links::build(&link_pairs, &ctx.user_ids),
             };
             link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            let table = std::sync::Arc::new(table);
-            // Index mode: what the table says per user index, flat. Only the
-            // index pass reads it, so it gets a thread of its own that may run
-            // on after the parse has ended: with eight parse threads the
-            // builder would otherwise be the last to finish.
-            let summary = ctx.keys.map(|keys| {
-                let table = std::sync::Arc::clone(&table);
-                std::thread::spawn(move || {
-                    let started = Instant::now();
-                    let summary = indexed::Summary::build(&keys, &table);
-                    (summary, started.elapsed())
-                })
-            });
-            (table, summary)
+            table
         });
         parallel(threads, |thread| {
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
@@ -616,8 +603,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             });
             (builder.finish(), started.elapsed())
         });
-        let (link_table, summary_thread) = builder.join().unwrap();
-        (link_table, summary_thread, click_index)
+        (builder.join().unwrap(), click_index)
     });
     let link_table: &links::LinkTable = &link_table;
     if let Some((_, spent)) = &click_index {
@@ -713,12 +699,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let kernels: Slots<Option<ScratchC>> = Slots::new(threads, || None);
 
     // Index mode: the winners of every index partition, in index order.
-    let link_summary = summary_thread.map(|thread| thread.join().unwrap());
-    if let Some((_, spent)) = &link_summary {
-        timing.detail("links_summary", spent.as_secs_f64() * 1e3);
-        timing.detail("links_summary_joined", timing.since_last());
-    }
-    if let (Some(keys), Some((summary, _)), Some((click_index, extras))) = (&ctx.keys, &link_summary, &index_state) {
+    if let (Some(keys), Some((click_index, extras))) = (&ctx.keys, &index_state) {
         let parts = parse::index_parts(keys);
         if std::env::var_os("SS_STATS").is_some() {
             let odd: usize = parse_out.iter().map(|out| out.odd_event_users.len()).sum();
@@ -728,7 +709,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         let shared = indexed::Shared {
             keys,
             links: link_table,
-            summary,
             clicks: click_index,
             extras,
             click_exotic: &click_exotic,
@@ -854,6 +834,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     write_tables(&ctx, output, threads, &c_out, &user_exotic)?;
     timing.stage("output");
     timing.total();
+    // Both tables are written and their files closed. Returning from here
+    // would hand a gigabyte of buffers back to the allocator piece by piece
+    // before the process ends; leaving at once lets the kernel take the
+    // whole address space back in one step. `SS_EXIT=drop` keeps the
+    // ordinary return, for comparison.
+    if !std::env::var_os("SS_EXIT").is_some_and(|value| value == "drop") {
+        std::process::exit(0);
+    }
     Ok(Attempt::Done)
 }
 

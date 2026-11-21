@@ -30,7 +30,7 @@ use super::arena::PartList;
 use super::codes::{unmix, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
-use super::links::LinkTable;
+use super::links::{LinkTable, SIMPLE, SLOW};
 use super::parse::CLICK_USERS;
 use super::sessions::{PassCOut, ScratchC};
 
@@ -298,87 +298,10 @@ impl Extras {
     }
 }
 
-/// Set in a user's summary: it has a simple link component, named by the
-/// code in the low bits, whose members' aliases are the bits of the mask.
-const SIMPLE: u64 = 1 << 63;
-/// Set in a user's summary: the two words cannot describe its IDs (a member
-/// of a complex component, two simple components, or an alias of 64 or
-/// more). Each of its IDs is then resolved through the link table.
-const SLOW: u64 = 1 << 62;
-
-/// What the link table says about each user index, flat and in the order
-/// the index pass visits the users, so that a run costs one read instead of
-/// one table probe per ID.
-pub struct Summary {
-    /// Per user index: `[name code | SIMPLE | SLOW, member alias mask]`.
-    /// All zero: none of the user's IDs is in a link component of two or
-    /// more, so each is a person of its own.
-    users: Vec<[u64; 2]>,
-}
-
-impl Summary {
-    pub fn build(keys: &Keys, links: &LinkTable) -> Self {
-        // Zeroed pages stay untouched for user indexes without links.
-        let mut users = vec![[0u64; 2]; keys.user_bound as usize];
-        let note = |users: &mut [[u64; 2]], [number, name, complex]: [u64; 3]| {
-            let entry = &mut users[(number >> 9) as usize];
-            let alias = number & (ALIASES - 1);
-            if complex != 0 || alias >= 64 {
-                entry[0] |= SLOW;
-            } else if entry[0] & SIMPLE == 0 {
-                entry[0] |= SIMPLE | name;
-                entry[1] |= 1 << alias;
-            } else if entry[0] & CODE_MASK == name {
-                entry[1] |= 1 << alias;
-            } else {
-                entry[0] |= SLOW;
-            }
-        };
-        // The members come in table order, so their users are all over the
-        // array: each one waits in a ring while its entry is on the way to
-        // the cache.
-        const AHEAD: usize = 32;
-        let mut ring = [[0u64; 3]; AHEAD];
-        let mut seen = 0usize;
-        links.for_each_member(|member, name, complex| {
-            // An ID that is not a generated one makes its component complex:
-            // the generated members of that component say so themselves.
-            let Some(number) = keys.user_number_of_code(member) else {
-                return;
-            };
-            #[cfg(target_arch = "x86_64")]
-            {
-                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                // SAFETY: a prefetch reads nothing, whatever the address;
-                // the index is in range anyway (`user_number_of_code`).
-                unsafe { _mm_prefetch(users.as_ptr().wrapping_add((number >> 9) as usize) as *const i8, _MM_HINT_T0) };
-            }
-            let at = seen % AHEAD;
-            if seen >= AHEAD {
-                note(&mut users, ring[at]);
-            }
-            ring[at] = [number, name, u64::from(complex)];
-            seen += 1;
-        });
-        // Order does not matter for the result: notes only set bits or
-        // compare names.
-        for waiting in &ring[..seen.min(AHEAD)] {
-            note(&mut users, *waiting);
-        }
-        Self { users }
-    }
-
-    #[inline(always)]
-    fn of(&self, user: u64) -> [u64; 2] {
-        self.users.get(user as usize).copied().unwrap_or([SLOW, 0])
-    }
-}
-
 /// What every thread reads while runs are processed.
 pub struct Shared<'a> {
     pub keys: &'a Keys,
     pub links: &'a LinkTable,
-    pub summary: &'a Summary,
     pub clicks: &'a ClickIndex,
     pub extras: &'a Extras,
     pub click_exotic: &'a [Box<[u8]>],
@@ -635,7 +558,8 @@ impl Runner {
     /// summary describes its IDs and nothing else joins the run.
     #[inline(always)]
     fn begin_direct(&mut self, shared: &Shared, user: u64) -> bool {
-        let [head, mask] = shared.summary.of(user);
+        // What the links say about this user's IDs, in one read.
+        let [head, mask] = shared.links.summary(user);
         if head & SLOW != 0 || shared.extras.of(user).is_some() {
             return false;
         }

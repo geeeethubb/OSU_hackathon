@@ -425,3 +425,112 @@ official_receipt_and_score: not yet submitted
 - **Next, by expected size:** session work fused into the winner scan (sessions agent), fewer
   instructions per row in the event and click parsers (two agents), links resolved per user range in
   parallel (links agent), fixed costs (exit without teardown work, output overlapped with the index pass).
+
+### 21:30 UTC
+
+- **Isolation of the last candidates (EPYC 7763, 4 vCPU, against `2dae9298`):** candidate C2 (`a67dad3`,
+  run 44949386535) lost every pair: -17.0 / -9.9 / -10.8 ms (0/18), 60M -19.0 ms. The same tree without
+  the parser step `c890351` (branch `cand-t1`, run 44950017407): +8.5 / +1.3 / +4.2 ms (12/18 pairs;
+  inside the A/A range, so "not slower, gain not demonstrated"). The parser step (lean kernel in two
+  halves run out of step, own store loop) is therefore a measured regression of about 15 to 20 ms on this
+  CPU although the laptop liked it; it is reverted on the PR branch (`0d6ac6a`). 2^15-event partitions
+  at the 60M scale only (`exp-shift60`, run 44947867416): +4.6 ms at 60M, 4/6 pairs: no effect, dropped.
+- **Elapsed critical path, measured** (run 44950017407, one instrumented run, seed 2; AMD EPYC 7763,
+  4 logical CPUs = 2 cores x 2 threads, --cpus 4; these are elapsed times, not summed worker times):
+
+  | step | elapsed ms | what finishes last / what waits |
+  |---|---:|---|
+  | container before and after the process | 104.3 | a no-op container on this runner: 73.8, so 30.5 is this process starting and exiting |
+  | startup (manifest, event files mapped, keys) | 3.9 | serial |
+  | link parse, lookup tables loaded beside it | 15.8 | all threads on links; one thread on the tables |
+  | parse stage | 457.6 | parse workers finish at 436.7; the link builder had finished at 208.7 and its summary thread 82 ms later: nobody waits for links; then the click index, 20.9, all threads |
+  | odd events, complex clicks | 2.5 | serial, small |
+  | index pass | 228.7 | partitions done at 217.9 (all threads); joining edge runs 0.2 (serial); edge runs incl. the five whales 10.5 (one thread per whale) |
+  | general-path remainder | 2.0 | all threads |
+  | output | 13.5 | all threads |
+  | in-process total | 723.9 | |
+
+  Parsing finishes last in its stage, sessions (the index pass) are the second block, links and output
+  are not on the critical path. Summed worker time for scale only: event parse 1,435, click parse 309,
+  index pass 867 (of which placing 131 and the session kernel 456), link builder 209 + 82 CPU-ms.
+- **Inferred, not measured:** the fit "official is about 0.17 s plus 0.57 of the CI time" rests on three
+  official scores with two decimals each; what part of the 0.17 s is container lifecycle on the scorer
+  is unknown. Not yet demonstrated: any 8-thread effect (the scorer's 4 cores x 2 threads cannot be
+  reproduced on a 2-core runner or on the 8-core laptop).
+- **Audit asked for: decode after dedup instead of before.** What must be decided at once for every row:
+  whether the line is malformed (field count, quote balance, empty event_id), because a malformed copy
+  never takes part in dedup; the event ID (which copy group) and ingest_ts (which copy wins). Everything
+  else (user, ts, type, product, price, the validity verdict) is needed only for the winning copy. Maximum
+  removable work: the non-winning rows only, i.e. the extra copies, 2 to 4% of events with 1 to 3 copies,
+  about 3 to 6% of rows, times the roughly 60% of a row's decode that could wait: 2 to 4% of the event
+  parse (about 8 to 15 ms of the 437 ms above) before paying for a second visit to each winning row,
+  which is a random access into the input (two cache lines per row) plus a second structure scan of that
+  row. Net effect not demonstrated and expected negative; no prototype.
+- **Buffered partition ownership:** the atomic direct-scatter result stands only against that
+  implementation. For a buffered owner design the test to pass first is the same harness with per-owner
+  batches; its upper bound is the placing pass plus the list writes it would replace, 131 CPU-ms of
+  placing and a part of the parse stores, about 35 to 60 ms elapsed on this runner. Not started.
+- **In CI now (this commit), candidate D against `2dae9298`:** the structural changes of cand-t1 plus
+  the links agent's `build_indexed` (`3bf5146`): links between two IDs of one user are resolved per user
+  in shards with no shared table, only users touched by other links go through the single table, and
+  the per-user summary comes out of the same pass (no summary thread). It runs on one thread beside the
+  parse. Laptop: link builder 100-130 + 25 ms before, 55-98 ms after (noisy machine). Laptop checks in
+  the scored configuration: 45 unit tests, 36/36, 43/43, dev, 20M seeds 2 and 3 and 60M MATCH, 24 small
+  generated datasets MATCH the reference pipeline.
+
+### 21:40 UTC
+
+```text
+candidate_full_sha: bb32616f718774d07b42c49d1a939c3ece637835  (candidate D; the commit to submit)
+baseline_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (official 0.64 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, Intel Xeon Platinum 8573C, 4 logical CPUs (2 cores x 2 threads), --cpus 4 --memory 13g; run 44951847559
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 45 unit tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 17/18 pairs won; +36.5 / +37.2 / +39.5 ms (medians 984.8 -> 951.3, 993.4 -> 954.9, 990.2 -> 948.6); each larger than every A/A difference of its seed
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,428.1 ms / 2.15 GiB; 74.0 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: link builder beside the parse 209 + 82 CPU-ms -> 101 ms on one thread (different runners, indicative only); fewer CPU-ms taken from the parse workers
+decision: keep; named as the commit to submit in the PR at 21:40 UTC
+official_receipt_and_score: not yet submitted
+```
+
+- **Experiment in CI:** candidate E (`5704266f417ff89b1d4d2627eb3188e706eb4e4e`: D plus the lean click
+  kernel, variant `SS_CLICK_KERNEL=general`); kill test 2 on branch `exp-scatter` (two-level
+  partitioning and one stream per owner against the lists). On the laptop both alternatives lose
+  (lists 42 to 115 ms, two-level 91 to 142 ms, owner streams 232 to 267 ms at 20M, 8 threads), but the
+  laptop has no huge pages; the Linux run decides.
+
+### 21:40 UTC
+
+- **Kill test 2, rejected (success line set beforehand: at least 25% less than "lists" at 20M and 60M):**
+  `bench/experiments/scatter2.rs` on branch `exp-scatter`, Linux runner (run 44952604559, EPYC 9V74,
+  4 logical CPUs, huge pages on request), elapsed ms, produce + rest = total, steady rounds:
+  | records | lists (today) | two levels (2^18-index streams, then a cache-resident second scatter) | one stream per owner, prefetched plain stores into one slot array |
+  |---|---|---|---|
+  | 20M | 67 + 23 = 90 | 64-78 + 54-71 = 118-158 | 69-76 + 198-203 = 268-274 |
+  | 60M | 286-344 + 71 = 358-415 | 187-204 + 169-171 = 355-374 | 206-212 + 611-623 = 817-830 |
+  Fewer streams do not make the producers faster at 20M (their cost is the fresh memory they write, not
+  the number of streams); at 60M they do (about 300 -> 190 ms) but the second scatter gives all of it
+  back. An exclusive owner with plain stores and prefetch is two to three times slower than placing in a
+  cache-resident table: the cache miss per record stays. With kill test 1 (atomic direct scatter, write
+  combining) this closes the question for records of this size: lists by 2^14-index partition and
+  in-cache placement stay.
+
+### 21:44 UTC
+
+```text
+candidate_full_sha: 5704266f417ff89b1d4d2627eb3188e706eb4e4e  (candidate E; the commit to submit)
+baseline_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (official 0.64 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, Intel Xeon 6975P-C, 4 logical CPUs (2 cores x 2 threads), --cpus 4 --memory 13g; run 44952308729
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 45 unit tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 18/18 pairs won; +56.3 / +67.1 / +55.9 ms (medians 869.9 -> 813.5, 880.1 -> 824.1, 859.8 -> 804.3); each larger than every A/A difference of its seed
+same-image variant (SS_CLICK_KERNEL=general): 18.2 / 21.5 / 16.2 ms slower, 0/18 pairs: the lean click kernel's own share
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,426.6 ms / see run; 176.6 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: candidate D (links per user in shards, overlapped startup) plus fewer instructions per click row
+decision: keep; named as the commit to submit in the PR at 21:45 UTC; bench/BEST_SHA moves to it
+official_receipt_and_score: not yet submitted
+```
