@@ -171,17 +171,24 @@ impl Ctx {
         let products = fs::read(data.join("products.csv"))?;
         let mut category_names: Vec<Box<[u8]>> = Vec::new();
         let mut category_index: FastMap<Box<[u8]>, u32> = HashMap::default();
-        let mut product_category: FastMap<Box<[u8]>, u32> = HashMap::default();
+        // A product line is at least a dozen bytes: room for all of them at once.
+        let mut product_category: FastMap<Box<[u8]>, u32> =
+            HashMap::with_capacity_and_hasher(products.len() / 12, Default::default());
         for_each_data_line(&products, |line| {
             if let Some([product, category]) = split_fields::<2>(line) {
                 if product.is_empty() {
                     return;
                 }
-                let next = category_names.len() as u32;
-                let at = *category_index.entry(category.into()).or_insert_with(|| {
-                    category_names.push(category.into());
-                    next
-                });
+                // Categories are few: look one up before making a key of it.
+                let at = match category_index.get(category) {
+                    Some(&at) => at,
+                    None => {
+                        let next = category_names.len() as u32;
+                        category_index.insert(category.into(), next);
+                        category_names.push(category.into());
+                        next
+                    }
+                };
                 product_category.entry(product.into()).or_insert(at);
             }
         });
@@ -370,10 +377,19 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
 fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::io::Result<Attempt> {
     let mut timing = Timing::new();
     let threads = threads.max(1);
-    let Some(mut ctx) = Ctx::load(data)? else {
+    // The input files are mapped while the lookup tables are read.
+    let (ctx, event_files, click_files, link_files) = std::thread::scope(|scope| {
+        let events = scope.spawn(|| map_all(&data.join("events")));
+        let clicks = scope.spawn(|| map_all(&data.join("clicks")));
+        let links = scope.spawn(|| map_all(&data.join("links")));
+        let ctx = Ctx::load(data);
+        (ctx, events.join().unwrap(), clicks.join().unwrap(), links.join().unwrap())
+    });
+    let Some(mut ctx) = ctx? else {
         return Ok(Attempt::Declined);
     };
-    let event_files = map_all(&data.join("events"))?;
+    let (event_files, click_files, link_files) = (event_files?, click_files?, link_files?);
+    timing.detail("startup_loaded", timing.since_last());
     let event_bytes: u64 = event_files.iter().map(|file| file.len() as u64).sum();
     ctx.size_partitions(event_bytes);
     if indexed {
@@ -387,8 +403,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         eprintln!("SS_TIMING note=keys {:x?}", ctx.keys);
     }
     let ctx = ctx;
-    let click_files = map_all(&data.join("clicks"))?;
-    let link_files = map_all(&data.join("links"))?;
     timing.stage("startup");
 
     // Links first: they are small, and resolving them can then overlap the
