@@ -31,6 +31,9 @@ on:
       variant_env:
         description: "bench-20m: also pair this commit against itself with extra environment, e.g. SS_FAST=0"
         default: ""
+      diag_envs:
+        description: "bench-20m: diagnostic runs (not ranked, not verified), comma-separated, e.g. SS_DIAG=7,SS_DIAG=8"
+        default: ""
       cold_run:
         description: "bench-20m: add one labelled run from a cold page cache"
         type: boolean
@@ -120,6 +123,7 @@ jobs:
     env:
       INPUT_SEEDS: ${{ inputs.seeds }}
       INPUT_VARIANT: ${{ inputs.variant_env }}
+      INPUT_DIAG: ${{ inputs.diag_envs }}
       VAR_SEEDS: ${{ vars.BENCH_SEEDS }}
       COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
       RUNS: ${{ inputs.runs || '3' }}
@@ -177,11 +181,15 @@ jobs:
           variant="$INPUT_VARIANT"
           [ -n "$variant" ] || variant=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[variant=\([^]]*\)\].*/\1/p' | head -n 1)
           [ -z "$variant" ] || echo "variant: $variant"
+          # Diagnostic runs: the run_workflow input, else [diag=NAME=VALUE,NAME=VALUE ...] in the commit message.
+          diag="$INPUT_DIAG"
+          [ -n "$diag" ] || diag=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[diag=\([^]]*\)\].*/\1/p' | head -n 1)
+          [ -z "$diag" ] || echo "diagnostic runs: $diag"
           python3 bench/bench.py bench20m --image "$image" --diag-image "$DIAG_IMAGE" \
             --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
             --out-json "$RUNNER_TEMP/evidence/bench-20m.json" \
             --seeds "$seeds" --runs "$RUNS" --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" $cold \
-            --variant-env "$variant" \
+            --variant-env "$variant" --diag-envs "$diag" \
             --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
       - name: Report
         if: always()
