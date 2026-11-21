@@ -403,3 +403,25 @@ official_receipt_and_score: not yet submitted
 - **If the reading holds, next:** links resolved per user range in parallel in index mode (pairs inside
   one user index never need the global union-find; only the few pairs that cross users do), and the
   click index built before the builder is waited for.
+
+### 21:11 UTC
+
+- **Official:** candidate C (`9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e`) scored **0.64 s**, the same as
+  `2dae9298` (relayed by the user). CI run 44948826448 (Xeon 8573C) had it at -1.4 / -13.3 / -0.8 ms
+  against `2dae9298` at 20M (within noise, 5/18 pairs) and 59.8 ms slower at 60M; all outputs MATCH.
+- **Hypothesis refuted:** "at 8 threads the link builder is the last to finish". The laptop's 8 threads
+  are 8 cores; the scorer's 8 hyperthreads are 4 cores, so its parse is about twice as fast as on a
+  4-vCPU runner, not four times, and the builder stays behind it. The summary thread and the overlapped
+  startup stay in the tree (they cost nothing), but they were not the limit.
+- **Model from the official scores so far** (0.71, 0.66, 0.64 s against 940, 890, 818 ms on the EPYC 7763
+  runner): official is about 0.17 s plus 0.57 of the CI container time; in other words a fixed part of
+  roughly 0.17 to 0.25 s (container lifecycle plus serial steps) and about half of the CI parallel work.
+  A CI gain of 74 ms arrived as 0.02 s.
+- **Checked and discarded:** rows inside an events file are not in event-index order (the index goes
+  back on half of the rows in every file looked at), so there is no order to use at parse time.
+- **Open experiments:** branch `cand-t1` (candidate C2 without the parser step `c890351`, to see whether
+  that step is the small Intel regression); candidate C2 (`a67dad3`, click index before the builder is
+  waited for); 2^15-event partitions at the 60M scale only (branch `exp-shift60`).
+- **Next, by expected size:** session work fused into the winner scan (sessions agent), fewer
+  instructions per row in the event and click parsers (two agents), links resolved per user range in
+  parallel (links agent), fixed costs (exit without teardown work, output overlapped with the index pass).
