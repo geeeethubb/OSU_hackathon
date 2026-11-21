@@ -695,6 +695,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let click_exotic = ctx.click_ids.snapshot();
     let user_exotic = ctx.user_ids.snapshot();
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
+    // Each thread's user_daily file, written while the rows are produced.
+    let sinks = UserSink::slots(&ctx, output, threads, &user_exotic);
     // The session kernels the index pass used, for the general pass after it.
     let kernels: Slots<Option<ScratchC>> = Slots::new(threads, || None);
 
@@ -723,7 +725,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         let next = AtomicUsize::new(0);
         parallel(threads, |thread| {
             // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
-            let (b, c, runner) = unsafe { (b_out.get(thread), c_out.get(thread), runners.get(thread)) };
+            let (b, c, runner, sink) =
+                unsafe { (b_out.get(thread), c_out.get(thread), runners.get(thread), sinks.get(thread)) };
             let mut lists: Vec<PartList> = Vec::with_capacity(indexed_lists.len());
             loop {
                 let part = next.fetch_add(1, Ordering::Relaxed);
@@ -733,6 +736,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 lists.clear();
                 lists.extend(indexed_lists.iter().map(|per_thread| per_thread[part]));
                 runner.partition(&shared, part, &lists, b, c);
+                sink.drain(c);
             }
         });
         timing.detail("index_partitions_done", timing.since_last());
@@ -757,7 +761,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         let next = AtomicUsize::new(0);
         parallel(threads, |thread| {
             // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
-            let (b, c, runner) = unsafe { (b_out.get(thread), c_out.get(thread), runners.get(thread)) };
+            let (b, c, runner, sink) =
+                unsafe { (b_out.get(thread), c_out.get(thread), runners.get(thread), sinks.get(thread)) };
             let mut pieces: Vec<&[indexed::Record]> = Vec::new();
             while let Some((user, records)) = chains.get(next.fetch_add(1, Ordering::Relaxed)) {
                 pieces.clear();
@@ -765,6 +770,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 runner.process_run(&shared, b, c, *user, &pieces);
             }
             runner.flush(c);
+            sink.drain(c);
         });
         {
             // SAFETY: no parallel phase is running; no other reference exists.
@@ -804,7 +810,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {
         // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
-        let (out, kernel) = unsafe { (c_out.get(thread), kernels.get(thread)) };
+        let (out, kernel, sink) = unsafe { (c_out.get(thread), kernels.get(thread), sinks.get(thread)) };
         let mut scratch = match kernel.take() {
             Some(mut kernel) => {
                 // The index pass has sized the output columns already.
@@ -825,13 +831,16 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             clicks.clear();
             clicks.extend(person_clicks.iter().map(|per_thread| per_thread[part]));
             sessions::sessions_partition(&ctx, part, &events, &clicks, &click_exotic, out, &mut scratch);
+            sink.drain(out);
         }
+        // No rows come after this: the thread's user_daily file is ended here.
+        sink.finish(out);
     });
     timing.stage("sessions");
 
     // Output: one user_daily file per thread, one campaign_daily file.
     let c_out = c_out.into_inner();
-    write_tables(&ctx, output, threads, &c_out, &user_exotic)?;
+    write_tables(&ctx, output, threads, &c_out, &mut sinks.into_inner(), &user_exotic)?;
     timing.stage("output");
     timing.total();
     // Both tables are written and their files closed. Returning from here
@@ -917,6 +926,208 @@ fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a [B
     Text::Short(1 + count)
 }
 
+/// The fields of a user_daily file with counts and sums of the given type.
+const fn user_daily_fields(integer: ColumnType) -> [(&'static str, ColumnType); 6] {
+    [
+        ("user_id", ColumnType::Str),
+        ("day", ColumnType::Date),
+        ("sessions", integer),
+        ("events", integer),
+        ("revenue_cents", integer),
+        ("top_category", ColumnType::OptStr),
+    ]
+}
+/// The counts and sums are INT32 unless one of them does not fit.
+static USER_DAILY_NARROW: [(&str, ColumnType); 6] = user_daily_fields(ColumnType::Int32);
+static USER_DAILY_WIDE: [(&str, ColumnType); 6] = user_daily_fields(ColumnType::Int64);
+
+/// One thread's user_daily file while its rows are still being produced.
+///
+/// A producer appends rows to its `PassCOut` and calls [`drain`](Self::drain)
+/// after each batch: every complete row group in the columns is written and
+/// removed, so the columns never hold more than a row group and a batch, and
+/// are encoded while they are in the cache, instead of holding the whole
+/// table until an output stage reads it back. [`finish`](Self::finish)
+/// writes what is left and ends the file. `SS_STREAM=0` turns both into
+/// no-ops; `write_tables` then writes user_daily after the last pass.
+///
+/// A count or sum that does not fit INT32 ends the thread's file before the
+/// row group that holds it, and the thread goes on in `part-NNN-wide.parquet`
+/// with INT64 columns. An I/O error does not stop the producer: the sink
+/// keeps it and drops the rows it is handed from then on, and `write_tables`
+/// returns it. A sink that is dropped before `finish` removes its files, so a
+/// run that starts over on the general path leaves nothing behind.
+struct UserSink<'a> {
+    ctx: &'a Ctx,
+    folder: std::path::PathBuf,
+    thread: usize,
+    user_exotic: &'a [Box<[u8]>],
+    gzip: &'a [&'a str],
+    /// `false` with `SS_STREAM=0`.
+    streaming: bool,
+    /// The file being written, once there is a row group for it.
+    writer: Option<GroupWriter<'static>>,
+    /// `writer` is the thread's second file, the one with INT64 columns.
+    is_wide: bool,
+    /// The files created so far, and whether `finish` has ended them.
+    files: Vec<std::path::PathBuf>,
+    finished: bool,
+    failure: Option<std::io::Error>,
+    /// For the `SS_TIMING` details: nanoseconds creating files and writing
+    /// row groups, and what the ended files hold.
+    create_nanos: u64,
+    rows_nanos: u64,
+    written: Written,
+}
+
+impl<'a> UserSink<'a> {
+    /// One sink per thread.
+    fn slots(ctx: &'a Ctx, output: &Path, threads: usize, user_exotic: &'a [Box<[u8]>]) -> Slots<Self> {
+        let streaming = !std::env::var_os("SS_STREAM").is_some_and(|value| value == "0");
+        let mut thread = 0;
+        Slots::new(threads, || {
+            thread += 1;
+            Self {
+                ctx,
+                folder: output.join("user_daily"),
+                thread: thread - 1,
+                user_exotic,
+                gzip: gzip_columns(&USER_DAILY_GZIP),
+                streaming,
+                writer: None,
+                is_wide: false,
+                files: Vec::new(),
+                finished: false,
+                failure: None,
+                create_nanos: 0,
+                rows_nanos: 0,
+                written: Written::default(),
+            }
+        })
+    }
+
+    /// Writes every complete row group in the row columns of `rows` to this
+    /// thread's file and removes those rows. The groups are taken from the
+    /// end, where the newest rows are: nothing is moved, and row order within
+    /// a table is free.
+    fn drain(&mut self, rows: &mut PassCOut) {
+        while self.streaming && rows.names.len() >= GROUP_ROWS {
+            self.take(rows, rows.names.len() - GROUP_ROWS);
+        }
+    }
+
+    /// Writes the rows that are left and ends the file. No rows may come
+    /// after it.
+    fn finish(&mut self, rows: &mut PassCOut) {
+        if !self.streaming {
+            return;
+        }
+        self.drain(rows);
+        if !rows.names.is_empty() {
+            self.take(rows, 0);
+        }
+        if self.failure.is_none() {
+            if let Err(error) = self.end() {
+                self.failure = Some(error);
+            }
+        }
+        self.finished = self.failure.is_none();
+    }
+
+    /// Writes `rows[start..]` as one row group and removes those rows.
+    fn take(&mut self, rows: &mut PassCOut, start: usize) {
+        if self.failure.is_none() {
+            let (started, creating) = (Instant::now(), self.create_nanos);
+            if let Err(error) = self.group(rows, start) {
+                self.failure = Some(error);
+            }
+            // Creating a file is counted on its own.
+            let spent = started.elapsed().as_nanos() as u64;
+            self.rows_nanos += spent.saturating_sub(self.create_nanos - creating);
+        }
+        rows.names.truncate(start);
+        rows.days.truncate(start);
+        rows.sessions.truncate(start);
+        rows.events.truncate(start);
+        rows.revenue.truncate(start);
+        rows.top_category.truncate(start);
+    }
+
+    fn group(&mut self, rows: &PassCOut, start: usize) -> std::io::Result<()> {
+        let (ctx, user_exotic, end) = (self.ctx, self.user_exotic, rows.names.len());
+        if self.writer.is_none() {
+            self.writer = Some(self.open()?);
+        }
+        if let Some(writer) = &mut self.writer {
+            if write_user_daily(ctx, writer, rows, start, end, user_exotic)? {
+                return Ok(());
+            }
+            // A count or sum over INT32. This file ends before the row group.
+            writer.abandon();
+        }
+        if self.is_wide {
+            return Err(std::io::Error::other("user_daily: a value does not fit INT64"));
+        }
+        if let Some(writer) = self.writer.take() {
+            let file = writer.finish()?;
+            self.add(file);
+        }
+        self.is_wide = true;
+        let mut writer = self.open()?;
+        if !write_user_daily(ctx, &mut writer, rows, start, end, user_exotic)? {
+            return Err(std::io::Error::other("user_daily: a value does not fit INT64"));
+        }
+        self.writer = Some(writer);
+        Ok(())
+    }
+
+    /// Creates the thread's next file.
+    fn open(&mut self) -> std::io::Result<GroupWriter<'static>> {
+        let started = Instant::now();
+        let (suffix, fields) = if self.is_wide { ("-wide", &USER_DAILY_WIDE) } else { ("", &USER_DAILY_NARROW) };
+        fs::create_dir_all(&self.folder)?;
+        let path = self.folder.join(format!("part-{:03}{suffix}.parquet", self.thread));
+        let writer = GroupWriter::create(&path, fields)?.gzip(self.gzip);
+        self.files.push(path);
+        self.create_nanos += started.elapsed().as_nanos() as u64;
+        Ok(writer)
+    }
+
+    /// Ends the file. Thread 0 always has one, so that the folder holds a
+    /// table even when there are no rows at all.
+    fn end(&mut self) -> std::io::Result<()> {
+        if self.files.is_empty() && self.thread == 0 {
+            self.writer = Some(self.open()?);
+        }
+        if let Some(writer) = self.writer.take() {
+            let started = Instant::now();
+            let file = writer.finish()?;
+            self.rows_nanos += started.elapsed().as_nanos() as u64;
+            self.add(file);
+        }
+        Ok(())
+    }
+
+    fn add(&mut self, file: Written) {
+        self.written.bytes += file.bytes;
+        self.written.row_groups += file.row_groups;
+        self.written.write_nanos += file.write_nanos;
+    }
+}
+
+impl Drop for UserSink<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // The file is closed before it is removed: an open one cannot be
+            // removed on every system.
+            self.writer = None;
+            for path in self.files.drain(..) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// What the output stage did, summed over its threads; times in nanoseconds.
 /// Printed as `SS_TIMING` details, so that a run shows where the stage's
 /// time goes on the machine at hand.
@@ -935,24 +1146,83 @@ struct OutputStats {
     row_groups: AtomicU64,
 }
 
-/// Writes both tables. The threads share one list of work: the campaign
-/// table, then every worker's user_daily rows in row-group-sized pieces. A
-/// thread adds the pieces it takes to its own file, so the files come out
-/// about equally large and all threads finish together, whatever the split
-/// of rows between the workers of pass C was.
+/// Writes what is not written yet of the two tables.
+///
+/// Usually the sinks have written user_daily while its rows were produced:
+/// what is left is to return an error one of them met, and the campaign
+/// table. With `SS_STREAM=0` all rows are still in `workers` and both
+/// tables are written here.
 fn write_tables(
     ctx: &Ctx,
     output: &Path,
     threads: usize,
     workers: &[PassCOut],
+    sinks: &mut [UserSink],
     user_exotic: &[Box<[u8]>],
 ) -> std::io::Result<()> {
     let timing = Timing::new();
     let started = Instant::now();
-    fs::create_dir_all(output.join("user_daily"))?;
+    let streamed = sinks.iter().any(|sink| sink.streaming);
+    if !streamed {
+        fs::create_dir_all(output.join("user_daily"))?;
+    }
     fs::create_dir_all(output.join("campaign_daily"))?;
     timing.detail("output_mkdir", started.elapsed().as_secs_f64() * 1e3);
     let stats = OutputStats::default();
+    if streamed {
+        for sink in sinks.iter_mut() {
+            if let Some(error) = sink.failure.take() {
+                return Err(error);
+            }
+            if !sink.finished {
+                return Err(std::io::Error::other("user_daily: a thread's file was not ended"));
+            }
+            stats.create.fetch_add(sink.create_nanos, Ordering::Relaxed);
+            stats.rows.fetch_add(sink.rows_nanos, Ordering::Relaxed);
+            stats.write.fetch_add(sink.written.write_nanos, Ordering::Relaxed);
+            stats.user_daily_bytes.fetch_add(sink.written.bytes, Ordering::Relaxed);
+            stats.row_groups.fetch_add(sink.written.row_groups as u64, Ordering::Relaxed);
+        }
+        if workers.iter().any(|worker| !worker.names.is_empty()) {
+            return Err(std::io::Error::other("user_daily: rows were produced after a thread's file was ended"));
+        }
+        let started = Instant::now();
+        let written = write_campaign_daily(ctx, output, workers)?;
+        stats.campaign.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        stats.campaign_daily_bytes.fetch_add(written.bytes, Ordering::Relaxed);
+    } else {
+        write_tables_at_end(ctx, output, threads, workers, user_exotic, &stats)?;
+    }
+    if timing.enabled() {
+        let ms = |nanos: &AtomicU64| nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        timing.detail("cpu_output_create", ms(&stats.create));
+        timing.detail("cpu_output_encode", ms(&stats.rows) - ms(&stats.write));
+        timing.detail("cpu_output_write", ms(&stats.write));
+        timing.detail("cpu_output_campaign", ms(&stats.campaign));
+        eprintln!(
+            "SS_OUTPUT user_daily_bytes={} user_daily_row_groups={} campaign_daily_bytes={}",
+            stats.user_daily_bytes.load(Ordering::Relaxed),
+            stats.row_groups.load(Ordering::Relaxed),
+            stats.campaign_daily_bytes.load(Ordering::Relaxed),
+        );
+    }
+    Ok(())
+}
+
+/// Both tables from rows that are all still in `workers` (`SS_STREAM=0`).
+/// The threads share one list of work: the campaign table, then every
+/// worker's user_daily rows in row-group-sized pieces. A thread adds the
+/// pieces it takes to its own file, so the files come out about equally
+/// large and all threads finish together, whatever the split of rows
+/// between the workers of pass C was.
+fn write_tables_at_end(
+    ctx: &Ctx,
+    output: &Path,
+    threads: usize,
+    workers: &[PassCOut],
+    user_exotic: &[Box<[u8]>],
+    stats: &OutputStats,
+) -> std::io::Result<()> {
     let mut pieces: Vec<(&PassCOut, usize, usize)> = Vec::new();
     for worker in workers {
         let mut start = 0;
@@ -965,14 +1235,7 @@ fn write_tables(
     let gzip = gzip_columns(&USER_DAILY_GZIP);
     // Task 0 is the campaign table, task `n + 1` is piece `n`.
     let write = |integer: ColumnType, first_task: usize| -> std::io::Result<bool> {
-        let fields = [
-            ("user_id", ColumnType::Str),
-            ("day", ColumnType::Date),
-            ("sessions", integer),
-            ("events", integer),
-            ("revenue_cents", integer),
-            ("top_category", ColumnType::OptStr),
-        ];
+        let fields = user_daily_fields(integer);
         let next = AtomicUsize::new(first_task);
         let too_narrow = AtomicBool::new(false);
         let failure: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
@@ -1041,19 +1304,6 @@ fn write_tables(
     // every user_daily file is written again with INT64 columns.
     if !write(ColumnType::Int32, 0)? {
         write(ColumnType::Int64, 1)?;
-    }
-    if timing.enabled() {
-        let ms = |nanos: &AtomicU64| nanos.load(Ordering::Relaxed) as f64 / 1e6;
-        timing.detail("cpu_output_create", ms(&stats.create));
-        timing.detail("cpu_output_encode", ms(&stats.rows) - ms(&stats.write));
-        timing.detail("cpu_output_write", ms(&stats.write));
-        timing.detail("cpu_output_campaign", ms(&stats.campaign));
-        eprintln!(
-            "SS_OUTPUT user_daily_bytes={} user_daily_row_groups={} campaign_daily_bytes={}",
-            stats.user_daily_bytes.load(Ordering::Relaxed),
-            stats.row_groups.load(Ordering::Relaxed),
-            stats.campaign_daily_bytes.load(Ordering::Relaxed),
-        );
     }
     Ok(())
 }
