@@ -516,3 +516,21 @@ official_receipt_and_score: not yet submitted
   cache-resident table: the cache miss per record stays. With kill test 1 (atomic direct scatter, write
   combining) this closes the question for records of this size: lists by 2^14-index partition and
   in-cache placement stay.
+
+### 21:44 UTC
+
+```text
+candidate_full_sha: 5704266f417ff89b1d4d2627eb3188e706eb4e4e  (candidate E; the commit to submit)
+baseline_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (official 0.64 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, Intel Xeon 6975P-C, 4 logical CPUs (2 cores x 2 threads), --cpus 4 --memory 13g; run 44952308729
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 45 unit tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 18/18 pairs won; +56.3 / +67.1 / +55.9 ms (medians 869.9 -> 813.5, 880.1 -> 824.1, 859.8 -> 804.3); each larger than every A/A difference of its seed
+same-image variant (SS_CLICK_KERNEL=general): 18.2 / 21.5 / 16.2 ms slower, 0/18 pairs: the lean click kernel's own share
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,426.6 ms / see run; 176.6 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: candidate D (links per user in shards, overlapped startup) plus fewer instructions per click row
+decision: keep; named as the commit to submit in the PR at 21:45 UTC; bench/BEST_SHA moves to it
+official_receipt_and_score: not yet submitted
+```

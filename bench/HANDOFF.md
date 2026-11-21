@@ -9,7 +9,7 @@ Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewri
   `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e`). Earlier: 0.66 s `4567e9532f4019fbfd0e92908fd01cc49f24f67d`,
   0.71 s `2b2cccd1ba1cb12bc5a074a899ce54c868205b86`, 0.84 s `23b285da8246d00275b1ad191da0fffb8c5f81e4`.
   Official scores are relayed by the user's submission watch; nothing here submits.
-- `bench/BEST_SHA` = `2dae9298…`: every CI run pairs HEAD against it. Move it only to a commit with a
+- `bench/BEST_SHA` = `5704266f…` (candidate E, best in CI; not yet scored officially): every CI run pairs HEAD against it. Move it only to a commit with a
   confirmed paired win, and read the hash from git (`git rev-parse`), never from memory.
 - The PR description names the commit to submit. It must name a commit only after its CI run shows a
   paired win with all correctness checks; replace the pointer when a better one is confirmed.
@@ -77,8 +77,11 @@ Not allowed and not used: reconstructing rows from generator state, hard-coded s
 
 - `bb32616f718774d07b42c49d1a939c3ece637835` candidate D (structural changes + sharded links): CONFIRMED
   in run 44951847559 (+36.5 / +37.2 / +39.5 ms against `2dae9298`, 60M +74 ms); named in the PR since 21:40.
-- `5704266f417ff89b1d4d2627eb3188e706eb4e4e` candidate E (D + lean click kernel; variant = old click
-  kernel), CI started 21:35.
+- `5704266f417ff89b1d4d2627eb3188e706eb4e4e` candidate E (D + lean click kernel): CONFIRMED in run
+  44952308729 (+56.3 / +67.1 / +55.9 ms against `2dae9298`, 18/18 pairs; 60M +176.6 ms); named in the PR
+  since 21:45 and now the commit in `bench/BEST_SHA`. Not yet submitted officially.
+- Next candidate (local, not pushed): E + leaving the process right after the output is written
+  (`SS_EXIT=drop` is the variant to pair against).
 
 ## Working rules that cost time when forgotten
 
