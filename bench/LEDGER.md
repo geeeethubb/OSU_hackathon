@@ -477,3 +477,26 @@ official_receipt_and_score: not yet submitted
   parse. Laptop: link builder 100-130 + 25 ms before, 55-98 ms after (noisy machine). Laptop checks in
   the scored configuration: 45 unit tests, 36/36, 43/43, dev, 20M seeds 2 and 3 and 60M MATCH, 24 small
   generated datasets MATCH the reference pipeline.
+
+### 21:40 UTC
+
+```text
+candidate_full_sha: bb32616f718774d07b42c49d1a939c3ece637835  (candidate D; the commit to submit)
+baseline_full_sha: 2dae9298f4e1e0a5259eec54c400501b00fae26f  (official 0.64 s)
+default_command_and_env: /pipeline, no environment variable
+CPU_topology / limits: GitHub runner, Intel Xeon Platinum 8573C, 4 logical CPUs (2 cores x 2 threads), --cpus 4 --memory 13g; run 44951847559
+input_size / seeds / cache_state: 20M events + 5M clicks, seeds 2, 3, 5; input page cache warm
+36_official / extra / unit_differential / 1M_dev: 36/36 / 43/43 / 45 unit tests / MATCH
+20M_raw_pairs / paired_median / A_A_variation: 17/18 pairs won; +36.5 / +37.2 / +39.5 ms (medians 984.8 -> 951.3, 993.4 -> 954.9, 990.2 -> 948.6); each larger than every A/A difference of its seed
+60M_correctness / container_ms / peak_memory: MATCH /reference / 2,428.1 ms / 2.15 GiB; 74.0 ms faster than the baseline, 6/6 pairs
+selected_route / fallback_count: index mode on every generated dataset; no restart
+changed_stage_and_hypothesis: link builder beside the parse 209 + 82 CPU-ms -> 101 ms on one thread (different runners, indicative only); fewer CPU-ms taken from the parse workers
+decision: keep; named as the commit to submit in the PR at 21:40 UTC
+official_receipt_and_score: not yet submitted
+```
+
+- **Experiment in CI:** candidate E (`5704266f417ff89b1d4d2627eb3188e706eb4e4e`: D plus the lean click
+  kernel, variant `SS_CLICK_KERNEL=general`); kill test 2 on branch `exp-scatter` (two-level
+  partitioning and one stream per owner against the lists). On the laptop both alternatives lose
+  (lists 42 to 115 ms, two-level 91 to 142 ms, owner streams 232 to 267 ms at 20M, 8 threads), but the
+  laptop has no huge pages; the Linux run decides.
