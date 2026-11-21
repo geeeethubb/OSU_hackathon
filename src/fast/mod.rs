@@ -435,8 +435,11 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     // clicks need them, links do not), the input files are mapped, and the
     // links are parsed, so that resolving them starts as early as it can and
     // overlaps the whole of the much longer event parse.
-    let (tables, click_files, front) = std::thread::scope(|scope| {
-        let tables = scope.spawn(|| Ctx::load_tables(data));
+    let (tables, click_files, front, startup_spent) = std::thread::scope(|scope| {
+        let tables = scope.spawn(|| {
+            let started = Instant::now();
+            (Ctx::load_tables(data), started.elapsed())
+        });
         let clicks = scope.spawn(|| map_all(&data.join("clicks")));
         let links = scope.spawn(|| map_all(&data.join("links")));
         let front = (|| -> std::io::Result<_> {
@@ -455,7 +458,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             }
             let link_files = links.join().unwrap()?;
             timing.stage("startup");
+            let started = Instant::now();
             let parse_out: Slots<ParseOut> = Slots::new(threads, || ParseOut::new(&ctx));
+            let buffers_spent = started.elapsed();
             let mut link_tasks = Vec::new();
             chunk_tasks(Kind::Links, &link_files, LINK_CHUNK, &mut link_tasks);
             let next = AtomicUsize::new(0);
@@ -472,11 +477,20 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                     std::mem::take(&mut unsafe { parse_out.get(thread) }.links)
                 })
                 .collect();
-            Ok((event_files, parse_out, link_pairs))
+            Ok((event_files, parse_out, link_pairs, buffers_spent, started.elapsed() - buffers_spent))
         })();
-        (tables.join().unwrap(), clicks.join().unwrap(), front)
+        let front_done = Instant::now();
+        let (tables, tables_spent) = tables.join().unwrap();
+        (tables, clicks.join().unwrap(), front, (tables_spent, front_done.elapsed()))
     });
-    let (event_files, parse_out, link_pairs) = front?;
+    let (event_files, parse_out, link_pairs, buffers_spent, link_rows_spent) = front?;
+    // What the stage before the parse is made of (diagnostics): the workers'
+    // output buffers, the link rows, and the lookup tables on their own
+    // thread, with how long the others then waited for them.
+    timing.detail("startup_buffers", buffers_spent.as_secs_f64() * 1e3);
+    timing.detail("startup_link_rows", link_rows_spent.as_secs_f64() * 1e3);
+    timing.detail("startup_tables", startup_spent.0.as_secs_f64() * 1e3);
+    timing.detail("startup_tables_waited", startup_spent.1.as_secs_f64() * 1e3);
     let Some(tables) = tables? else {
         return Ok(Attempt::Declined);
     };
