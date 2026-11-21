@@ -84,7 +84,13 @@ fn place(lists: &[PartList], scratch: &mut ScratchI) -> bool {
                 if first || ((word1 >> 1) & INGEST_MASK) < ((scratch.slots[slot][1] >> 1) & INGEST_MASK) {
                     scratch.occupied[slot >> 6] |= bit;
                     scratch.slots[slot] = [word0, word1];
-                    scratch.purchases[slot] = purchase;
+                    // Only a purchase writes its word: every reader looks at
+                    // `purchases[slot]` only when the slot's winner has the
+                    // purchase bit, and that winner wrote it here. What an
+                    // earlier winner or partition left is never read.
+                    if has_purchase == 1 {
+                        scratch.purchases[slot] = purchase;
+                    }
                     any = true;
                 }
             }
