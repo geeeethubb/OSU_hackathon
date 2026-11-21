@@ -15,7 +15,10 @@ use std::hint::select_unpredictable;
 
 use super::codes::id_code;
 use super::keys::{unscramble, MASK as NUMBER_MASK};
+use super::arena::{Arena, PartWriter};
+use super::codes::mix;
 use super::parse::{emit_indexed, emit_raw, ClickRecord, EventRow, ParseOut};
+use super::EVENT_BLOCK;
 use super::Ctx;
 use crate::util::{civil_from_days, parse_price, parse_ts, DAY_MS, LATE_MS, WEEK_MS};
 
@@ -1021,7 +1024,7 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
     window_length: u64,
     p: *const u8,
     front: *const LeanFront,
-    out: &mut ParseOut,
+    sink: &LeanSink,
     row: &mut EventRow,
 ) -> (usize, u32) {
     const DECLINE: (usize, u32) = (0, ROW_DECLINE);
@@ -1150,17 +1153,82 @@ pub unsafe fn event_lean_back<const MODE: u32, const INDEXED: bool>(
             }
         }
         let status =
-            event_lean_finish::<MODE, INDEXED>(out, row, front.event, front.user, ts, valid, ingest_seconds, purchase);
+            event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, purchase);
         return (length, status);
     }
-    (length, event_lean_finish::<MODE, INDEXED>(out, row, front.event, front.user, ts, valid, ingest_seconds, None))
+    (length, event_lean_finish::<MODE, INDEXED>(sink, row, front.event, front.user, ts, valid, ingest_seconds, None))
+}
+
+/// Where the lean kernel stores event records: the writers of the mode's
+/// partitions and the arena, looked up once per chunk instead of through
+/// `ParseOut` for every row.
+pub struct LeanSink {
+    writers: *mut PartWriter,
+    arena: *mut Arena,
+    /// General mode: the shift from a mixed code to its partition. Index
+    /// mode: the shift from an index to its partition.
+    shift: u32,
+}
+
+impl LeanSink {
+    #[inline(always)]
+    pub fn new<const INDEXED: bool>(out: &mut ParseOut) -> Self {
+        if INDEXED {
+            Self { writers: out.indexed.as_mut_ptr(), arena: &mut out.arena, shift: out.index_shift }
+        } else {
+            Self { writers: out.events.as_mut_ptr(), arena: &mut out.arena, shift: out.event_shift }
+        }
+    }
+
+    /// One event record, word for word what `emit_raw` (general mode) and
+    /// `emit_indexed` (index mode) store for the same row; the test
+    /// `whole_files_in_chunks` holds the two together.
+    ///
+    /// # Safety
+    /// The sink's `ParseOut` must not have been used since `new`; in index
+    /// mode `event` must be an index below the keys' bound.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn store<const INDEXED: bool>(
+        &self,
+        event: u64,
+        ts: u64,
+        valid: u64,
+        user: u64,
+        user_is_number: u64,
+        ingest: u64,
+        purchase: Option<(u32, u32)>,
+    ) {
+        let (part, key) = if INDEXED {
+            (event >> self.shift, ((event & ((1u64 << self.shift) - 1)) << 48) | (user_is_number << 32))
+        } else {
+            let mixed = mix(event);
+            (mixed >> self.shift, mixed << 32)
+        };
+        let word0 = key | (ts << 1) | valid;
+        let word1 = (user << 22) | (ingest << 1);
+        let writer = &mut *self.writers.add(part as usize);
+        match purchase {
+            None => {
+                let at = writer.reserve(&mut *self.arena, EVENT_BLOCK, 2);
+                *at = word0;
+                *at.add(1) = word1;
+            }
+            Some((price, category)) => {
+                let at = writer.reserve(&mut *self.arena, EVENT_BLOCK, 3);
+                *at = word0;
+                *at.add(1) = word1 | 1;
+                *at.add(2) = u64::from(price) | (u64::from(category) << 32);
+            }
+        }
+    }
 }
 
 /// Stores (or hands back) what the lean kernel read.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
-    out: &mut ParseOut,
+    sink: &LeanSink,
     row: &mut EventRow,
     event_code: u64,
     user_code: u64,
@@ -1176,20 +1244,15 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
     // Index mode: the user of a valid row is its user number.
     let user_is_number = INDEXED & valid;
     if MODE == MODE_STORE {
-        if INDEXED {
-            emit_indexed(
-                out,
-                event_code,
-                ts,
-                u64::from(valid),
-                user_code,
-                u64::from(user_is_number),
-                ingest_seconds as u64,
-                purchase,
-            );
-        } else {
-            emit_raw(out, event_code, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
-        }
+        sink.store::<INDEXED>(
+            event_code,
+            ts,
+            u64::from(valid),
+            user_code,
+            u64::from(user_is_number),
+            ingest_seconds as u64,
+            purchase,
+        );
         return ROW_DONE;
     }
     if MODE == MODE_ROW {
@@ -1252,8 +1315,9 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
     let (lean, window_length) = lean_setup(ctx);
     let mut front = std::mem::MaybeUninit::<LeanFront>::uninit();
     event_lean_front::<INDEXED>(ctx, lean, p, front.as_mut_ptr());
+    let sink = LeanSink::new::<INDEXED>(out);
     let (length, status) =
-        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, front.as_ptr(), out, row);
+        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, front.as_ptr(), &sink, row);
     if status == ROW_DECLINE {
         #[cfg(test)]
         DECLINED.with(|count| count.set(count.get() + 1));

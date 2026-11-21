@@ -410,7 +410,8 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
     out: &mut ParseOut,
 ) -> usize {
     use super::simd::{
-        event_lean_back, event_lean_front, event_lean_masks, lean_setup, LeanFront, LEAN_PAD, ROW_DECLINE,
+        event_lean_back, event_lean_front, event_lean_masks, lean_setup, LeanFront, LeanSink, LEAN_PAD,
+        ROW_DECLINE,
     };
     let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(LEAN_PAD));
     let (lean, window_length) = lean_setup(ctx);
@@ -428,17 +429,20 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
         std::hint::black_box(row.event);
         return position;
     }
-    let mut fronts = [std::mem::MaybeUninit::<LeanFront>::uninit(); 2];
-    let mut which = 0;
+    // Two records, each row's first half in turn in one and in the other.
+    // Their address goes through `black_box` so that they stay in memory:
+    // the second half then takes its operands from there.
+    let mut records = [std::mem::MaybeUninit::<LeanFront>::uninit(); 2];
+    let record_a = std::hint::black_box(records.as_mut_ptr() as *mut LeanFront);
+    let record_b = record_a.wrapping_add(1);
     if MODE == 3 {
         // Diagnostic: first halves only.
         while position < stop {
             // SAFETY: as below.
             unsafe {
-                event_lean_front::<INDEXED>(ctx, lean, base.add(position), fronts[0].as_mut_ptr());
-                let front = &*fronts[0].as_ptr();
-                row.event ^= front.fold();
-                position += front.guess + 1;
+                event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a);
+                row.event ^= (*record_a).fold();
+                position += (*record_a).guess + 1;
             }
         }
         std::hint::black_box(row.event);
@@ -448,28 +452,35 @@ fn events_lean_loop<const MODE: u32, const INDEXED: bool>(
         // SAFETY (all of this loop): `position < stop` leaves LEAN_PAD
         // readable bytes after it; a first half reads at most 132 bytes from
         // where it is run, which is `position` or at most 97 bytes past it.
-        unsafe { event_lean_front::<INDEXED>(ctx, lean, base.add(position), fronts[which].as_mut_ptr()) };
+        // The sink is made anew after every use of `out`.
+        let sink = LeanSink::new::<INDEXED>(out);
+        unsafe { event_lean_front::<INDEXED>(ctx, lean, base.add(position), record_a) };
         loop {
-            let p = unsafe { base.add(position) };
-            let current = fronts[which].as_ptr();
-            let guess = unsafe { (*current).guess };
-            let (length, status) = unsafe {
-                event_lean_front::<INDEXED>(ctx, lean, p.add(guess + 1), fronts[which ^ 1].as_mut_ptr());
-                event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, current, out, &mut row)
-            };
-            if status == ROW_DECLINE {
-                position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
-                continue 'restart;
+            // One row with its record in `$current`, the next row's in `$next`.
+            macro_rules! row {
+                ($current:expr, $next:expr) => {{
+                    let p = unsafe { base.add(position) };
+                    let guess = unsafe { (*$current).guess };
+                    let (length, status) = unsafe {
+                        event_lean_front::<INDEXED>(ctx, lean, p.add(guess + 1), $next);
+                        event_lean_back::<MODE, INDEXED>(ctx, lean, window_length, p, $current, &sink, &mut row)
+                    };
+                    if status == ROW_DECLINE {
+                        position = event_row_declined::<MODE, INDEXED>(ctx, buffer, position, out);
+                        continue 'restart;
+                    }
+                    if length != guess {
+                        position = row_end_elsewhere(position, length);
+                        continue 'restart;
+                    }
+                    position += guess + 1;
+                    if position >= stop {
+                        break 'restart;
+                    }
+                }};
             }
-            if length != guess {
-                position = row_end_elsewhere(position, length);
-                continue 'restart;
-            }
-            position += guess + 1;
-            which ^= 1;
-            if position >= stop {
-                break 'restart;
-            }
+            row!(record_a, record_b);
+            row!(record_b, record_a);
         }
     }
     // Diagnostic modes fold their work into `row.event`; keep it alive.
