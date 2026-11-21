@@ -32,7 +32,7 @@ use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::{LinkTable, SIMPLE, SLOW};
 use super::parse::CLICK_USERS;
-use super::sessions::{PassCOut, Person, ScratchC};
+use super::sessions::{PassCOut, Person, ScratchC, Sessions};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -373,10 +373,22 @@ pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<Chain>> {
 /// the partitions set aside (index order).
 pub type Chain = (u64, Vec<Vec<Record>>);
 
+/// The main person of a run read straight from the slots, as the session
+/// kernel has it: in its batch, or on its own.
+#[derive(Clone, Copy)]
+enum Open {
+    Batch(Person),
+    Alone(Sessions),
+}
+
 /// One thread's state for the index pass.
 pub struct Runner {
     place: ScratchI,
     kernel: ScratchC,
+    /// Whether the main persons of direct runs go to the session kernel in
+    /// batches. `SS_BATCH=0` does them one at a time instead, for A/B runs:
+    /// the same rows either way.
+    batched: bool,
     /// Per alias: the run that resolved it last, and what it resolved to
     /// (the person's name code, with `COMPLEX` for a complex component).
     aliases: Vec<[u64; 2]>,
@@ -414,6 +426,7 @@ impl Runner {
         Self {
             place: ScratchI::new(index_shift),
             kernel,
+            batched: !std::env::var_os("SS_BATCH").is_some_and(|value| value == "0"),
             aliases: vec![[0; 2]; ALIASES as usize],
             run: 0,
             records: Vec::new(),
@@ -456,6 +469,26 @@ impl Runner {
         if !any {
             return;
         }
+        if self.batched {
+            self.read::<true>(shared, part, b_out, c_out);
+        } else {
+            self.read::<false>(shared, part, b_out, c_out);
+        }
+        if let Some(started) = started {
+            self.total_nanos += started.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// The runs of the partition whose records `place` has laid out: the
+    /// main persons of direct runs join the session kernel's batch
+    /// (`BATCHED`) or are done one at a time.
+    fn read<const BATCHED: bool>(
+        &mut self,
+        shared: &Shared,
+        part: usize,
+        b_out: &mut PassBOut,
+        c_out: &mut PassCOut,
+    ) {
         let mut current = u64::MAX;
         let mut edge = Edge { part, first_user: u64::MAX, first: Vec::new(), last_user: u64::MAX, last: Vec::new() };
         let mut records = std::mem::take(&mut self.records);
@@ -466,9 +499,11 @@ impl Runner {
         let mut run_start = 0usize;
         // A run read straight from the slots, once its main person has an
         // event: that person's aliases (0 before that, and in every other
-        // kind of run) and the person as the session kernel's batch has it.
+        // kind of run) and the person as the session kernel has it, in its
+        // batch (`person`) or on its own (`alone`).
         let mut main = 0u64;
         let mut person = Person::default();
+        let mut alone = Sessions::default();
         let slot_count = self.place.slots.len();
         let mut slot = 0usize;
         while slot < slot_count {
@@ -476,25 +511,47 @@ impl Runner {
                 // The main person's next events, for as long as nothing else
                 // comes: its sessions grow as the slots are read, and its
                 // timestamps are never collected.
-                let (start, meta, bought) = self.kernel.batch_scratch();
+                let place = &self.place;
                 // `number >> 6` of this user's IDs with an alias below 64.
                 let user_bits = current << 3;
-                while slot < slot_count {
-                    let [word0, word1] = self.place.slots[slot];
-                    let occupied = self.place.occupied[slot >> 6] >> (slot & 63);
+                // Timestamp and purchase bit of a slot that is occupied and
+                // holds a valid event of a generated user ID under one of
+                // the main person's aliases.
+                let event_at = |slot: usize| {
+                    let [word0, word1] = place.slots[slot];
+                    let occupied = place.occupied[slot >> 6] >> (slot & 63);
                     let number = word1 >> 22;
-                    // Occupied, valid, a generated user ID, one of the main person's aliases.
                     let ours = occupied & word0 & (word0 >> 32) & (main >> (number & 63)) & 1;
-                    if ours == 0 || number >> 6 != user_bits {
-                        break;
+                    (ours != 0 && number >> 6 == user_bits).then_some(((word0 >> 1) & TS_MASK, word1 & 1))
+                };
+                if BATCHED {
+                    let (start, meta, bought) = self.kernel.batch_scratch();
+                    while slot < slot_count {
+                        let Some((ts, is_purchase)) = event_at(slot) else {
+                            break;
+                        };
+                        if !person.add(start, meta, ts as u32) {
+                            break;
+                        }
+                        if is_purchase == 1 {
+                            person.purchase(bought, place.purchases[slot]);
+                        }
+                        slot += 1;
                     }
-                    if !person.add(start, meta, ((word0 >> 1) & TS_MASK) as u32) {
-                        break;
+                } else {
+                    let (start, count) = self.kernel.session_scratch();
+                    while slot < slot_count {
+                        let Some((ts, is_purchase)) = event_at(slot) else {
+                            break;
+                        };
+                        if !alone.add(start, count, ts as u32) {
+                            break;
+                        }
+                        if is_purchase == 1 {
+                            self.purchases.push([ts, place.purchases[slot]]);
+                        }
+                        slot += 1;
                     }
-                    if word1 & 1 == 1 {
-                        person.purchase(bought, self.place.purchases[slot]);
-                    }
-                    slot += 1;
                 }
                 if slot == slot_count {
                     break;
@@ -533,7 +590,8 @@ impl Runner {
                         self.process_run(shared, b_out, c_out, current, &[&records]);
                         records.clear();
                     } else {
-                        self.finish_direct(shared, c_out, current, main, person);
+                        let open = if BATCHED { Open::Batch(person) } else { Open::Alone(alone) };
+                        self.finish_direct(shared, c_out, current, main, open);
                     }
                     gathering = !self.begin_direct(shared, user);
                     main = 0;
@@ -559,30 +617,44 @@ impl Runner {
                 self.others.push([number, (ts << 1) | is_purchase, purchase]);
                 continue;
             }
-            if main == 0 {
-                if self.kernel.batch_is_full() {
-                    self.finish_batch(shared, c_out);
+            let in_order = if main == 0 {
+                if BATCHED {
+                    if self.kernel.batch_is_full() {
+                        self.finish_batch(shared, c_out);
+                    }
+                    person = self.kernel.begin_person(c_out, shared.click_exotic, ts as u32);
+                } else {
+                    alone = Sessions::begin(self.kernel.session_scratch().0, ts as u32);
                 }
-                person = self.kernel.begin_person(c_out, shared.click_exotic, ts as u32);
                 main = self.main_mask;
-            } else {
+                true
+            } else if BATCHED {
                 let (start, meta, _) = self.kernel.batch_scratch();
-                if !person.add(start, meta, ts as u32) {
-                    // The run is not in time order, so its main person cannot
-                    // be done this way. Nothing of the run has left this
-                    // runner or the batch: it is read again as records, and
-                    // goes through `process_run` like the runs the summary
-                    // cannot describe.
+                person.add(start, meta, ts as u32)
+            } else {
+                let (start, count) = self.kernel.session_scratch();
+                alone.add(start, count, ts as u32)
+            };
+            if !in_order {
+                // The run is not in time order, so its main person cannot be
+                // done this way. Nothing of the run has left this runner or
+                // the batch: it is read again as records, and goes through
+                // `process_run` like the runs the summary cannot describe.
+                if BATCHED {
                     self.kernel.abort_person(person);
-                    self.regather(run_start, this, &mut records);
-                    records.push([word0, word1, purchase]);
-                    gathering = true;
-                    main = 0;
-                    continue;
                 }
+                self.regather(run_start, this, &mut records);
+                records.push([word0, word1, purchase]);
+                gathering = true;
+                main = 0;
+                continue;
             }
             if is_purchase == 1 {
-                person.purchase(self.kernel.batch_scratch().2, purchase);
+                if BATCHED {
+                    person.purchase(self.kernel.batch_scratch().2, purchase);
+                } else {
+                    self.purchases.push([ts, purchase]);
+                }
             }
         }
         if current != u64::MAX {
@@ -594,7 +666,7 @@ impl Runner {
                     // The last run was read straight from the slots, and
                     // nothing of it has left this runner or the batch: read
                     // it again as records.
-                    if main != 0 {
+                    if BATCHED && main != 0 {
                         self.kernel.abort_person(person);
                     }
                     self.regather(run_start, slot_count, &mut records);
@@ -610,9 +682,6 @@ impl Runner {
         if !c_out.names.is_empty() {
             // A thread handles about `parts / threads` partitions like this one.
             self.kernel.reserve_rows(c_out, c_out.names.len() * shared.parts / shared.threads * 3 / 2);
-        }
-        if let Some(started) = started {
-            self.total_nanos += started.elapsed().as_nanos() as u64;
         }
     }
 
@@ -665,19 +734,34 @@ impl Runner {
     }
 
     /// Ends a run read straight from the slots: its main person (`main` are
-    /// its aliases, 0 if it has no event, and `person` is what the batch
-    /// has of it), then the persons of its other IDs.
-    fn finish_direct(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64, main: u64, person: Person) {
+    /// its aliases, 0 if it has no event, and `open` is what the session
+    /// kernel has of it), then the persons of its other IDs.
+    fn finish_direct(&mut self, shared: &Shared, c_out: &mut PassCOut, user: u64, main: u64, open: Open) {
         if main != 0 {
             let name =
                 if self.main_name != 0 { self.main_name } else { shared.keys.code_of_user_number(self.main_number) };
             self.inline_persons += 1;
-            self.inline_events += person.events();
             let clicks = shared.clicks.of(user).iter().filter_map(|click| {
                 let alias = click[0] >> 32;
                 (alias < 64 && (main >> alias) & 1 != 0).then_some([click[0] & 0xFFFF_FFFF, click[1]])
             });
-            self.kernel.end_person(person, name, clicks);
+            match open {
+                Open::Batch(person) => {
+                    self.inline_events += person.events();
+                    self.kernel.end_person(person, name, clicks);
+                }
+                Open::Alone(sessions) => {
+                    self.inline_events += u64::from(sessions.events());
+                    self.clicks.clear();
+                    self.clicks.extend(clicks);
+                    let started = self.measure.then(std::time::Instant::now);
+                    let (purchases, clicks) = (&self.purchases, &self.clicks);
+                    self.kernel.finish_sessions(sessions, c_out, shared.click_exotic, name, purchases, clicks);
+                    if let Some(started) = started {
+                        self.kernel_nanos += started.elapsed().as_nanos() as u64;
+                    }
+                }
+            }
         }
         if !self.others.is_empty() {
             // Rare: IDs of one user that no link joins are separate persons.
