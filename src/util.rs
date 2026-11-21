@@ -264,6 +264,19 @@ impl Timing {
         self.last = now;
     }
 
+    /// Milliseconds since the previous stage ended.
+    pub fn since_last(&self) -> f64 {
+        self.last.elapsed().as_secs_f64() * 1e3
+    }
+
+    /// Reports a diagnostic that is not a wall-clock stage (summed thread
+    /// time, or work that overlaps a stage), so stage lines still add up.
+    pub fn detail(&self, name: &str, milliseconds: f64) {
+        if self.enabled {
+            eprintln!("SS_TIMING detail={} ms={:.3}", name, milliseconds);
+        }
+    }
+
     pub fn total(&self) {
         if self.enabled {
             eprintln!("SS_TIMING stage=total ms={:.3}", self.start.elapsed().as_secs_f64() * 1e3);

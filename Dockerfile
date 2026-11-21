@@ -7,7 +7,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # A fully static binary: nothing to load at start, and it runs on the scorer's
 # read-only root filesystem with no libraries in the image.
-ENV RUSTFLAGS="-C target-feature=+crt-static"
+# x86-64-v3: the engine uses AVX2/BMI2 directly (the scorers are Cascade Lake or newer).
+ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && mkdir /out \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline \

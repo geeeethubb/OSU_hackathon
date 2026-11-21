@@ -17,21 +17,25 @@ pub mod arena;
 pub mod codes;
 pub mod io;
 pub mod links;
+pub mod dedup;
 pub mod parse;
-pub mod passes;
+pub mod sessions;
+pub mod simd;
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::BuildHasherDefault;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use self::arena::PartList;
 use self::codes::Interner;
 use self::io::Mapped;
 use self::parse::{ClickRecord, ParseOut};
-use self::passes::{PassBOut, PassCOut, ScratchB, ScratchC, NO_CATEGORY};
+use self::dedup::{PassBOut, ScratchB};
+use self::sessions::{PassCOut, ScratchC, NO_CATEGORY};
 use crate::parquet::{self, Column, OptStrColumn, StrColumn};
 use crate::reference::{list_csv, FastHasher};
 use crate::util::{for_each_data_line, parse_manifest, split_fields, Timing, DAY_MS};
@@ -73,6 +77,16 @@ pub struct Ctx {
     pub event_ids: Interner,
     pub user_ids: Interner,
     pub click_ids: Interner,
+    #[cfg(target_arch = "x86_64")]
+    pub ts_tables: simd::TsTables,
+    /// Use the AVX2 row parsers (`SS_FAST=0` turns them off, for A/B runs).
+    pub fast_rows: bool,
+    /// Run the general parser next to every fast-parsed row and compare (`SS_VERIFY=1`).
+    pub verify: bool,
+    /// Diagnostic builds of the parse stage (`SS_DIAG`): 1 parses rows but
+    /// does not store them, 2 only walks row boundaries. Nothing is written
+    /// in either mode; they exist to see where parse time goes.
+    pub diag: u32,
     fallback: AtomicBool,
 }
 
@@ -153,6 +167,11 @@ impl Ctx {
             event_ids: Interner::default(),
             user_ids: Interner::default(),
             click_ids: Interner::default(),
+            #[cfg(target_arch = "x86_64")]
+            ts_tables: simd::TsTables::new(window_start),
+            fast_rows: !std::env::var_os("SS_FAST").is_some_and(|value| value == "0"),
+            verify: std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1"),
+            diag: std::env::var("SS_DIAG").ok().and_then(|value| value.parse().ok()).unwrap_or(0),
             fallback: AtomicBool::new(false),
         }))
     }
@@ -264,23 +283,80 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
     let mut tasks = Vec::new();
     chunk_tasks(Kind::Events, &event_files, EVENT_CHUNK, &mut tasks);
     chunk_tasks(Kind::Clicks, &click_files, EVENT_CHUNK, &mut tasks);
+    if std::env::var_os("SS_PRETOUCH").is_some_and(|value| value == "1") {
+        // Diagnostic only: fault every input page in first, so the parse stage
+        // that follows shows parsing without first-touch costs.
+        let next = AtomicUsize::new(0);
+        let checksum = AtomicU64::new(0);
+        parallel(threads, |_| {
+            let mut sum = 0u64;
+            while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                let files = if task.kind == Kind::Events { &event_files } else { &click_files };
+                let bytes = &files[task.file].bytes()[task.start..task.end];
+                let full = std::env::var_os("SS_PRETOUCH_FULL").is_some();
+                if full {
+                    for chunk in bytes.chunks_exact(8) {
+                        sum = sum.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+                    }
+                } else {
+                    for at in (0..bytes.len()).step_by(4096) {
+                        sum = sum.wrapping_add(u64::from(bytes[at]));
+                    }
+                }
+            }
+            checksum.fetch_add(sum, Ordering::Relaxed);
+        });
+        timing.detail("pretouch_checksum", (checksum.load(Ordering::Relaxed) % 1000) as f64);
+        timing.stage("pretouch");
+    }
     let next = AtomicUsize::new(0);
+    let measure = timing.enabled();
+    // Summed worker time per kind of task, in nanoseconds (diagnostics only).
+    let event_nanos = AtomicU64::new(0);
+    let click_nanos = AtomicU64::new(0);
+    let link_build_nanos = AtomicU64::new(0);
     let link_table = std::thread::scope(|scope| {
-        let builder = scope.spawn(|| links::build(&link_pairs, &ctx.user_ids));
+        let builder = scope.spawn(|| {
+            let started = Instant::now();
+            let table = links::build(&link_pairs, &ctx.user_ids);
+            link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            table
+        });
         parallel(threads, |thread| {
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
             let out = unsafe { parse_out.get(thread) };
+            let (mut events_spent, mut clicks_spent) = (0u64, 0u64);
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                let started = measure.then(Instant::now);
                 if task.kind == Kind::Events {
                     parse::parse_events_chunk(&ctx, event_files[task.file].bytes(), task.start, task.end, out);
                 } else {
                     parse::parse_clicks_chunk(&ctx, click_files[task.file].bytes(), task.start, task.end, out);
                 }
+                if let Some(started) = started {
+                    let spent = started.elapsed().as_nanos() as u64;
+                    if task.kind == Kind::Events {
+                        events_spent += spent;
+                    } else {
+                        clicks_spent += spent;
+                    }
+                }
             }
+            event_nanos.fetch_add(events_spent, Ordering::Relaxed);
+            click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
         });
+        timing.detail("parse_workers_done", timing.since_last());
         builder.join().unwrap()
     });
+    timing.detail("cpu_parse_events", event_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("cpu_parse_clicks", click_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+    timing.detail("links_build", link_build_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.stage("parse");
+    if ctx.diag != 0 {
+        eprintln!("SS_DIAG={}: parse-only diagnostic, no output written", ctx.diag);
+        timing.total();
+        std::process::exit(3);
+    }
     if ctx.fallback.load(Ordering::Relaxed) {
         return Ok(false);
     }
@@ -305,9 +381,9 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
             if at < PARTS {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
-                passes::dedup_partition(&link_table, &lists, out, &mut scratch);
+                dedup::dedup_partition(&link_table, &lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - PARTS) {
-                passes::map_clicks(&link_table, batch, out);
+                dedup::map_clicks(&link_table, batch, out);
             } else {
                 break;
             }
@@ -340,7 +416,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
             events.extend(person_events.iter().map(|per_thread| per_thread[part]));
             clicks.clear();
             clicks.extend(person_clicks.iter().map(|per_thread| per_thread[part]));
-            passes::sessions_partition(&ctx, part, &events, &clicks, &click_exotic, out, &mut scratch);
+            sessions::sessions_partition(&ctx, part, &events, &clicks, &click_exotic, out, &mut scratch);
         }
     });
     timing.stage("sessions");
