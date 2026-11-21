@@ -128,3 +128,29 @@ known so far is 1.38 s for `e4eef020`).
   same engine plus the fix, paired against `16bc175b`, with the 60M run). The fix changes two constants,
   so the expected paired difference is noise.
 - **Next:** the inline index path continues on branch `exp-index-inline` (default path untouched).
+
+### 18:58 UTC
+
+- **Best verified candidate, and the commit to submit:** `2ff7868fc861348db3e2d918e550ec1eb664bcf1`
+  (`16bc175b` plus the timestamp day-range fix). CI run 44936865073: 36/36, 43/43, dev MATCH, 23/23 runs
+  MATCH on seeds 2, 3 and 5; no measurable speed difference from `16bc175b` (-2.8 / +3.1 / +3.0 ms);
+  60M 2,777 ms, MATCH, peak 2.61 GiB.
+- **In CI now, next candidate (this commit):** the general path with three agent branches merged:
+  a lean event kernel for regular rows in front of the general one (parser agent; laptop, one thread,
+  input pre-faulted: 28.2 -> 21.2 ns per event row) and eight differential tests of every fast kernel
+  against the general parsers; link forest with 8-byte nodes at any size (links agent; laptop
+  links_build 105 -> 90 ms at 20M, 420 -> 309 ms at 60M); writer errors instead of panics, output timing
+  details and fewer allocations (output agent). Laptop checks on the merged tree with SS_VERIFY=1:
+  37 unit tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH. Laptop, 4 alternating pairs, input
+  pre-faulted, seed 2: parse stage 132 to 168 ms before, 101 to 117 ms after.
+- **In CI now, experiment:** `146a333` on branch `exp-index-inline`: index mode with the inline session
+  path as a same-image variant (SS_STRUCT=1). Laptop: dedup + indexed + sessions 125 to 130 ms against
+  180 to 186 ms on the general path, but its parse stage is 45 to 60 ms slower here; whether that is
+  real work or a small-page effect of this Windows laptop is the question for the Linux runner.
+- **Tried and learned:** the reviewer's two link experiments are measured (links agent): counting
+  merges instead of scanning buys nothing measurable (the scan was 2 ms of a 180 ms build at 60M); probing
+  the forest itself halves the build but makes dedup about 45% slower (a hit needs a second dependent
+  load), so it is not kept. A range-check audit of the fast parsers found no second bug.
+- **Current limiting work:** parse, then dedup forward (one link lookup and one scatter per event).
+- **Next experiment:** read both CI runs; if index mode wins on Linux, make it the default in a
+  candidate of its own; in parallel the parser agent continues toward 15 ns per row (tile experiment).
