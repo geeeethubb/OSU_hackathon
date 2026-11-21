@@ -447,6 +447,11 @@ impl Extras {
                 }
             }
         }
+        // In time order: merged into its user's run that way, an extra does
+        // not put the run's events out of order.
+        for (_, records) in extras.by_user.values_mut() {
+            records.sort_by_key(|record| (record[0] >> 1) & TS_MASK);
+        }
         extras
     }
 
@@ -939,8 +944,9 @@ impl Runner {
         }
         if !self.others.is_empty() {
             // Rare: IDs of one user that no link joins are separate persons.
+            // The sort keeps each one's events in the order they came.
             let mut others = std::mem::take(&mut self.others);
-            others.sort_unstable_by_key(|other| other[0]);
+            others.sort_by_key(|other| other[0]);
             let mut from = 0;
             while from < others.len() {
                 let number = others[from][0];
@@ -980,6 +986,11 @@ impl Runner {
     /// them), given in pieces and in any order, each ID resolved through the
     /// link table: each simple person in it goes to the session kernel,
     /// events of complex components go to their persons' partitions.
+    ///
+    /// The user's extras are merged in by time. In generated data the
+    /// pieces are in time order, so every person's events then reach the
+    /// kernel in order and it does not have to order them; a whale with a
+    /// few odd-ID events used to cost a second pass over all its events.
     pub fn process_run(
         &mut self,
         shared: &Shared,
@@ -1002,33 +1013,32 @@ impl Runner {
         self.others.clear();
         // The first simple person met; codes are never 0.
         let mut first = 0u64;
-        for &[word0, word1, purchase] in pieces.iter().copied().chain(std::iter::once(extra)).flatten() {
-            let name = resolve(&mut self.aliases, self.run, shared, word1 >> 22);
-            let ts = (word0 >> 1) & TS_MASK;
-            let is_purchase = word1 & 1;
-            if name & COMPLEX != 0 {
-                forward_named(b_out, name & CODE_MASK, word0, is_purchase, purchase);
-                self.general_events += 1;
-                continue;
-            }
-            if first == 0 {
-                first = name;
-            }
-            if name == first {
-                self.ts.push(ts as u32);
-                if is_purchase == 1 {
-                    self.purchases.push([ts, purchase]);
+        // The extras not merged in yet; they are in time order.
+        let mut waiting = extra;
+        for piece in pieces {
+            for &record in *piece {
+                let ts = (record[0] >> 1) & TS_MASK;
+                while let Some((&early, rest)) = waiting.split_first() {
+                    if (early[0] >> 1) & TS_MASK >= ts {
+                        break;
+                    }
+                    self.sort_out(shared, b_out, &mut first, early);
+                    waiting = rest;
                 }
-            } else {
-                self.others.push([name, (ts << 1) | is_purchase, purchase]);
+                self.sort_out(shared, b_out, &mut first, record);
             }
+        }
+        for &late in waiting {
+            self.sort_out(shared, b_out, &mut first, late);
         }
         if first != 0 {
             self.person(shared, c_out, user, first);
             if !self.others.is_empty() {
-                // Rare: IDs of one user that no link joins are separate persons.
+                // Rare: IDs of one user that no link joins are separate
+                // persons. The sort keeps each one's events in the order
+                // they came, which is time order when the run's was.
                 let mut others = std::mem::take(&mut self.others);
-                others.sort_unstable_by_key(|other| other[0]);
+                others.sort_by_key(|other| other[0]);
                 let mut from = 0;
                 while from < others.len() {
                     let name = others[from][0];
@@ -1046,6 +1056,33 @@ impl Runner {
                 }
                 self.others = others;
             }
+        }
+    }
+
+    /// One event of the run `process_run` is reading: on to its person's
+    /// partition if its ID belongs to a complex component, to the events of
+    /// the first simple person met (`first`), or to the others'.
+    #[inline(always)]
+    fn sort_out(&mut self, shared: &Shared, b_out: &mut PassBOut, first: &mut u64, record: Record) {
+        let [word0, word1, purchase] = record;
+        let name = resolve(&mut self.aliases, self.run, shared, word1 >> 22);
+        let ts = (word0 >> 1) & TS_MASK;
+        let is_purchase = word1 & 1;
+        if name & COMPLEX != 0 {
+            forward_named(b_out, name & CODE_MASK, word0, is_purchase, purchase);
+            self.general_events += 1;
+            return;
+        }
+        if *first == 0 {
+            *first = name;
+        }
+        if name == *first {
+            self.ts.push(ts as u32);
+            if is_purchase == 1 {
+                self.purchases.push([ts, purchase]);
+            }
+        } else {
+            self.others.push([name, (ts << 1) | is_purchase, purchase]);
         }
     }
 
