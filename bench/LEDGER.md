@@ -281,3 +281,19 @@ official_receipt_and_score: not yet submitted
   answered by a bit test instead of a hash probe per run). Laptop checks with SS_VERIFY=1: 42 unit
   tests, 36/36, 43/43, dev and 20M seeds 2 and 3 MATCH; 16 small generated datasets and three mutated
   ones MATCH the reference pipeline.
+
+### 19:57 UTC
+
+- **In CI now (this commit), candidate B for the next submission, paired against the 0.66 s commit
+  `4567e9532f4019fbfd0e92908fd01cc49f24f67d`:** candidate A plus three agent steps, each verified by its
+  author and again on the merged tree:
+  - index-mode click path: the kernel reads the user number from the text and writes into the
+    per-user-range list (click agent, `4989f58`; laptop, one thread: 29.9 -> 21.2 ns per click row);
+  - lean event kernel v2: row end from the decode, range compares for the canonical-ID checks, a store
+    loop without a call on the common path (parser agent, `82182bb`; laptop, one thread, index mode:
+    25.3 -> 23.4 ns per row), with a whole-file differential test of the store loops in both modes;
+  - sessions from events in time order in one pass (sessions agent, `5cb6ad0`; about 20% of the
+    per-person kernel in its replay), called from the index pass.
+- **Laptop checks on the merged tree:** 43 unit tests; with SS_VERIFY=1 and without it: 36/36, 43/43, dev
+  and 20M seed 2 MATCH (seed 3 too, both ways); 24 small generated datasets and three mutated ones MATCH
+  the reference pipeline in the scored configuration.
