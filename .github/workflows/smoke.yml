@@ -1,0 +1,55 @@
+# Quick gate for the pipeline branch: the image builds for linux/amd64, passes
+# the 36 official fixtures with the scorer's docker flags, and matches the
+# published answer for the 1M-event dev set (seed 1).
+name: smoke
+on:
+  push:
+    branches: [pipeline]
+  workflow_dispatch:
+
+jobs:
+  docker-correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CPUS: "4"
+      MEM: 12g
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit and hardware
+        run: |
+          echo "commit: $GITHUB_SHA"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Flags' | cut -c1-400
+          free -g | head -2
+          docker version --format 'docker {{.Server.Version}}'
+      - name: Build image (linux/amd64)
+        run: docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+      - name: Python deps
+        run: python3 -m pip install --quiet polars
+      - name: 36 official fixtures (scorer flags)
+        run: python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Generator and dev answer from the track page
+        run: |
+          mkdir -p /tmp/track && cd /tmp/track
+          B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl -fsSL -A "Mozilla/5.0" -o generator.zip "$B/generator.zip"
+          curl -fsSL -A "Mozilla/5.0" -o dev-answer.zip "$B/dev-answer.zip"
+          unzip -q generator.zip && unzip -q dev-answer.zip
+          cd generator && cargo build --release
+      - name: Dev set (seed 1, 1M events, 250k clicks)
+        run: |
+          /tmp/track/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          du -sb /tmp/dev/events /tmp/dev/clicks /tmp/dev/links
+      - name: Run on the dev set with scorer flags
+        run: bash -c 'time scripts/docker_run.sh /tmp/dev /tmp/out'
+      - name: check-dev (exact diff against the published answer)
+        run: |
+          python3 scripts/compare.py /tmp/out /tmp/track/dev-answer | tee /tmp/check-dev.txt
+          {
+            echo "### Smoke check for \`$GITHUB_SHA\`"
+            echo "- 36/36 official fixtures passed with the scorer's docker flags"
+            echo "- check-dev (seed 1, 1M events):"
+            echo '```'
+            cat /tmp/check-dev.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
