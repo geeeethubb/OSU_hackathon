@@ -58,13 +58,14 @@ arrived as 0.02 and 0.05 s).
 |---|---|---:|---|---|
 | 1 | Fewer instructions per event row (asm halves; about 340 -> 250) | 65-110 ms of the 437 | paired CI win on AMD and Intel runners; laptop-only wins do not count (c890351 won on the laptop and lost 15-20 ms in CI) | parser agent, `exp-parse` |
 | 2 | Session work fused into the slot scan, persons in batches | about 70 ms of the 229 | paired CI win; exact on fixtures, dev, 20M x2, mutated sets | sessions agent, `exp-sessions` (owns the hot loop of `indexed.rs`) |
-| 3 | Two-level partitioning: parsers write a handful of streams, each owner splits or places its own | about 45 ms (parse stores + placing) | `bench/experiments/scatter.rs`: at least 25% less than "lists" at 20M and 60M on an AMD and an Intel runner, else drop | lead, not started |
+| 3 | Two-level partitioning / one stream per owner | about 45 ms (parse stores + placing) | REJECTED 21:45: `bench/experiments/scatter2.rs`, run 44952604559: two levels 30-40% slower at 20M and equal at 60M, owner streams 2-3x slower | closed |
 | 4 | Lean click kernel (in candidate E), then table-driven | 18 + about 10 ms | same-image CI variant `SS_CLICK_KERNEL=general` | click agent, `exp-clicks` |
 | 5 | Links per user in shards (in candidate D), compact summary | 20-25 ms | candidate D's paired run | links agent, `exp-links` |
 | 6 | Edge runs/whales without the tail; click index without the second copy; output overlapped; exit without teardown work | 8 + 10 + 5 + 5 ms | each alone, paired CI | lead, not started |
 
 Rejected, with evidence in the ledger: forward-only index mode; partition-owned winners by direct
-atomic scatter (1.5-2.2x slower than lists); write-combining/non-temporal list writes (no gain);
+atomic scatter (1.5-2.2x slower than lists); one stream per owner with prefetched plain stores (2-3x
+slower); two-level partitioning (slower at 20M, equal at 60M); write-combining/non-temporal list writes (no gain);
 2^13 and 2^15 partitions (CPU-dependent, no robust gain); decode-after-dedup (at most 2-4% of parse,
 before reread costs); link builder as an 8-thread bottleneck (official score unchanged); parser
 "two halves out of step" (CI regression); probing the forest instead of a lookup table (slower dedup);
@@ -74,7 +75,8 @@ Not allowed and not used: reconstructing rows from generator state, hard-coded s
 
 ## Candidates in flight
 
-- `bb32616f718774d07b42c49d1a939c3ece637835` candidate D (structural changes + sharded links), CI started 21:30.
+- `bb32616f718774d07b42c49d1a939c3ece637835` candidate D (structural changes + sharded links): CONFIRMED
+  in run 44951847559 (+36.5 / +37.2 / +39.5 ms against `2dae9298`, 60M +74 ms); named in the PR since 21:40.
 - `5704266f417ff89b1d4d2627eb3188e706eb4e4e` candidate E (D + lean click kernel; variant = old click
   kernel), CI started 21:35.
 

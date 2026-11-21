@@ -500,3 +500,19 @@ official_receipt_and_score: not yet submitted
   partitioning and one stream per owner against the lists). On the laptop both alternatives lose
   (lists 42 to 115 ms, two-level 91 to 142 ms, owner streams 232 to 267 ms at 20M, 8 threads), but the
   laptop has no huge pages; the Linux run decides.
+
+### 21:40 UTC
+
+- **Kill test 2, rejected (success line set beforehand: at least 25% less than "lists" at 20M and 60M):**
+  `bench/experiments/scatter2.rs` on branch `exp-scatter`, Linux runner (run 44952604559, EPYC 9V74,
+  4 logical CPUs, huge pages on request), elapsed ms, produce + rest = total, steady rounds:
+  | records | lists (today) | two levels (2^18-index streams, then a cache-resident second scatter) | one stream per owner, prefetched plain stores into one slot array |
+  |---|---|---|---|
+  | 20M | 67 + 23 = 90 | 64-78 + 54-71 = 118-158 | 69-76 + 198-203 = 268-274 |
+  | 60M | 286-344 + 71 = 358-415 | 187-204 + 169-171 = 355-374 | 206-212 + 611-623 = 817-830 |
+  Fewer streams do not make the producers faster at 20M (their cost is the fresh memory they write, not
+  the number of streams); at 60M they do (about 300 -> 190 ms) but the second scatter gives all of it
+  back. An exclusive owner with plain stores and prefetch is two to three times slower than placing in a
+  cache-resident table: the cache miss per record stays. With kill test 1 (atomic direct scatter, write
+  combining) this closes the question for records of this size: lists by 2^14-index partition and
+  in-cache placement stay.
