@@ -317,7 +317,7 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
 #[inline(always)]
 fn forward_ring(links: &LinkTable, out: &mut PassBOut, waiting: [u64; 5]) {
     let [word0, word1, purchase, hash, at] = waiting;
-    forward_named(out, links.person_probed(word1 >> 22, [hash, at]), word0, word1 & 1, purchase);
+    forward_mixed(out, links.person_mixed_probed(word1 >> 22, [hash, at]), word0, word1 & 1, purchase);
 }
 
 /// Writes one surviving event to its person's partition.
@@ -330,7 +330,12 @@ pub fn forward(links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, pu
 /// that person's partition. `word0` holds the timestamp as `parse` stores it.
 #[inline(always)]
 pub fn forward_named(out: &mut PassBOut, name: u64, word0: u64, is_purchase: u64, purchase: u64) {
-    let mixed = mix(name);
+    forward_mixed(out, mix(name), word0, is_purchase, purchase);
+}
+
+/// `forward_named` with the name already mixed (`codes::mix`).
+#[inline(always)]
+pub fn forward_mixed(out: &mut PassBOut, mixed: u64, word0: u64, is_purchase: u64, purchase: u64) {
     let part = (mixed >> out.person_shift) as usize;
     // The local key: the low 32 bits hold every bit below the partition's.
     let key = (mixed << 32) | (word0 & (TS_MASK << 1)) | is_purchase;

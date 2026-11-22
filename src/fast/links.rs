@@ -382,6 +382,25 @@ impl LinkTable {
         }
     }
 
+    /// `mix(person(user))`, given what `probe(user)` returned. When the
+    /// person is named by `user` itself (an ID in no link line, or the one
+    /// that names its component), that is the probe's hash, `mix(user)`,
+    /// already: no second mix.
+    #[inline(always)]
+    pub fn person_mixed_probed(&self, user: u64, probe: [u64; 2]) -> u64 {
+        match &self.indexed {
+            None => {
+                let name = self.table.lookup_probed(user, probe).0;
+                if name == user {
+                    probe[0]
+                } else {
+                    mix(name)
+                }
+            }
+            Some(indexed) => mix(self.lookup_indexed(indexed, user).0),
+        }
+    }
+
     /// `person(user)`, given what `probe(user)` returned.
     #[inline(always)]
     pub fn person_probed(&self, user: u64, probe: [u64; 2]) -> u64 {
