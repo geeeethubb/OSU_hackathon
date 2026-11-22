@@ -207,7 +207,8 @@ known so far is 1.38 s for `e4eef020`).
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | **0.5231 s** | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
+| `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | **0.4663 s** | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:55 UTC |
+| `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | 0.5231 s | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
 | `2dae9298f4e1e0a5259eec54c400501b00fae26f` | 0.6389 s (shown earlier as 0.64 s) | not relayed | relayed by the user 2026-11-21 |
 | `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e` (candidate C) | 0.64 s | not relayed | same |
 | `4567e9532f4019fbfd0e92908fd01cc49f24f67d` | 0.66 s | BB-898B1D4A | same |
@@ -837,3 +838,16 @@ base was `b890895` and the comparison was against candidate E.
   +18.2 / +19.1 / +29.5 ms, 18/18 pairs. F2 is confirmed and named in the PR until F3 is.
 - **In CI:** declined event rows straight to the general kernel (`1b73234`, G(b) step 1, against F3,
   variant `SS_RARE=a`).
+
+### 01:00 UTC
+
+- **Official: candidate F3 scored 0.4663 s** (`8dde2af12e542b0df94ba6d0be3da4f8660f896d`, receipt
+  BB-9900D7A0): 56.8 ms and 10.9% less than F's 0.5231 s. Relayed by the user. `bench/BEST_SHA` now
+  names F3; every CI run pairs against it.
+- **Calibration row:** F3 against F in CI +42.5 / +38.9 / +42.2 ms (EPYC 9V74); the one-runner table
+  above (EPYC 7763) has F at 678 ms. Official change 56.8 ms for a CI change of about 40 ms: this step
+  carried over at more than one to one, where the earlier steps gave 0.5 to 0.9. Noise in a single
+  official number is unknown; the intercept-plus-slope reading above is a fit over seven points and
+  should not be taken as a rule for the next step either.
+- **Agents remain stopped** (usage limit); the lead works alone with CI. Budget is kept for integration
+  and the final candidate's validation.
