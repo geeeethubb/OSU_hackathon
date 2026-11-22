@@ -1464,6 +1464,22 @@ unsafe fn event_lean_finish<const MODE: u32, const INDEXED: bool>(
     ROW_DROP
 }
 
+/// Starts loading the writer that an event's record goes through: that of
+/// its long-ID partition for a long ID (`value`), else that of its code's
+/// partition. Both are worked out and one is picked, with no branch on the
+/// kind of ID; the stores' own mix and `long_part` are the same values.
+#[inline(always)]
+fn prefetch_writer(out: &ParseOut, first: u8, code: u64, value: Option<u128>) {
+    let short = out.events.as_ptr().wrapping_add((super::codes::mix(code) >> out.event_shift) as usize);
+    let long = out
+        .long_events
+        .as_ptr()
+        .wrapping_add(super::parse::long_part(first, value.unwrap_or(0), out.event_shift));
+    let writer = select_unpredictable(value.is_some(), long, short);
+    // SAFETY: a prefetch reads nothing and never faults.
+    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(writer as *const i8) };
+}
+
 /// The lean kernel for the rows `event_lean` declines because an ID is long:
 /// the event ID or the user ID (or both) is one byte and 32 lowercase
 /// hexadecimal digits, as one in eight distinct IDs of current generated
@@ -1563,6 +1579,10 @@ pub unsafe fn event_lean_long<const MODE: u32>(
         }
         None
     };
+    // The writer of the record's partition, asked for now: the store at the
+    // end of the row reads its cursor, which would otherwise wait at the end
+    // of the row's chain (the ID, its partition, the writer, the cursor).
+    prefetch_writer(out, *event_at, event_short, event_value);
     let user_value = if user_length == 33 {
         match hex_value32(user_at.add(1)) {
             Some(value) => {
@@ -1815,6 +1835,10 @@ pub unsafe fn event_lean_wide<const MODE: u32>(
         }
         None
     };
+    // The writer of the record's partition, asked for now: the store at the
+    // end of the row reads its cursor, which would otherwise wait at the end
+    // of the row's chain (the ID, its partition, the writer, the cursor).
+    prefetch_writer(out, *event_at, event_short, event_value);
     let user_value = if user_length == 33 {
         match hex_value32(user_at.add(1)) {
             Some(value) => {
