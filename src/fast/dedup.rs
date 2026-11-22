@@ -66,6 +66,9 @@ pub struct ScratchB {
     table: Vec<Slot>,
     /// One bit per record, in iteration order: set for losing copies.
     lost: Vec<u64>,
+    /// The same two for the long event IDs of a partition.
+    long_table: Vec<LongSlot>,
+    long_lost: Vec<u64>,
     /// Diagnostics (`SS_TIMING`): nanoseconds this worker spent choosing
     /// winners and forwarding survivors.
     pub measure: bool,
@@ -132,42 +135,54 @@ fn for_each_long_record(lists: &[PartList], mut visit: impl FnMut(u8, u128, u64,
     }
 }
 
-/// One slot of the per-partition table of long event IDs.
+/// One slot of the per-partition table of long event IDs: the ID's value in
+/// two words, then its first byte (bits 56..64), the winning copy's ingest
+/// time (bits 32..53) and that copy's sequence number plus one (bits 0..32;
+/// a whole word of 0 marks an empty slot).
 #[derive(Clone, Copy, Default)]
 struct LongSlot {
-    /// Sequence number of the winning copy plus one; 0 marks an empty slot.
-    tag: u32,
-    ingest: u32,
-    first: u8,
-    value: u128,
+    low: u64,
+    high: u64,
+    meta: u64,
 }
 
 /// Step 2 of the rules for the long event IDs of one partition: per ID the
 /// copy with the smallest ingest_ts (the first seen among equal ones, which
 /// are identical), then the survivors forwarded like the others.
-fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, _scratch: &mut ScratchB) {
+fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch: &mut ScratchB) {
     let words: usize = lists.iter().map(PartList::words).sum();
     let most_records = words / 4;
     let bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
     let capacity = 1usize << bits;
-    let mut table = vec![LongSlot::default(); capacity];
-    let mut lost = vec![0u64; most_records / 64 + 1];
+    let table = &mut scratch.long_table;
+    table.clear();
+    table.resize(capacity, LongSlot::default());
+    let lost = &mut scratch.long_lost;
+    lost.clear();
+    lost.resize(most_records / 64 + 1, 0);
     let mut sequence = 0u32;
     for_each_long_record(lists, |first, value, _, word1, _| {
-        let ingest = ((word1 >> 1) & INGEST_MASK) as u32;
-        let folded = (value as u64) ^ ((value >> 64) as u64).rotate_left(29) ^ u64::from(first);
-        let mut at = (folded.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+        let ingest = (word1 >> 1) & INGEST_MASK;
+        let (low, high) = (value as u64, (value >> 64) as u64);
+        // `parse::long_part` picked this partition with the top bits of one
+        // multiply of these words: every ID here has the same ones. The slot
+        // comes from a different multiply (the same one would crowd the
+        // partition's IDs into a few slots, and probing would go quadratic).
+        let folded = low ^ high.rotate_left(29) ^ u64::from(first);
+        let mut at = ((folded ^ (folded >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
+        let named = u64::from(first) << 56;
+        let meta = named | (ingest << 32) | u64::from(sequence + 1);
         loop {
-            let slot = &mut table[at];
-            if slot.tag == 0 {
-                *slot = LongSlot { tag: sequence + 1, ingest, first, value };
+            // SAFETY: `at` is masked to the table's capacity.
+            let slot = unsafe { table.get_unchecked_mut(at) };
+            if slot.meta == 0 {
+                *slot = LongSlot { low, high, meta };
                 break;
             }
-            if slot.value == value && slot.first == first {
-                let loser = if ingest < slot.ingest {
-                    let previous = slot.tag - 1;
-                    slot.tag = sequence + 1;
-                    slot.ingest = ingest;
+            if slot.low == low && slot.high == high && slot.meta >> 56 == u64::from(first) {
+                let loser = if ingest < (slot.meta >> 32) & INGEST_MASK {
+                    let previous = (slot.meta as u32) - 1;
+                    slot.meta = meta;
                     previous
                 } else {
                     sequence
@@ -179,6 +194,7 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, _scratc
         }
         sequence += 1;
     });
+    let lost = &scratch.long_lost;
     let mut sequence = 0u32;
     for_each_long_record(lists, |_, _, word0, word1, purchase| {
         let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
