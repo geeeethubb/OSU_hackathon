@@ -699,6 +699,42 @@ pub fn rare_rows() -> u64 {
     })
 }
 
+/// `input_lead()` unless `SS_LEAD` says otherwise.
+pub const INPUT_LEAD: usize = 2048;
+
+/// How far ahead of the row they read the row loops ask for the input, in
+/// bytes (`prefetch_input`): `SS_LEAD` (at most 65536) for A/B runs on one
+/// binary, else `INPUT_LEAD`. `SS_LEAD=0` asks for the row's own bytes,
+/// which are being read anyway: the loops as they were, but for the hints.
+pub fn input_lead() -> usize {
+    static LEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEAD.get_or_init(|| {
+        let lead = std::env::var("SS_LEAD")
+            .ok()
+            .and_then(|lead| lead.parse().ok())
+            .filter(|&lead| lead <= 1 << 16)
+            .unwrap_or(INPUT_LEAD);
+        if std::env::var_os("SS_TIMING").is_some() {
+            eprintln!("SS_TIMING note=input_lead={lead}");
+        }
+        lead
+    })
+}
+
+/// Asks for the input `lead` bytes after `p`: two cache lines, as much as a
+/// row of up to 128 bytes spans. On Intel the hardware streamer stops at
+/// every 4 KB page of the input; this keeps the next page coming.
+#[inline(always)]
+pub fn prefetch_input(p: *const u8, lead: usize) {
+    let at = p.wrapping_add(lead) as *const i8;
+    // SAFETY: a prefetch is a hint: it reads nothing into the program and
+    // never faults, whatever the address.
+    unsafe {
+        _mm_prefetch::<_MM_HINT_T0>(at);
+        _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(64));
+    }
+}
+
 /// What the lean kernel reads from memory at every use. The three byte
 /// vectors are here and not constants in the code so that each compare takes
 /// its operand straight from memory, on every target, with a call in the loop
@@ -2453,6 +2489,10 @@ macro_rules! lean_run_codes {
         concat!(
             "mov qword ptr [rdx + {saved}], rbx\n",
             "9:\n",
+            // The input two lines at `lead` bytes ahead (`prefetch_input`).
+            "mov r15, qword ptr [rdx + {lead}]\n",
+            "prefetcht0 byte ptr [rdi + r15]\n",
+            "prefetcht0 byte ptr [rdi + r15 + 64]\n",
             lean_head!("lea rbx, [rdi + rax + 65]\n"),
             lean_codes!(),
             lean_ts!(),
@@ -2733,6 +2773,8 @@ pub struct LeanFrame {
     event_shift: u64,
     mix_a: u64,
     mix_b: u64,
+    /// `input_lead()` for the loop in assembly on the general path (0 elsewhere).
+    lead: u64,
 }
 
 /// Whether a `PartWriter` is what the loop in assembly takes it for: four
@@ -2805,6 +2847,7 @@ impl LeanFrame {
             event_shift: 0,
             mix_a: 0,
             mix_b: 0,
+            lead: 0,
         }
     }
 
@@ -2838,6 +2881,7 @@ impl LeanFrame {
             event_shift: u64::from(ctx.event_shift()),
             mix_a: super::codes::MIX_A,
             mix_b: super::codes::MIX_B,
+            lead: input_lead() as u64,
         }
     }
 
@@ -3045,6 +3089,7 @@ pub unsafe fn event_lean_run_codes(
         event_shift = const std::mem::offset_of!(LeanFrame, event_shift),
         mix_a = const std::mem::offset_of!(LeanFrame, mix_a),
         mix_b = const std::mem::offset_of!(LeanFrame, mix_b),
+        lead = const std::mem::offset_of!(LeanFrame, lead),
     );
     (status, at)
 }

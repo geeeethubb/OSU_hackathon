@@ -853,6 +853,7 @@ fn event_row_declined<const MODE: u32, const INDEXED: bool>(
 ) -> usize {
     use super::simd::{event_lean_long, event_row_fast, MODE_ROW, MODE_STORE, ROW_DECLINE, ROW_DONE, ROW_DROP, ROW_LONG};
     let mut row = EventRow::default();
+    super::simd::prefetch_input(buffer.as_ptr().wrapping_add(position), super::simd::input_lead());
     if !INDEXED && MODE != MODE_ROW {
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe { event_lean_long::<MODE>(ctx, buffer.as_ptr().add(position), out, &mut row) };
@@ -1053,7 +1054,9 @@ fn clicks_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     // loads from it are known not to change under the loop's stores.
     let frame = ClickFrame::new(ctx);
     let mut click = ClickRecord::default();
+    let lead = super::simd::input_lead();
     while position < limit && position < safe {
+        super::simd::prefetch_input(buffer.as_ptr().wrapping_add(position), lead);
         // SAFETY: at least ROW_PAD readable bytes follow `position`.
         let (length, status) = unsafe {
             let p = buffer.as_ptr().add(position);
