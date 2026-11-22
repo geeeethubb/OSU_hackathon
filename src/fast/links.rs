@@ -84,8 +84,15 @@ struct Table {
 
 /// Timing only, wrong answers: `SS_DIAG_BITMAP=1` (see `Table::probe`).
 fn diag_bitmap() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SS_DIAG_BITMAP").is_some_and(|value| value == "1"))
+    diag_bitmap_mode() != 0
+}
+
+/// 1: bitmap and rank words from 512 cached bytes; 2: the same, with about
+/// 40% of probes taking an entry at a random rank (the real rate of IDs with
+/// an entry), so that only the bitmap and rank misses are gone.
+fn diag_bitmap_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("SS_DIAG_BITMAP").ok().and_then(|value| value.parse().ok()).unwrap_or(0))
 }
 
 impl Table {
@@ -119,8 +126,12 @@ impl Table {
         let home = (hash >> self.rem_bits) as usize & if diag_bitmap() { 4095 } else { usize::MAX };
         // SAFETY: `bits` has a word for every home position.
         let word = unsafe { *self.bits.get_unchecked(home >> 6) };
-        let set = (word >> (home & 63)) & 1;
-        let rank = self.rank(home, word);
+        let mut set = (word >> (home & 63)) & 1;
+        let mut rank = self.rank(home, word);
+        if diag_bitmap_mode() == 2 && !self.entries.is_empty() {
+            set = u64::from((hash >> 9) % 5 < 2);
+            rank = ((hash >> 20) % self.entries.len() as u64) as usize;
+        }
         let entry = self.entries.as_ptr().wrapping_add(rank);
         prefetch_line(if set != 0 { entry } else { self as *const Self as *const u64 });
         [hash, (rank as u64) | (set << 63)]
