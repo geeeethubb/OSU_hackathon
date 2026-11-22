@@ -902,3 +902,22 @@ base was `b890895` and the comparison was against candidate E.
      for this sprint; recorded so it is not retried without a new argument.
 - **Agents:** three were resumed at 00:52 and two stopped again at 00:56 on the user's budget note; the
   parser agent alone continues, scoped to G(b)(2) and hypothesis 1, then stops.
+
+### 01:25 UTC
+
+- **T, lookup tables without one allocation per product** (`60758b0` on top of `1b73234`, against F3,
+  run 44968983694, EPYC 9V74): **+11.8 / +12.6 / +20.5 ms, 18/18 pairs**, A/A medians -3.3 / -1.8 /
+  +1.8. Instrumented runs, seeds 2 / 3 / 5: the tables' own thread 22.8 / 20.9 / 22.0 -> 8.1 / 7.6 / 7.7
+  ms; the wait for them 7.4 / 4.8 / 6.9 -> 0.0 ms; the link stage (link rows plus that wait) 19.7 /
+  17.7 / 19.8 -> 8.9 / 8.6 / 11.4 ms. More than the wait itself, and this run includes `1b73234`
+  (measured neutral alone). Kept. With eight threads the link rows finish sooner, so the wait was the
+  larger share of the start there; how much of that the scorer shows is unknown.
+- **Parser agent, final report:** G(b)(2) (`069f752`, rows with no usable timestamp stored as invalid
+  rows inside the assembly; per-case exactness argument in its commit message; 54 unit tests and the
+  full verification list) is verified but **not integrated**: by its own counters it moves 0.58% of rows
+  off one 85 ns call, about 2.5 ms of CPU-bound elapsed time on four threads, below what CI resolves.
+  Hypothesis 1 (two rows per pass) **killed on the instruction count**: a pair shares only the ID vector
+  sequence and one loop edge, about 5.5 instructions per row of 216 (2.5%) against the bar of 25 (12%);
+  the timestamps already use both lanes of a row. The agent has stopped.
+- **Candidate F4 (this push):** F3 + `1b73234` + `60758b0`. Its CI run carries the 60M check; fresh
+  seeds follow as a dispatch run.
