@@ -111,7 +111,8 @@ fn remove_earlier_tables(output: &Path) {
         if let Ok(entries) = std::fs::read_dir(output.join(table)) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "parquet") {
+                // Any case: a case-insensitive file system or loader would read PART-9.PARQUET too.
+                if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("parquet")) {
                     let _ = std::fs::remove_file(path);
                 }
             }
