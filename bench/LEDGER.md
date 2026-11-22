@@ -1281,3 +1281,133 @@ mapped input is 4 KB pages from the page cache; Intel's L2 streamer stops at eve
   run read the lead on F8's code again: +67.8 / +64.5 / +62.8 ms, 18/18.
 - In flight: the link rows' input lead (`8937270`, on F8), and a long-ID path for click rows (rows with a
   long ID are 23.3% of click rows and about 5.7% of CPU on the 8573C).
+
+### 06:15 UTC: F8 on its exact SHA; link-row lead rejected; a mutated-click "DIFFER" explained
+
+- **F8's exact commit `8652004`** (push run 44991597811 on `pipeline`, against F6): drew a **Xeon 6975P-C:
+  +246.2 / +254.1 / +250.4 ms, 18/18** (F8 861-881 ms against F6 1,108-1,136 ms per container run); 36/36,
+  43/43, MATCH; 60M on an EPYC 7763 +256.9 ms against F6 (6/6), `/reference` 25/25 MATCH, peak 2.55 GiB.
+- **Link rows' input lead (`8937270`) against F8, Xeon 8573C** (run 44990988594): links_parse 35.2 / 34.3 /
+  36.5 against 34.0 / 33.7 / 37.4 ms, end to end -4.6 / +0.0 / -2.6 ms. No gain: **REJECTED** (not kept).
+- **A mutated click set differed from `/reference`, on F6 as on F8.** Bisected by damage kind and field,
+  then delta-debugged to one row: one of the three copies of click `k1w1nn17n` had its user's first
+  byte changed. rules.md says copies of a click have identical values ("keep any one"), so that input
+  is outside the rules: `/reference` keeps one copy and the engine credits the person through the
+  others. Damage that leaves copies identical (only clicks without copies damaged): all 14 kinds MATCH
+  on F6, on F8 and with the click path below; damaging every copy of duplicated clicks MATCHes too.
+- **Click rows with a long ID read directly (`click_lean_long`), long users deferred in a ring**
+  (`3bf9bc4` on top of `8937270`; `7c19ed0` = the same on F8 alone). Laptop (AMD): click parse 279 ->
+  251 thread-ms. Same image, path on against SS_CLICK_LONG=0 (saving, positive = path faster): **EPYC
+  9V74 +13.1 / +1.6 / +20.5 ms** (clicks 285 -> 272, 278 -> 272, 283 -> 259 thread-ms; run 44992503414);
+  EPYC 7763 +4.0 / +2.5 / -1.1 (run 44992495768); against F8 on a 7763 +5.7 / +13.4 / +5.2 (16/18, push
+  run 44992493744). **Intel (e1, native): Xeon 8370C +14.5 / -3.6 / +7.9 (13/18, noisy runner), Xeon
+  6975P-C +2.1 / +5.2 / +5.1 (14/18), Xeon 8573C +1.3 / +6.8 / +8.7 (15/18); click parse -6 to -10% on
+  all three.** Small, positive on both vendors: KEPT. **F9 = `7c19ed0`** (F8 + this path, without the
+  link-row lead). Local gate on the exact tree passed (unit tests, fixtures, small seeds, mutated event
+  and click sets in verify and default modes, dev at 8 and 3 threads, both 20M, 20M verify, 60M). CI
+  gate against F8 on `exp-f9` ([60m]; fresh seeds 101 / 103 / 107) running.
+- **Partition counts (runtime knobs, F8)**: 11 bits instead of 10. e1, native: **Xeon 8370C (Ice Lake)
+  SS_PART_BITS=11 loses 15.8 / 12.3 / 14.0 ms (18/18)**, SS_EVENT_PART_BITS=11 loses 8.4 / -0.8 / 6.0,
+  SS_PERSON_PART_BITS=11 loses 2.3 / 7.3 / 3.1 (run 44993068462); Xeon 6975P-C all within about 6 ms
+  (runs 44993066202, -077321); my CI on a 6975P-C: SS_PART_BITS=11 +4.5 / +0.2 / +5.8 ms faster (run
+  44992837253; the same run: F8 against F6 +263.8 / +266.0 / +247.2 ms, 18/18). **10 bits kept.**
+- **Block recycling in pass B (`9273315` = F9 + SS_RECYCLE)**: a finished event partition's 512-word
+  blocks become the thread's person blocks (kernel_init_pages was 3.2% of CPU on the 8573C). Local:
+  all MATCH, on and off. **Xeon 6975P-C (run 44993450047): same image, recycling faster by 3.1 / 12.5 /
+  8.5 ms (15/18); against F9 +8.5 / +12.8 / +5.8 ms (17/18).** EPYC 9V45 (run 44993457881): faster by
+  3.3 / 3.9 / 5.0 ms (12/18), against F9 +2.6 / +5.1 / +3.1. EPYC 9V74 push run: noisy (+1.3 / -2.4 / +7.7).
+- **F9 (`7c19ed0`) against F8, the whole binary: NOT promoted.** Xeon 6975P-C (exact push, run
+  44993541143): -7.3 / +0.0 / +1.6 ms (9/18); fresh seeds 101 / 103 / 107 on a Xeon 8573C (run
+  44993548836): -5.5 / -3.5 / -2.2 ms (3/18); 60M on an EPYC 9V45 +37.8 ms (5/6), 25/25 MATCH, 2.56 GiB.
+  The click path's saving (5-13 thread-ms of click parse on Intel) does not show through the two images'
+  other differences on Intel: a same-image mechanism, not an end-to-end gain. F8 stays the candidate.
+- **Wide rows (`c2ddada` = F9 + `event_lean_wide`)**: rows of 128-159 bytes (0.4% in generated data, both
+  IDs long) read by `event_lean_long`'s field code from masks of bytes 32..160. The 84,133 such rows of the
+  new 20M set alone: event parse 57.6 -> 33.4 thread-ms, MATCH; a mutated wide set (135,485 widened rows,
+  42,253 damaged) MATCHes on, off and under SS_VERIFY at 8 and 3 threads. CI (exp-wide-a) running.
+- **Combined candidates, each timed against F8 directly** (the small changes are each about 1% or less, so
+  the decision is on the whole binary): C1 = F8 + recycling (`fc165ba`, exp-c1-a), C2 = F8 + click path +
+  recycling + wide rows (`929baca`, exp-c2-a, variant = all three off), each with [60m].
+
+### 06:40 UTC: corrections from an independent re-check of the raw artifacts
+
+A read-only verification pass re-derived the published numbers from the CI JSON. Corrections (the
+lines above are left as written; these supersede them):
+- The lead's on/off rows were measured on `907111d` (F7 + the lead), not on F8's binary; the Ice Lake
+  reading "on F8's code" (run 44991136473) was on `3dfb62a` = F8 + the staged lookup, on in both arms
+  (+62.7 / +64.5 / +67.8 ms). No lead on/off pair exists on F8's own binary.
+- The deferral natively on Intel is +4 to +16 ms (Xeon 8573C seed 5: +4.1 in e1's record, +4.0 in the
+  raw log), 48/54 pairs; measured on F8's binary.
+- "25/25 MATCH" at 60M counted the prior's runs too: F8's own runs are 19/19 MATCH (the same for F9).
+- F8 against F7, 20M: only seeds 5 (9V74) and 97 (7763) clear every A/A difference; the clear evidence
+  is at 60M (+137.9 ms) and on Intel (the parts; F8's exact commit against F6). No direct F8-against-F7
+  pair on Intel.
+- The 4 KB page restart of the hardware prefetcher is a hypothesis consistent with the measurements
+  (the stall at the row's first loads, 39% of the short loop on Intel, falls below about 2% with the
+  lead), not an isolated cause.
+- The scorer is recorded as an n2 Xeon (Cascade Lake or Ice Lake); "closest to the scorer" for the
+  8370C is an inference: it is the only n2-generation CPU drawn, and no Cascade Lake runner was seen.
+- PGO (05:10, 05:20): on the Xeon 6975P-C, `50ed2ee` raised the click map only (+122 to +129 thread-ms),
+  not the forward (-1.7 to +10.1); PGO alone on F6's code (run 44987313196, one 8573C VM) raised click
+  map 194.9 -> 286.6 on seed 2 (7bb3836's message quotes seed 5's 283.7) and forward +26 to +41, and
+  lost 13-19 ms. The forward rise of `af75107` (+142 to +158) is not accounted for by PGO alone; its
+  cause is undetermined. No same-runner kernel x PGO matrix, no exact-source profile of F7's code, no PGO
+  run on Ice Lake, and no pass-B disassembly were made. PGO is in no candidate.
+
+### 06:50 UTC: combined candidates against F8 (first CI draws)
+
+Whole binary against F8 (A-B > 0 = candidate faster); same image = the change(s) on against off.
+- **C1 = F8 + recycling (`fc165ba`)**: **Xeon 8370C (Ice Lake) +8.1 / +6.1 / +7.7 ms (15/18)**, same image
+  recycling faster by 3.7 / 2.5 / 7.0 ms (14/18) (run 44994424000); EPYC 7763 -2.4 / -5.4 / -4.8 (5/18),
+  same image -1.5 / -1.5 / -1.1 (run 44994435921); EPYC 9V74 push -1.6 / -3.0 / +13.7 (noisy, run
+  44994411780). 36/36, 43/43, MATCH in all.
+- **C2 = F8 + click path + recycling + wide rows (`929baca`)**: EPYC 7763 **+11.6 / +11.6 / +13.2 ms
+  (18/18)** (push run 44994417568); EPYC 9V74 **+24.2 / +18.0 / +15.1 ms (16/18)**, same image all three
+  on faster by 1.8 / 19.2 / 10.2 ms (16/18) (run 44994430044). 36/36, 43/43, MATCH. No Intel draw yet.
+- **Wide rows alone (`c2ddada` against F9), EPYC 7763**: +6.2 / +15.1 / +14.2 and +8.5 / +13.2 / +9.2 ms
+  (32/36 pairs, runs 44994174409, -176322); same image SS_WIDE=0 slower by 8.1 / 3.7 / 8.4 ms (15/18).
+- Local gates on the exact trees of C1 and C2: unit tests, 36/36, 43/43, dev (8 and 3 threads), new and
+  old 20M, the mutated long-ID, click and wide sets (default and SS_VERIFY), new 60M: all MATCH.
+- **Link rows with a long ID (`link_lean_long`, C3 = C2 + it, not pushed)**: exact on a mutated link set
+  (6,681 damaged rows; default, SS_VERIFY, off; 8 and 3 threads) and everywhere else, but the link stage
+  only went 28.4 -> 26.8 ms on the laptop: the long rows were not where that stage's time goes. Parked.
+- **C2 on Intel (run 44994441586, Xeon Platinum 8573C): +17.1 / +26.7 / +22.5 ms against F8 (17/18); same
+  image, all three on against all three off, faster by 27.8 / 20.6 / 28.9 ms (18/18).** Forward 724 ->
+  684 thread-ms (seed 2), parse 499 -> 484 ms. 36/36, 43/43, MATCH.
+- **C2 at 60M (push run 44994417568, Xeon 6975P-C): 2,614 against F8's 2,650 ms, +36.0 ms (6/6); peak
+  memory 2.13 GiB against F8's 2.55** (recycling). `/reference` was OOM-killed on that runner (14 GB), so
+  CI's 60M correctness there rests on the rules' self-check; locally C2's 60M MATCHes the complete local
+  reference. Another 60M run (44995320953) and fresh seeds 109 / 113 / 127 and 131 / 137 / 139 dispatched.
+- More corrections from the same pass: `a33259f` and `7bb3836` (F7) do not have identical build inputs, as
+  05:20 says: `a33259f`'s Dockerfile still copied an unused `pgo/` directory (no `-Cprofile-use`); the
+  `/pipeline` binaries are byte-identical (sha256 66c1e575...). The 05:10 entry's run 44986307321 timed
+  `af75107`, not `50ed2ee`. The 18.5% forward re-read stall in the e1 cost model comes from one PGO run on
+  one 6973P-C (without PGO on an 8573C it is at most 1.9%), so it does not describe F7 or F8. The one
+  code-alignment test ever run (JCC padding, EPYC 7763, run 44960336101) lost 14/18 pairs. The "5.7% of
+  CPU" for long-ID click rows is a sum of profile entries, not a measurement of that path.
+
+### 07:00 UTC: F10 = C2 (F8 + click long-ID path + block recycling + wide rows) passes its gate
+
+C2 (`929baca`) against F8 as whole binaries (A-B > 0 = C2 faster):
+
+| Runner | Run | Seeds | A-B per seed | Pairs |
+|---|---|---|---|---|
+| Xeon Platinum 8573C | 44994441586 | 2 / 3 / 5 | +17.1 / +26.7 / +22.5 ms | 17/18 |
+| Xeon Platinum 8573C | 44995301087 | fresh 131 / 137 / 139 | **+16.4 / +32.7 / +17.6 ms** | **18/18** |
+| EPYC 7763 | 44994417568 | 2 / 3 / 5 | +11.6 / +11.6 / +13.2 ms | 18/18 |
+| EPYC 9V74 | 44994430044 | 2 / 3 / 5 | +24.2 / +18.0 / +15.1 ms | 16/18 |
+| EPYC 9V45 | 44995297391 | fresh 109 / 113 / 127 | +21.8 / +21.4 / +12.2 ms | 14/18 |
+| EPYC 7763 | 44995320953 | 2 / 3 / 5 (2 pairs each) | +14.3 / +46.1 / +22.9 ms | 6/6 |
+
+- Same image, all three on against all three off: Xeon 8573C faster by 27.8 / 20.6 / 28.9 ms (18/18), EPYC 9V74
+  by 1.8 / 19.2 / 10.2 (16/18). Forward on the 8573C 713-783 -> 673-684 thread-ms (recycling).
+- 60M on a Xeon 6975P-C: +36.0 ms (6/6, run 44994417568) and +55.3 ms (2/2, run 44995320953); peak memory
+  **2.13 GiB** (F8: 2.55). `/reference` was OOM-killed on those runners (14 GB), so their 60M correctness
+  is the rules' self-check; two more 60M runs (44995820644, -826471) are fishing for a runner where
+  `/reference` fits. Locally C2's 60M output MATCHes the complete local reference.
+- Every CI run: 36/36, 43/43, 1M dev MATCH, and every 20M run MATCHes `/reference`.
+- Local gate on the exact tree: unit tests; 36/36 + 43/43; dev at 8 and 3 threads; new and old 20M; mutated
+  long-ID, click (11,427 rows) and wide-row (42,253 damaged rows) sets in default and SS_VERIFY modes; the
+  engine's other modes (SS_KERNEL=plain and general, SS_STRUCT=1, SS_FAST=0); new 60M: all MATCH.
+- **F10 = the head of `pipeline` after this commit**: `0a8c971` + `723c51a` + `9870032` cherry-picked onto
+  F8's commit, the same build inputs as `929baca`. Native whole-image Intel pairs (e1) still running.

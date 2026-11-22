@@ -4,18 +4,36 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 06:00 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 07:00 UTC, shopping-sessions-5)
+
+- **Candidate F10 = head of `pipeline` (this commit)** = F8 + click long-ID path (`SS_CLICK_LONG`) + block
+  recycling in pass B (`SS_RECYCLE`) + wide-row kernel (`SS_WIDE`); build inputs = `929baca` (C2). Against
+  F8: Xeon 8573C +16 to +33 ms (35/36 over two runs incl. fresh seeds), AMD +11 to +24 (48/54), 60M +36
+  and +55 ms on a 6975P-C with peak 2.13 GiB (LEDGER 07:00). F8 `8652004` stays the fallback.
 
 - **Candidate F8 = `284f1ca` + its ledger commit (head of `pipeline`)**: F7 + input lead 2 KB ahead in the
   row loops (`SS_LEAD`) + long-user lookups trailing the parse in a ring of 8 (`SS_DEFER`). Gate passed
   against F7 (LEDGER 06:00): +15 to +21 ms on seeds 2/3/5 and +1 to +13 on fresh seeds on AMD, 60M
-  +137.9 ms with 25/25 MATCH and 2.54 GiB; on Intel the lead alone is +106 to +184 ms (containers,
-  Xeon 6975P-C and 8573C) and +60 to +68 ms (native, Ice Lake 8370C), the ring +5 to +16 ms.
+  +137.9 ms with F8's 19/19 runs MATCH and 2.54 GiB; on Intel the lead alone (measured on `907111d` =
+  F7 + lead) is +106 to +184 ms (containers, Xeon 6975P-C and 8573C) and +60 to +68 ms (native, Ice
+  Lake 8370C), the ring (on F8's binary) +4 to +16 ms; F8's exact commit against F6 on a 6975P-C
+  +246 to +254 ms (18/18). No direct F8-against-F7 pair on Intel.
 - Rejected since 05:20: the staged person lookup (slower on Ice Lake and AMD), the pass-B scan prefetch
-  (slower on AMD, no stall to remove on Intel). In flight: the link rows' lead (`8937270`) and a long-ID
-  path for click rows (rows with a long ID: 23% of clicks, about 5.7% of CPU on the 8573C).
+  (slower on AMD, no stall to remove on Intel), the link rows' lead (no change on an 8573C), 11-bit
+  partitions (slower on Ice Lake), F9 = F8 + click path alone (whole binary neutral on Intel).
+- **Next candidate under test (06:50): C2 = `929baca` = F8 + click long-ID path (`SS_CLICK_LONG`) + block
+  recycling in pass B (`SS_RECYCLE`) + wide-row kernel (`SS_WIDE`).** Against F8: Xeon 8573C +17 to +27
+  ms (17/18), AMD +11 to +24 (34/36), 60M on a 6975P-C +36 ms with peak 2.13 GiB (2.55 for F8). Local
+  gate on the exact tree passed. Pending: fresh seeds (runs 44995297391, -301087), a 60M run with a
+  `/reference` compare (44995320953), e1's native whole-image Intel pairs. Branch `scratch-f10`
+  (`9870032`) = the same three commits cherry-picked onto `pipeline` (identical build inputs): fast-forward
+  `pipeline` to it and add the ledger commit when C2 passes; then name it F10 in PR #1.
+- Parked: `link_lean_long` (C3; exact, but the link stage only 28.4 -> 26.8 ms on the laptop).
 - The e1 session's Intel measurements: cpu-clock annotates and native AB/BA pairs on Intel draws (its
   branches perf-probe-*; record in its `bench/experiments/cost_model_probe.md`).
+- A read-only verification workflow re-derived the published numbers (LEDGER 06:40 corrections). Reply to
+  ChatGPT's follow-up drafted from it (PGO: pass-B instructions identical in matched windows; no alignment
+  evidence; the af75107 forward rise has no established cause; PGO is in no candidate).
 
 ## Checkpoint 2026-11-22 05:20 UTC (superseded above)
 
