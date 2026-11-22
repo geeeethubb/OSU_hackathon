@@ -525,17 +525,39 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             timing.stage("startup");
             let started = Instant::now();
             let parse_out: Slots<ParseOut> = Slots::new(threads, || ParseOut::new(&ctx));
-            Ok((event_files, parse_out, link_files, started.elapsed()))
+            let buffers_spent = started.elapsed();
+            let mut link_tasks = Vec::new();
+            chunk_tasks(Kind::Links, &link_files, LINK_CHUNK, &mut link_tasks);
+            let next = AtomicUsize::new(0);
+            parallel(threads, |thread| {
+                // SAFETY: slot `thread` belongs to this thread for the whole phase.
+                let out = unsafe { parse_out.get(thread) };
+                while let Some(task) = link_tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    parse::parse_links_chunk(&ctx, link_files[task.file].bytes(), task.start, task.end, out);
+                }
+            });
+            let link_pairs: Vec<Vec<(u64, u64)>> = (0..threads)
+                .map(|thread| {
+                    // SAFETY: the phase above has ended; no other reference exists.
+                    std::mem::take(&mut unsafe { parse_out.get(thread) }.links)
+                })
+                .collect();
+            Ok((event_files, parse_out, link_pairs, buffers_spent, started.elapsed() - buffers_spent))
         })();
         let front_done = Instant::now();
         let (tables, tables_spent) = tables.join().unwrap();
         (tables, clicks.join().unwrap(), front, (tables_spent, front_done.elapsed()))
     });
-    let (event_files, parse_out, link_files, buffers_spent) = front?;
+    let (event_files, parse_out, link_pairs, buffers_spent, link_rows_spent) = front?;
+    // Parse-only diagnostics may time the parse without user-table lookups.
+    if ctx.diag != 0 {
+        codes::arm_fake_lookups();
+    }
     // What the stage before the parse is made of (diagnostics): the workers'
-    // output buffers, and the lookup tables on their own thread, with how
-    // long the others then waited for them.
+    // output buffers, the link rows, and the lookup tables on their own
+    // thread, with how long the others then waited for them.
     timing.detail("startup_buffers", buffers_spent.as_secs_f64() * 1e3);
+    timing.detail("startup_link_rows", link_rows_spent.as_secs_f64() * 1e3);
     timing.detail("startup_tables", startup_spent.0.as_secs_f64() * 1e3);
     timing.detail("startup_tables_waited", startup_spent.1.as_secs_f64() * 1e3);
     let Some(tables) = tables? else {
@@ -546,12 +568,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let ctx = ctx;
     timing.stage("links_parse");
 
-    // Link rows first, then event rows, then click rows, all in one pool:
-    // no thread waits for the last link chunk before it starts on events.
-    // The link builder starts once the last link task has ended.
     let mut tasks = Vec::new();
-    chunk_tasks(Kind::Links, &link_files, LINK_CHUNK, &mut tasks);
-    let link_tasks = tasks.len();
     chunk_tasks(Kind::Events, &event_files, EVENT_CHUNK, &mut tasks);
     chunk_tasks(Kind::Clicks, &click_files, EVENT_CHUNK, &mut tasks);
     if std::env::var_os("SS_PRETOUCH").is_some_and(|value| value == "1") {
@@ -562,11 +579,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         parallel(threads, |_| {
             let mut sum = 0u64;
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                let files = match task.kind {
-                    Kind::Events => &event_files,
-                    Kind::Clicks => &click_files,
-                    Kind::Links => &link_files,
-                };
+                let files = if task.kind == Kind::Events { &event_files } else { &click_files };
                 let bytes = &files[task.file].bytes()[task.start..task.end];
                 let full = std::env::var_os("SS_PRETOUCH_FULL").is_some();
                 if full {
@@ -590,40 +603,12 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let link_nanos = AtomicU64::new(0);
-    // Each worker's link pairs: a slot is touched only by its own thread's
-    // link tasks, and taken by the builder once all link tasks have ended.
-    let link_out: Slots<Vec<(u64, u64)>> = Slots::new(threads, Vec::new);
-    // Link tasks ended so far; the builder waits for all of them.
-    let links_done = (std::sync::Mutex::new(0usize), std::sync::Condvar::new());
-    let parse_started = Instant::now();
-    let links_ready_nanos = AtomicU64::new(0);
     let (link_table, click_index) = std::thread::scope(|scope| {
         // The links are resolved beside the parse, on one thread. In index
         // mode almost every link joins two IDs of one user, and those are
         // done user by user with no shared table (`links::build_indexed`), a
         // fraction of the work of the single table the general path builds.
         let builder = scope.spawn(|| {
-            {
-                let (count, ended) = &links_done;
-                let mut done = count.lock().unwrap();
-                while *done < link_tasks {
-                    done = ended.wait(done).unwrap();
-                }
-            }
-            links_ready_nanos.store(parse_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            let link_pairs: Vec<Vec<(u64, u64)>> = (0..threads)
-                .map(|thread| {
-                    // SAFETY: every link task has ended (the count above, under
-                    // its lock), and no thread touches its slot afterwards.
-                    std::mem::take(unsafe { link_out.get(thread) })
-                })
-                .collect();
-            // Parse-only diagnostics may time the parse without user-table
-            // lookups once the link IDs are all in the table.
-            if ctx.diag != 0 {
-                codes::arm_fake_lookups();
-            }
             let started = Instant::now();
             let table = match &ctx.keys {
                 Some(keys) => links::build_indexed(&link_pairs, &ctx.user_ids, keys, 0),
@@ -637,47 +622,22 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             let out = unsafe { parse_out.get(thread) };
             let (mut events_spent, mut clicks_spent) = (0u64, 0u64);
             codes::begin_thread_ids(thread);
-            let mut links_spent = 0u64;
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
                 let started = measure.then(Instant::now);
-                match task.kind {
-                    Kind::Events => {
-                        parse::parse_events_chunk(&ctx, event_files[task.file].bytes(), task.start, task.end, out)
-                    }
-                    Kind::Clicks => {
-                        parse::parse_clicks_chunk(&ctx, click_files[task.file].bytes(), task.start, task.end, out)
-                    }
-                    Kind::Links => {
-                        // Counts the task as ended when it ends, even by a
-                        // panic, so that the builder never waits forever.
-                        struct Ended<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar), usize);
-                        impl Drop for Ended<'_> {
-                            fn drop(&mut self) {
-                                let (count, ended) = self.0;
-                                let mut done = count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                *done += 1;
-                                if *done >= self.1 {
-                                    ended.notify_all();
-                                }
-                            }
-                        }
-                        let _ended = Ended(&links_done, link_tasks);
-                        // SAFETY: slot `thread` belongs to this thread's link
-                        // tasks; the builder takes it only after they ended.
-                        let pairs = unsafe { link_out.get(thread) };
-                        parse::parse_links_chunk(&ctx, link_files[task.file].bytes(), task.start, task.end, pairs);
-                    }
+                if task.kind == Kind::Events {
+                    parse::parse_events_chunk(&ctx, event_files[task.file].bytes(), task.start, task.end, out);
+                } else {
+                    parse::parse_clicks_chunk(&ctx, click_files[task.file].bytes(), task.start, task.end, out);
                 }
                 if let Some(started) = started {
                     let spent = started.elapsed().as_nanos() as u64;
-                    match task.kind {
-                        Kind::Events => events_spent += spent,
-                        Kind::Clicks => clicks_spent += spent,
-                        Kind::Links => links_spent += spent,
+                    if task.kind == Kind::Events {
+                        events_spent += spent;
+                    } else {
+                        clicks_spent += spent;
                     }
                 }
             }
-            link_nanos.fetch_add(links_spent, Ordering::Relaxed);
             out.click_ids = codes::take_thread_ids();
             event_nanos.fetch_add(events_spent, Ordering::Relaxed);
             click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
@@ -750,8 +710,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     if let Some((_, spent)) = &click_index {
         timing.detail("click_index", spent.as_secs_f64() * 1e3);
     }
-    timing.detail("cpu_parse_links", link_nanos.load(Ordering::Relaxed) as f64 / 1e6);
-    timing.detail("links_ready", links_ready_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_parse_events", event_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_parse_clicks", click_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("links_build", link_build_nanos.load(Ordering::Relaxed) as f64 / 1e6);
