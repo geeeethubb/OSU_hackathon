@@ -690,11 +690,15 @@ pub fn event_kernel() -> u32 {
 /// its caller as it did before; `SS_RARE=a`: purchases; unset: everything.
 /// Bit 1: a row the assembly declines goes straight to the general kernel
 /// (`event_row_rare`) instead of through the compiled lean kernel first.
+/// Bit 2: a row whose ts is no timestamp, or one outside the window
+/// whatever it says, is taken as the invalid row it is (`lean_no_ts`);
+/// `SS_RARE=b` is everything but this.
 pub fn rare_rows() -> u64 {
     static RARE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RARE.get_or_init(|| match std::env::var("SS_RARE").as_deref() {
         Ok("0") => 0,
         Ok("a") => 1,
+        Ok("b") => 3,
         _ => u64::MAX,
     })
 }
@@ -1580,8 +1584,9 @@ macro_rules! lean_ids {
 
 /// Both timestamps through the vector units, with the constants at r14: the
 /// sums of ts in xmm0, the first of them in rax too, those of ingest_ts in
-/// xmm4. Declines the row if a byte is over its limit, a number over its
-/// ceiling, or the IDs left something in ymm3.
+/// xmm4. If a byte is over its limit, a number over its ceiling, or the IDs
+/// left something in ymm3, the row goes to 30 (`lean_no_ts`), which declines
+/// it unless ts alone is at fault.
 macro_rules! lean_times {
     () => {
         concat!(
@@ -1593,7 +1598,7 @@ macro_rules! lean_times {
             "vpor ymm1, ymm1, ymm2\n",
             "vpor ymm1, ymm1, ymm3\n",
             "vptest ymm1, ymm1\n",
-            "jnz 2f\n",
+            "jnz 30f\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_first}]\n",
             "vpackusdw ymm0, ymm0, ymm0\n",
             "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_second}]\n",
@@ -1622,10 +1627,10 @@ macro_rules! lean_ts {
             // since the window's start, and the year text of its day.
             "vpextrd r15d, xmm0, 1\n",
             "vpextrd r8d, xmm0, 3\n",
-            "mov r12d, dword ptr [rdi + r12]\n",
-            "xor r12d, dword ptr [r14 + r15*8 + {f_day}]\n",
-            "and r12d, dword ptr [r14 + {f_year_mask}]\n",
-            "jnz 2f\n",
+            "mov ecx, dword ptr [rdi + r12]\n",
+            "xor ecx, dword ptr [r14 + r15*8 + {f_day}]\n",
+            "and ecx, dword ptr [r14 + {f_year_mask}]\n",
+            "jnz 31f\n",
             "movsxd r15, dword ptr [r14 + r15*8 + {f_day} + 4]\n",
             "add rax, r15\n",
             "imul rax, qword ptr [r14 + {f_scale}]\n",
@@ -1745,7 +1750,7 @@ macro_rules! lean_offset {
             "vpextrd r8d, xmm0, 1\n",
             "mov r15d, dword ptr [rdi + r12]\n",
             "cmp r15d, dword ptr [rsi + r8*8 + {day}]\n",
-            "jne 2f\n",
+            "jne 32f\n",
             "movsxd r15, dword ptr [rsi + r8*8 + {day} + 4]\n",
             "add rax, r15\n",
             // `+HH:MM` or `-HH:MM`: hours to 23, minutes to 59, as seconds (r8).
@@ -1759,7 +1764,7 @@ macro_rules! lean_offset {
             "vpandn xmm1, xmm2, xmm1\n",
             "vpmovmskb r8d, xmm1\n",
             "cmp r8d, 0xFFFF\n",
-            "jne 2f\n",
+            "jne 32f\n",
             "vpmaddwd xmm0, xmm0, xmmword ptr [rsi + {offset_weights}]\n",
             "vmovd r8d, xmm0\n",
             // The sign: -1 for `+` (the offset comes off), 1 for `-`.
@@ -1767,11 +1772,98 @@ macro_rules! lean_offset {
             "sub r15, 44\n",
             "lea r14, [r15 + 1]\n",
             "test r14, -3\n",
-            "jnz 2f\n",
+            "jnz 32f\n",
             "imul r8, r15\n",
             "add rax, r8\n",
             "imul rax, rax, 1000\n",
             "sub rax, qword ptr [rsi + {plain_start}]\n",
+            "jmp 5b\n",
+        )
+    };
+}
+
+/// A row whose ts is no timestamp, or is one that lies outside the window
+/// whatever it says: the general parser makes an invalid row of it (no ts,
+/// no user, its index and its ingest seconds), provided the line is seven
+/// well-formed fields and event ID and ingest_ts are good. Such a row comes
+/// here from three places and goes back to the straight line at 5 with ts
+/// "as far outside the window as can be", which makes it that invalid row;
+/// the rest of the row is then checked like any other row's.
+///
+/// 30: the vector test failed (rax: the length of ts, r8: where it ends,
+/// r12: where it starts, r14: its form's constants, ymm0: the numbers of
+/// both timestamps, ymm1: what is wrong, xmm3: what is wrong with the IDs).
+/// Only ts may be at fault: not the IDs, not ingest_ts, whose sums are then
+/// made here. ts must end inside the first 64 bytes (else its end is not
+/// known), must not be the empty-and-quote-only field of negative length,
+/// and must be empty or have a byte that is no digit among its last 16 (or
+/// fewer): a text of digits only is a number, which may lie in the window.
+/// 31: ts is F1 by every byte after its year, but not on a table day or not
+/// in that day's year. 32: ts is the offset form up to its seconds, but
+/// not on a table day, or what follows is no legal offset.
+/// 34: whichever it was, no byte of ts (rax of them, from r12) may be a
+/// quote or a newline: with one the line is not seven well-formed fields.
+///
+/// The frame's `rare` has bit 2 only where the day table reaches a day
+/// past the window on both sides, so a time on no table day is outside
+/// the window whatever its UTC offset.
+macro_rules! lean_no_ts {
+    () => {
+        concat!(
+            "30:\n",
+            "test byte ptr [rdx + {rare}], 4\n",
+            "jz 2f\n",
+            "vptest xmm3, xmm3\n",
+            "jnz 2f\n",
+            "vextracti128 xmm2, ymm1, 1\n",
+            "vptest xmm2, xmm2\n",
+            "jnz 2f\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_first}]\n",
+            "vpackusdw ymm0, ymm0, ymm0\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [r14 + {f_second}]\n",
+            "vextracti128 xmm4, ymm0, 1\n",
+            "cmp r8, 64\n",
+            "jae 2f\n",
+            "test rax, rax\n",
+            "js 2f\n",
+            "jz 33f\n",
+            "mov r15d, 16\n",
+            "cmp rax, 16\n",
+            "cmovb r15, rax\n",
+            "shl r15, 4\n",
+            "vmovdqu xmm0, xmmword ptr [rdi + r8 - 16]\n",
+            "vpxor xmm0, xmm0, xmmword ptr [rsi + {digit_zero}]\n",
+            "vpsubusb xmm0, xmm0, xmmword ptr [rsi + {nines}]\n",
+            "vpand xmm0, xmm0, xmmword ptr [rsi + r15 + {keep_last}]\n",
+            "vptest xmm0, xmm0\n",
+            "jz 2f\n",
+            "jmp 34f\n",
+            "31:\n",
+            "test byte ptr [rdx + {rare}], 4\n",
+            "jz 2f\n",
+            "mov eax, 20\n",
+            "jmp 34f\n",
+            "32:\n",
+            "test byte ptr [rdx + {rare}], 4\n",
+            "jz 2f\n",
+            "mov eax, 25\n",
+            "34:\n",
+            "vmovdqu ymm0, ymmword ptr [rdi + r12]\n",
+            "vmovdqu ymm1, ymmword ptr [rdi + r12 + 32]\n",
+            "vpcmpeqb ymm2, ymm0, ymm6\n",
+            "vpcmpeqb ymm0, ymm0, ymm7\n",
+            "vpor ymm0, ymm0, ymm2\n",
+            "vpmovmskb r15d, ymm0\n",
+            "vpcmpeqb ymm2, ymm1, ymm6\n",
+            "vpcmpeqb ymm1, ymm1, ymm7\n",
+            "vpor ymm1, ymm1, ymm2\n",
+            "vpmovmskb r14d, ymm1\n",
+            "shl r14, 32\n",
+            "or r15, r14\n",
+            "bzhi r15, r15, rax\n",
+            "jnz 2f\n",
+            "33:\n",
+            "mov rax, -1\n",
             "jmp 5b\n",
         )
     };
@@ -1966,6 +2058,7 @@ macro_rules! lean_row {
             "xor r15d, r15d\n",
             "jmp 8f\n",
             lean_offset!(),
+            lean_no_ts!(),
             lean_purchase!("cmp r15, qword ptr [rdx + {next}]\n", "jmp 8f\n", lean_bought_row),
             "2:\n",
             "mov r15d, 1\n",
@@ -2042,6 +2135,7 @@ macro_rules! lean_run {
             "xor r15d, r15d\n",
             "jmp 8f\n",
             lean_offset!(),
+            lean_no_ts!(),
             lean_purchase!("cmp r15, rbx\n", "jmp 23f\n", $bought),
             "22:\n",
             "mov r15d, 3\n",
@@ -2264,8 +2358,20 @@ impl LeanFrame {
             categories: ctx.category_by_product_number.as_ptr(),
             category_count: ctx.category_by_product_number.len() as u64,
             bought: 0,
-            rare: rare_rows(),
+            rare: if Self::table_spans_window(ctx) { rare_rows() } else { rare_rows() & !4 },
         }
+    }
+
+    /// Whether the day table (62 days from 9 days before the window, as
+    /// `TsTables::new` makes it) holds every day from a day before the
+    /// window's first to a day after its last, all of them in years that
+    /// have four digits. Then a time whose local date is on no table day is
+    /// outside the window, whatever its UTC offset (less than a day).
+    fn table_spans_window(ctx: &Ctx) -> bool {
+        let base_day = ctx.window_start.div_euclid(DAY_MS) - 9;
+        ctx.window_end + DAY_MS <= (base_day + 62) * DAY_MS
+            && civil_from_days(base_day).0 >= 0
+            && civil_from_days(base_day + 61).0 <= 9999
     }
 
     /// Whether `event_lean_run` can store for this run: the writers are as
@@ -2532,6 +2638,9 @@ thread_local! {
     /// Purchases the kernel in assembly finished by itself on this thread,
     /// and purchases it left to its caller.
     static BOUGHT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// Rows the kernel in assembly took as invalid for their ts alone, which
+    /// the compiled lean kernel declines.
+    static NO_TS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// As `event_row_fast`, with the lean kernel in front of it: the same
@@ -2570,12 +2679,21 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
     let read = event_lean_asm(lean, p, frame);
     #[cfg(test)]
     if MODE == MODE_ROW {
-        // The assembly must take exactly the rows `event_lean` takes that
-        // end where the early look said, and read the same from them.
+        // The assembly must take the rows `event_lean` takes that end where
+        // the early look said, and read the same from them. Beyond those it
+        // takes only rows `event_lean` declines for their ts, as invalid
+        // rows (what the general parser makes of them is the caller's check).
         let mut twin = EventRow::default();
         let (length, guess, status) = event_lean::<MODE, true>(ctx, lean, _window_length, p, out, &mut twin);
         let taken = status == ROW_EMIT && length == guess;
-        assert_eq!(read.status != 1, taken, "the assembly and the lean kernel take different rows");
+        if !taken && read.status != 1 {
+            assert!(
+                status == ROW_DECLINE && read.status == 0 && read.keep == 0,
+                "the assembly takes a row the lean kernel does not"
+            );
+            NO_TS.with(|count| count.set(count.get() + 1));
+        }
+        assert!(read.status != 1 || !taken, "the assembly declines a row the lean kernel takes");
         if taken {
             assert_eq!(frame.next, p.add(length + 1), "the assembly ends the row elsewhere");
             // A purchase comes back as one the assembly finished (4), one
@@ -4670,6 +4788,76 @@ mod tests {
             }
             // The clicks and counts `for_each_window` asks for.
             check.times(&ts);
+        });
+    }
+
+    /// Rows with a ts that is no timestamp, or one outside the window whatever
+    /// it says, are taken by the assembly as invalid rows; a ts of digits
+    /// only, or one with a quote in it, is not its business. Either way the
+    /// row is what the general parser makes of it (`Checker::event_with`).
+    #[test]
+    fn the_assembly_takes_rows_without_a_timestamp() {
+        for_each_window(|check| {
+            let taken = || NO_TS.with(|count| count.get());
+            let ingest = check.ingest.clone();
+            let good = check.ts.clone();
+            let (year, _, _) = civil_from_days(check.ctx.window_start.div_euclid(DAY_MS));
+            let mut texts: Vec<String> = [
+                "", "-7", "1.78e12", "1789639893000.0", "x", "17896398930o0", "2026-09-18T12:09:48", "nonsense",
+                "a-timestamp-of-thirty-one-bytes",
+            ]
+            .map(String::from)
+            .to_vec();
+            // The good ts with one thing wrong: no Z, milliseconds, small
+            // letters, a space, an impossible day, another year, a far day.
+            texts.push(good[..19].to_string());
+            texts.push(format!("{}.000Z", &good[..19]));
+            texts.push(good.replace('T', "t"));
+            texts.push(good.replace('Z', "z"));
+            texts.push(good.replace('T', " "));
+            texts.push(format!("{year:04}-02-30T10:00:00Z"));
+            texts.push(format!("{year:04}-13-01T10:00:00Z"));
+            texts.push(format!("{year:04}-00-10T10:00:00Z"));
+            texts.push(format!("{:04}{}", year + 1, &good[4..]));
+            texts.push(format!("{:04}{}", year - 3, &good[4..]));
+            texts.push(format!("2O26{}", &good[4..]));
+            // The offset form: no legal offset, no table day.
+            for offset in ["+24:00", "+05:60", "*05:30", "+05-30", "+0a:30", " 05:30"] {
+                texts.push(format!("{}{offset}", &good[..19]));
+            }
+            texts.push(format!("{:04}{}+05:30", year - 3, &good[4..19]));
+            for ts in &texts {
+                for quoted in [false, true] {
+                    let before = taken();
+                    let ts = if quoted { format!("\"{ts}\"") } else { ts.clone() };
+                    let line = check.view(&ts, &ingest);
+                    assert!(line.len() >= 64 && line.len() <= 95, "{}", line.len());
+                    check.event_with(&line, TAILS[0]);
+                    assert_eq!(taken(), before + 1, "not taken in assembly: ts {ts:?}");
+                }
+            }
+            // Not the assembly's: digits only (a number, wherever it lies),
+            // a quote or a doubled quote inside, a ts in the window after all.
+            let mut others: Vec<String> =
+                ["7", "178963989300", "01789639893000", "00000000000000000000", "0000000000000000000000000"]
+                    .map(String::from)
+                    .to_vec();
+            others.push(format!("0{}", check.digits));
+            others.push(format!("{}\"{}", &good[..10], &good[10..]));
+            others.push(format!("20\"6{}", &good[4..]));
+            others.push(format!("{}\"05:30", &good[..19]));
+            others.push(format!("ab\"cd"));
+            others.push(good.clone());
+            others.push(check.digits.clone());
+            others.push(format!("{}+00:00", &good[..19]));
+            for ts in &others {
+                let before = taken();
+                let line = check.view(ts, &ingest);
+                check.event_with(&line, TAILS[0]);
+                assert_eq!(taken(), before, "taken in assembly: ts {ts:?}");
+            }
+            // The clicks and counts `for_each_window` asks for.
+            check.times(&good);
         });
     }
 
