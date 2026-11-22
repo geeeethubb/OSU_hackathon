@@ -1711,6 +1711,267 @@ pub unsafe fn event_lean_long<const MODE: u32>(
     (length, ROW_DROP)
 }
 
+/// Whether `event_lean_wide` reads the rows `event_lean_long` declines for
+/// want of a newline in their first 128 bytes: yes unless `SS_WIDE=0`.
+pub fn wide_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SS_WIDE").as_deref() != Ok("0"))
+}
+
+/// `event_lean_long` for rows of 128 to 159 bytes, which it declines: in
+/// current generated data 0.4% of rows, all with both IDs long, 128 to 143
+/// bytes, which otherwise go through `event_row_fast` and the general
+/// parser. The same reading from the same six commas, found with the masks
+/// of bytes 32..160 instead of 0..128: the event ID then must be 33 bytes or
+/// more (no comma, newline or quote in bytes 1..32, a quote at byte 0 only
+/// as its opening one). Any other row it declines, as before.
+///
+/// # Safety
+/// `ROW_PAD` (192) bytes after `p` are readable, and 3 before it.
+#[inline(never)]
+pub unsafe fn event_lean_wide<const MODE: u32>(
+    ctx: &Ctx,
+    p: *const u8,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> (usize, u32) {
+    const DECLINE: (usize, u32) = (0, ROW_DECLINE);
+    let (lean, window_length) = lean_setup(ctx);
+    let comma = _mm256_load_si256(std::ptr::addr_of!((*lean).comma) as *const __m256i);
+    let quote = _mm256_load_si256(std::ptr::addr_of!((*lean).quote) as *const __m256i);
+    let newline = _mm256_load_si256(std::ptr::addr_of!((*lean).newline) as *const __m256i);
+    // Bytes 0..32: the event ID's, with no separator, and a quote at most at
+    // byte 0 (the ID's opening quote).
+    let head = _mm256_loadu_si256(p as *const __m256i);
+    let head_quotes = mask(head, quote);
+    if (mask(head, newline) | mask(head, comma)) != 0 || head_quotes & !1 != 0 {
+        return DECLINE;
+    }
+    // Bit i of these masks is byte 32 + i.
+    let blocks = [
+        _mm256_loadu_si256(p.add(32) as *const __m256i),
+        _mm256_loadu_si256(p.add(64) as *const __m256i),
+        _mm256_loadu_si256(p.add(96) as *const __m256i),
+        _mm256_loadu_si256(p.add(128) as *const __m256i),
+    ];
+    let wide = |byte: __m256i| -> u128 {
+        let low = mask(blocks[0], byte) | (mask(blocks[1], byte) << 32);
+        let high = mask(blocks[2], byte) | (mask(blocks[3], byte) << 32);
+        (u128::from(high) << 64) | u128::from(low)
+    };
+    let newlines = wide(newline);
+    if newlines == 0 {
+        return DECLINE;
+    }
+    let length = 32 + newlines.trailing_zeros() as usize;
+    // A row that ends sooner `event_lean_long` saw whole and declined.
+    if length < 128 {
+        return DECLINE;
+    }
+    let below = (1u128 << (length - 32)) - 1;
+    let commas = wide(comma) & below;
+    let quotes = wide(quote) & below;
+    // Six commas, the first after byte 32, so that the event ID's last byte
+    // (where its closing quote would be) is inside the masks.
+    if commas.count_ones() != 6 || commas & 1 != 0 {
+        return DECLINE;
+    }
+    // `event_lean_long`'s quote rule: field 0 opens at byte 0, outside the
+    // masks (`head_quotes`); every other start and every end is inside.
+    let separators = commas | (1u128 << (length - 32));
+    let starts = separators << 1;
+    let ends = separators >> 1;
+    let pext128 = |bits: u128, select: u128| -> u64 {
+        let (low, high) = (bits as u64, (bits >> 64) as u64);
+        let (select_low, select_high) = (select as u64, (select >> 64) as u64);
+        _pext_u64(low, select_low) | (_pext_u64(high, select_high) << select_low.count_ones())
+    };
+    let opened = u64::from(head_quotes & 1) | (pext128(quotes, starts) << 1);
+    if ((quotes & !(starts | ends)) | (quotes & starts & ends)) != 0 || opened != pext128(quotes, ends) {
+        return DECLINE;
+    }
+    let c0 = 32 + commas.trailing_zeros() as usize;
+    let rest = commas & (commas - 1);
+    let c1 = 32 + rest.trailing_zeros() as usize;
+    let rest = rest & (rest - 1);
+    let c2 = 32 + rest.trailing_zeros() as usize;
+    let rest = rest & (rest - 1);
+    let c3 = 32 + rest.trailing_zeros() as usize;
+    let rest = rest & (rest - 1);
+    let c4 = 32 + rest.trailing_zeros() as usize;
+    let rest = rest & (rest - 1);
+    let c5 = 32 + rest.trailing_zeros() as usize;
+    let quoted = |index: u32| ((opened >> index) & 1) as usize;
+    // Field 4's quotes are part of the type's text, matched below.
+    let (q0, q1, q2, q3, q5, q6) = (quoted(0), quoted(1), quoted(2), quoted(3), quoted(5), quoted(6));
+
+    // Both IDs: short (the prefix and 7 or 8 characters, coded as
+    // `event_lean` codes them) or long (one byte and 32 hexadecimal digits).
+    let event_at = p.add(q0);
+    let event_length = c0 - 2 * q0;
+    let user_at = p.add(c0 + 1 + q1);
+    let user_length = c1 - c0 - 1 - 2 * q1;
+    let (event_short, user_short, known) = two_codes(read_u64(event_at.add(1)), read_u64(user_at.add(1)));
+    let event_value = if event_length == 33 {
+        match hex_value32(event_at.add(1)) {
+            Some(value) => Some(value),
+            None => return DECLINE,
+        }
+    } else {
+        let extra = event_length.wrapping_sub(8);
+        if extra > 1 || *event_at != b'e' || known & 0xFF != 0x7F | ((extra as u32) << 7) {
+            return DECLINE;
+        }
+        None
+    };
+    let user_value = if user_length == 33 {
+        match hex_value32(user_at.add(1)) {
+            Some(value) => {
+                // Its slot in the user table loads while the rest is read.
+                ctx.user_ids.prefetch_hex(*user_at, value);
+                Some(value)
+            }
+            None => return DECLINE,
+        }
+    } else {
+        let extra = user_length.wrapping_sub(8);
+        if extra > 1 || *user_at != b'u' || (known >> 8) & 0xFF != 0x7F | ((extra as u32) << 7) {
+            return DECLINE;
+        }
+        None
+    };
+
+    // Both timestamps, as `event_lean` reads them. ingest_ts is 20 bytes.
+    let ts_at = p.add(c1 + 1 + q2);
+    let ts_length = (c2 - c1 - 1 - 2 * q2) as u32;
+    let ingest_at = p.add(c2 + 1 + q3);
+    if c3 - c2 - 1 - 2 * q3 != 20 {
+        return DECLINE;
+    }
+    let (ts_packed, ingest_packed, good) = iso_tails(ts_at, ingest_at);
+    let days = std::ptr::addr_of!((*lean).forms.day) as *const [u32; 2];
+    let ingest_day = *days.add((ingest_packed & 511) as usize);
+    if good < 0xFFFF_0000 || ingest_day[0] != (ingest_at as *const u32).read_unaligned() {
+        return DECLINE;
+    }
+    let ingest_seconds = i64::from(ingest_day[1] as i32) + (ingest_packed >> 32) as i64;
+    if ingest_seconds as u64 >= 1 << 21 {
+        return DECLINE;
+    }
+    let base_ms = (*lean).base_ms;
+    let ingest_ms = base_ms + ingest_seconds * 1_000;
+    let ts_day = *days.add((ts_packed & 511) as usize);
+    let ts_year = (ts_at as *const u32).read_unaligned();
+    let iso_ms = base_ms + (i64::from(ts_day[1] as i32) + (ts_packed >> 32) as i64) * 1_000;
+    let ts_ms = if ts_length == 25 {
+        let offset = iso_offset(ts_at.add(19));
+        if good & 0x7FFF != 0x7FFF || ts_day[0] != ts_year || offset == NOT_FAST {
+            return DECLINE;
+        }
+        iso_ms.wrapping_sub(offset.wrapping_mul(1_000))
+    } else {
+        let (digits, digit_mask) = digits13(ts_at);
+        let not_digits = (digit_mask ^ 0xFFFF) | (ts_length ^ 13);
+        let not_plain = ((good & 0xFFFF) ^ 0xFFFF) | (ts_length ^ 20) | (ts_day[0] ^ ts_year);
+        if u64::from(not_digits) * u64::from(not_plain) != 0 {
+            return DECLINE;
+        }
+        select_unpredictable(not_digits == 0, digits, iso_ms)
+    };
+    let ts = ts_ms.wrapping_sub(ctx.window_start) as u64;
+    let mut valid = (ts < window_length) & (ingest_ms.wrapping_sub(ts_ms) <= LATE_MS);
+
+    // The event type with its commas and quotes, as `event_lean` matches it,
+    // and its closing comma must be the fifth.
+    let type_at = p.add(c3);
+    let lanes = _mm256_set1_epi64x(read_u64(type_at) as i64);
+    let masks = _mm256_setr_epi64x(TYPE_SHORT as i64, TYPE_SHORT as i64, -1, -1);
+    let texts =
+        _mm256_setr_epi64x(TYPE_VIEW as i64, TYPE_CART as i64, TYPE_VIEW_QUOTED as i64, TYPE_CART_QUOTED as i64);
+    let hits = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(lanes, masks), texts)))
+        as usize;
+    let mut step = usize::from(*(*lean).type_step.get_unchecked(hits));
+    let is_purchase = step == 0;
+    if is_purchase {
+        let heads = _mm256_setr_epi64x(TYPE_PURCHASE as i64, TYPE_PURCHASE_QUOTED as i64, 0, 0);
+        let found = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(lanes, heads))) & 3;
+        let plain = (found == 1) & ((type_at.add(8) as *const u16).read_unaligned() == 0x2C65);
+        let quoted = (found == 2) & ((type_at.add(8) as *const u32).read_unaligned() == 0x2C22_6573);
+        if !(plain | quoted) {
+            return DECLINE;
+        }
+        step = 9 + 2 * usize::from(quoted);
+    }
+    let product_length = c5 - c4 - 1 - 2 * q5;
+    if c3 + step != c4 || product_length == 0 {
+        return DECLINE;
+    }
+
+    let mut purchase = None;
+    if is_purchase && valid {
+        let price = std::slice::from_raw_parts(p.add(c5 + 1 + q6), length - c5 - 1 - 2 * q6);
+        match parse_price(price) {
+            Some(price) => purchase = Some((price, product_category(ctx, p.add(c4 + 1 + q5), product_length))),
+            None => valid = false,
+        }
+    }
+    // A valid row of a long user ID waits in the worker's ring for the slot
+    // asked for above, and is stored when it leaves it.
+    if MODE == MODE_STORE && valid && defer_lookups() {
+        if let Some(value) = user_value {
+            let (bought, purchase) = match purchase {
+                Some((price, category)) => (u64::from(price) | (u64::from(category) << 32), true),
+                None => (0, false),
+            };
+            let deferred = super::parse::Deferred {
+                user_value: value,
+                event_value: event_value.unwrap_or(0),
+                event_short,
+                ts,
+                ingest: ingest_seconds as u64,
+                bought,
+                user_first: *user_at,
+                event_first: *event_at,
+                long_event: event_value.is_some(),
+                purchase,
+            };
+            super::parse::defer_row(ctx, out, deferred);
+            return (length, ROW_DONE);
+        }
+    }
+    // An invalid row keeps neither its time nor its user, as in
+    // `event_lean_finish`; only a valid one needs its user's code.
+    let user_code = match (valid, user_value) {
+        (false, _) => 0,
+        (true, None) => user_short,
+        (true, Some(value)) => ctx.user_ids.hex_code(*user_at, value),
+    };
+    let ts = ts & u64::from(valid).wrapping_neg();
+    let Some(value) = event_value else {
+        return (length, event_lean_finish::<MODE, false>(out, row, event_short, user_code, ts, valid, ingest_seconds, purchase));
+    };
+    if MODE == MODE_STORE {
+        emit_long_value(out, *event_at, value, ts, u64::from(valid), user_code, ingest_seconds as u64, purchase);
+        return (length, ROW_DONE);
+    }
+    if MODE == MODE_ROW {
+        // As the general parser leaves it: the code, and the value aside.
+        set_long_value(*event_at, value);
+        *row = EventRow {
+            event: LONG_EVENT,
+            user: user_code,
+            user_is_number: false,
+            ts: ts as u32,
+            ingest: ingest_seconds as u32,
+            valid,
+            purchase,
+        };
+        return (length, ROW_EMIT);
+    }
+    row.event ^= (value as u64) ^ user_code ^ ts ^ (ingest_seconds as u64);
+    (length, ROW_DROP)
+}
+
 // ---------------------------------------------------------------------------
 // The lean kernel in assembly, for index mode: `event_lean` again, as one
 // piece of code in which every value stays in its register from where it is
@@ -3294,6 +3555,12 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
             let (length, status) = event_lean_long::<MODE>(ctx, p, out, row);
             if status != ROW_DECLINE {
                 return (length, status);
+            }
+            if wide_rows() {
+                let (length, status) = event_lean_wide::<MODE>(ctx, p, out, row);
+                if status != ROW_DECLINE {
+                    return (length, status);
+                }
             }
         }
         return event_row_fast::<MODE, INDEXED>(ctx, p, out, row);
