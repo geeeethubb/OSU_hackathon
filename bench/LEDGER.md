@@ -207,8 +207,8 @@ known so far is 1.38 s for `e4eef020`).
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | **0.4648 s** | BB-9044646E | relayed by the user 2026-11-22 about 01:40 UTC |
-| `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | 0.4663 s | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:55 UTC |
+| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | **0.4648 s** | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
+| `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | 0.4663 s | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:45 UTC |
 | `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | 0.5231 s | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
 | `2dae9298f4e1e0a5259eec54c400501b00fae26f` | 0.6389 s (shown earlier as 0.64 s) | not relayed | relayed by the user 2026-11-21 |
 | `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e` (candidate C) | 0.64 s | not relayed | same |
@@ -775,7 +775,7 @@ base was `b890895` and the comparison was against candidate E.
   Its CI run pairs it against F and carries the 60M check; the steps were measured one at a time, and
   only this combined run counts for the combination.
 
-### 00:40 UTC
+### 00:34 UTC
 
 - **Agents stopped.** At about 00:15 UTC the parser, index-pass, click and correctness agents all ended
   on the account's model usage limit (resets 2026-11-24, after the cutoff). Committed work is intact;
@@ -807,7 +807,7 @@ base was `b890895` and the comparison was against candidate E.
 - **Candidate F3 (this push):** F2 + fixes + K + G(a). Unit tests 53/53, fixtures 36/36 and 43/43,
   dev, 20M seeds 2 and 3 MATCH locally. Its CI run pairs it against F with the 60M check.
 
-### 00:50 UTC
+### 00:45 UTC
 
 - **Calibration, measured (branch `exp-calib`, run 44967358977).** The seven officially scored commits
   timed on one runner (AMD EPYC 7763, 2 cores x 2 threads), 20M seed 2, six shuffled rounds of fresh
@@ -840,7 +840,7 @@ base was `b890895` and the comparison was against candidate E.
 - **In CI:** declined event rows straight to the general kernel (`1b73234`, G(b) step 1, against F3,
   variant `SS_RARE=a`).
 
-### 01:00 UTC
+### 00:45 UTC (later)
 
 - **Official: candidate F3 scored 0.4663 s** (`8dde2af12e542b0df94ba6d0be3da4f8660f896d`, receipt
   BB-9900D7A0): 56.8 ms and 10.9% less than F's 0.5231 s. Relayed by the user. `bench/BEST_SHA` now
@@ -853,7 +853,7 @@ base was `b890895` and the comparison was against candidate E.
 - **Agents remain stopped** (usage limit); the lead works alone with CI. Budget is kept for integration
   and the final candidate's validation.
 
-### 01:15 UTC
+### 00:59 UTC
 
 - **F3 fresh seeds 41 / 43 / 47** (run 44968021383): +27.1 / +30.9 / +28.9 ms against F, 18/18 pairs,
   A/A medians +1.3 / -0.3 / -1.0. F3 is confirmed on nine seeds in all.
@@ -904,7 +904,7 @@ base was `b890895` and the comparison was against candidate E.
 - **Agents:** three were resumed at 00:52 and two stopped again at 00:56 on the user's budget note; the
   parser agent alone continues, scoped to G(b)(2) and hypothesis 1, then stops.
 
-### 01:25 UTC
+### 01:03 UTC
 
 - **T, lookup tables without one allocation per product** (`60758b0` on top of `1b73234`, against F3,
   run 44968983694, EPYC 9V74): **+11.8 / +12.6 / +20.5 ms, 18/18 pairs**, A/A medians -3.3 / -1.8 /
@@ -923,7 +923,7 @@ base was `b890895` and the comparison was against candidate E.
 - **Candidate F4 (this push):** F3 + `1b73234` + `60758b0`. Its CI run carries the 60M check; fresh
   seeds follow as a dispatch run.
 
-### 01:35 UTC
+### 01:12 UTC
 
 - **Candidate F4 `bad5c1b1bc3178508db7de5d7459197741497236` VERIFIED** (F3 + lookup tables without one
   allocation per product + declined rows straight to the general kernel), against F3:
@@ -940,7 +940,7 @@ base was `b890895` and the comparison was against candidate E.
   different families made blind to the current engine, then compared with it; three adversarial reviews
   each; a ranking that picks at most two bounded prototypes). Results follow in the next entry.
 
-### 01:45 UTC
+### 01:13 UTC
 
 - **Official: candidate F4 scored 0.4648 s** (`bad5c1b1bc3178508db7de5d7459197741497236`, receipt
   BB-9044646E), 1.5 ms below F3's 0.4663 s. In CI the step was +4 to +20 ms depending on the runner.
@@ -955,7 +955,7 @@ base was `b890895` and the comparison was against candidate E.
   the container time on that runner: the largest single block outside the event parser. Its output is
   wrong by design under the switch; the diagnostic never enters a candidate.
 
-### 02:00 UTC
+### 01:16 UTC
 
 - **Attribution anatomy** (profile lab, run 44970524890, EPYC 9V45, F4's code built with the session
   kernel's lap profiler on, 20M seed 2, NCPU=4, three rounds, per-worker laps summed over four workers):
