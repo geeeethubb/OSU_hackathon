@@ -1,0 +1,14 @@
+target/
+out/
+dev/
+dev-answer/
+data/
+bench-data/
+*.parquet
+__pycache__/
+.venv/
+# Local copies of the organizers' archives (not ours to publish)
+/starter-duckdb/
+/starter-polars/
+/starter-pyspark/
+/generator/

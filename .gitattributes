@@ -1,3 +1,7 @@
 * text=auto eol=lf
 *.sh text eol=lf
 Dockerfile text eol=lf
+# Fixture inputs are byte-exact test data (E20 holds real CRLF): never convert.
+fixtures/** -text
+extra_fixtures/** -text
+*.csv -text

@@ -1,0 +1,62 @@
+# A profile for profile-guided optimization (PGO) of the scored build.
+#
+# Builds an instrumented pipeline in the same pinned Rust image the root
+# Dockerfile uses, runs it on practice-size data from the organizers'
+# generator, and merges the counters with that toolchain's own llvm-profdata.
+# The merged profile (branch and call counts only: no input data, no
+# answers) is uploaded as an artifact; committed as pgo/pipeline.profdata it
+# lets the root Dockerfile build with -Cprofile-use.
+#
+# Runs on a push to a branch named pgo-profile*, so that it never competes
+# with the benchmark jobs of other branches.
+name: PGO profile
+
+on:
+  push:
+    branches: ['pgo-profile*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore generator and dev answer
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator and dev answer (from the track page when not cached)
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Training data (20M events, seed 2)
+        run: |
+          mkdir -p "$RUNNER_TEMP/work/data"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/work/data/train"
+          du -sh "$RUNNER_TEMP/work/data/train"
+      - name: Instrumented build, profile runs, merge (pinned Rust image)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/work:/work" -w /src rust:1.100.0-slim-bookworm bash -c '
+            set -euo pipefail
+            rustup component add llvm-tools
+            export RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3 -Cprofile-generate=/work/pgo-raw"
+            export CARGO_TARGET_DIR=/work/target-gen
+            cargo build --release --locked --target x86_64-unknown-linux-gnu
+            bin=/work/target-gen/x86_64-unknown-linux-gnu/release/pipeline
+            for threads in 4 4; do
+              rm -rf /work/out && mkdir -p /work/out
+              DATA_DIR=/work/data/train OUTPUT_DIR=/work/out SCRATCH_DIR=/work/out NCPU=$threads "$bin"
+            done
+            profdata=$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -n 1)
+            "$profdata" merge -o /work/pipeline.profdata /work/pgo-raw
+            "$profdata" show /work/pipeline.profdata | tail -n 5
+            ls -la /work/pipeline.profdata
+            rustc --version --verbose
+          '
+          sha256sum "$RUNNER_TEMP/work/pipeline.profdata"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile
+          path: ${{ runner.temp }}/work/pipeline.profdata

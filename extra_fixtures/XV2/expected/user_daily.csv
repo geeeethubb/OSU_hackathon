@@ -1,0 +1,12 @@
+user_id,day,sessions,events,revenue_cents,top_category
+ua,2026-10-03,1,3,1100,shoes
+ub,2026-10-03,1,3,900,books
+uc,2026-10-03,1,2,800,Toys
+ud,2026-10-03,1,2,600,unknown
+ue,2026-10-03,1,2,600,shoes
+uf,2026-10-03,1,3,900,unknown
+ug,2026-10-03,3,3,1100,shoes
+ug,2026-10-04,1,1,100,books
+uh,2026-10-03,1,3,100,shoes
+ui,2026-10-03,1,3,300,Toys
+uj,2026-10-03,1,1,0,

@@ -1,0 +1,28 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "ss"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pipeline"
+path = "src/bin/pipeline.rs"
+
+[[bin]]
+name = "reference"
+path = "src/bin/reference.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/bin/chmod.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

@@ -1,0 +1,339 @@
+# Correctness and benchmark evidence for every commit. Methodology: bench/README.md.
+#
+#   correctness  build the root Dockerfile for linux/amd64, the 36 official fixtures and
+#                extra_fixtures/ the organizers' way, the 1M dev set against the published answer
+#   bench-20m    practice scale (20M events): container start-up and read-through diagnostics,
+#                timed fresh-container runs, the prior best in balanced order, /reference diff
+#   bench-60m    final scale (60M events), on request: run with `run_60m` or put [60m] in the
+#                commit message
+#   report       one sticky pull-request comment per commit SHA with the jobs' reports
+#
+# Every job's summary starts with the exact commit SHA and its raw results are a JSON artifact.
+name: CI
+
+on:
+  push:
+    # pgo-profile* branches only make a PGO profile (pgo.yml).
+    branches-ignore: ['pgo-profile*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "bench-20m: generator seeds, first the tuning seed, then holdouts (empty: bench/SEEDS)"
+        default: ""
+      runs:
+        description: "bench-20m: timed fresh-container runs per image"
+        default: "3"
+      pairs:
+        description: "bench-20m: AB/BA pairs for the A/A check and for prior-vs-candidate (0: none)"
+        default: "6"
+      pair_budget_s:
+        description: "bench-20m: seconds the paired runs may take per seed (slow pipelines get fewer pairs)"
+        default: "300"
+      variant_env:
+        description: "bench-20m: also pair this commit against itself with extra environment, e.g. SS_FAST=0"
+        default: ""
+      diag_envs:
+        description: "bench-20m: diagnostic runs (not ranked, not verified), comma-separated, e.g. SS_DIAG=7,SS_DIAG=8"
+        default: ""
+      cold_run:
+        description: "bench-20m: add one labelled run from a cold page cache"
+        type: boolean
+        default: true
+      run_60m:
+        description: "also run bench-60m (60M events / 15M clicks)"
+        type: boolean
+        default: false
+      seed_60m:
+        description: "bench-60m: generator seed"
+        default: "2"
+      standin:
+        description: "harness self-test: behave as if this commit had no root Dockerfile"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+env:
+  # The commit under test. For pull_request events this is the branch head, not the merge commit.
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  BENCH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  IMAGE: shopping-sessions:latest
+  DIAG_IMAGE: ss-diag:latest
+  TOOLS_KEY: ss-tools-v2
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Harness self-test: behave as if this commit had no root Dockerfile.
+  STANDIN: ${{ inputs.standin }}
+
+jobs:
+  correctness:
+    # A pull request from a branch of this repository gets the same commit tested by its push
+    # event; running it twice would only double the load. Fork pull requests are tested here.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - name: Python deps
+        run: python3 -m pip install --quiet polars
+      - name: Restore generator and dev answer
+        id: tools
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator and dev answer (from the track page when not cached)
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Save generator and dev answer
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Build image (linux/amd64)
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
+      - name: Fixtures, extra fixtures and the dev answer
+        run: |
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
+          python3 bench/bench.py correctness --image "$image" --tools "$HOME/ss-tools" \
+            --work "$RUNNER_TEMP/ss" --out-json "$RUNNER_TEMP/evidence/correctness.json"
+      - name: Report
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 bench/report.py --job correctness "$RUNNER_TEMP/evidence/correctness.json" > "$RUNNER_TEMP/evidence/correctness.md"
+          cat "$RUNNER_TEMP/evidence/correctness.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ss-correctness
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  bench-20m:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      INPUT_SEEDS: ${{ inputs.seeds }}
+      INPUT_VARIANT: ${{ inputs.variant_env }}
+      INPUT_DIAG: ${{ inputs.diag_envs }}
+      VAR_SEEDS: ${{ vars.BENCH_SEEDS }}
+      COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+      RUNS: ${{ inputs.runs || '3' }}
+      PAIRS: ${{ inputs.pairs || '6' }}
+      PAIR_BUDGET_S: ${{ inputs.pair_budget_s || '300' }}
+      COLD_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.cold_run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0   # bench/BEST_SHA may name any earlier commit
+      - name: Python deps
+        run: python3 -m pip install --quiet polars
+      - name: Restore generator and dev answer
+        id: tools
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator and dev answer (from the track page when not cached)
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Save generator and dev answer
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Build image (linux/amd64)
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
+      - name: Build diagnostics image
+        run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
+      - name: Build prior-best image (bench/BEST_SHA)
+        id: prior
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: bash bench/build_prior.sh ss-prior:latest
+      - name: Benchmark (20M events)
+        env:
+          PRIOR_IMAGE: ${{ steps.prior.outputs.image }}
+          PRIOR_SHA: ${{ steps.prior.outputs.sha }}
+          PRIOR_STATUS: ${{ steps.prior.outputs.status }}
+        run: |
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
+          cold=""; [ "$COLD_RUN" = "true" ] && cold="--cold-run"
+          # Seeds: the run_workflow input, else [seeds=2,7] in the commit message, else the
+          # BENCH_SEEDS repository variable, else bench/SEEDS, else 2.
+          seeds="$INPUT_SEEDS"
+          [ -n "$seeds" ] || seeds=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[seeds=\([0-9 ,]*\)\].*/\1/p' | head -n 1)
+          [ -n "$seeds" ] || seeds="$VAR_SEEDS"
+          if [ -z "$seeds" ] && [ -f bench/SEEDS ]; then seeds=$(sed -e 's/#.*//' bench/SEEDS | tr '\n' ' '); fi
+          [ -n "$(printf '%s' "$seeds" | tr -d ' ,')" ] || seeds=2
+          echo "seeds: $seeds"
+          # A variant: the run_workflow input, else [variant=NAME=VALUE ...] in the commit message.
+          variant="$INPUT_VARIANT"
+          [ -n "$variant" ] || variant=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[variant=\([^]]*\)\].*/\1/p' | head -n 1)
+          [ -z "$variant" ] || echo "variant: $variant"
+          # Diagnostic runs: the run_workflow input, else [diag=NAME=VALUE,NAME=VALUE ...] in the commit message.
+          diag="$INPUT_DIAG"
+          [ -n "$diag" ] || diag=$(printf '%s' "$COMMIT_MESSAGE" | sed -n 's/.*\[diag=\([^]]*\)\].*/\1/p' | head -n 1)
+          [ -z "$diag" ] || echo "diagnostic runs: $diag"
+          python3 bench/bench.py bench20m --image "$image" --diag-image "$DIAG_IMAGE" \
+            --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
+            --out-json "$RUNNER_TEMP/evidence/bench-20m.json" \
+            --seeds "$seeds" --runs "$RUNS" --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" $cold \
+            --variant-env "$variant" --diag-envs "$diag" \
+            --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/siblings"
+          # The other jobs' results fill two cells of the compact line; here they are optional.
+          for job in correctness bench-60m; do
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "ss-$job" --dir "$RUNNER_TEMP/siblings/$job" 2>/dev/null \
+              || echo "no $job results to add (not finished, or not run)"
+          done
+          python3 bench/report.py --job bench-20m "$RUNNER_TEMP/evidence/bench-20m.json" \
+            --correctness-json "$RUNNER_TEMP/siblings/correctness/correctness.json" \
+            --bench60m-json "$RUNNER_TEMP/siblings/bench-60m/bench-60m.json" > "$RUNNER_TEMP/evidence/bench-20m.md"
+          cat "$RUNNER_TEMP/evidence/bench-20m.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ss-bench-20m
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  bench-60m:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.run_60m) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[60m]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SEED_60M: ${{ inputs.seed_60m || '2' }}
+      PAIRS: ${{ inputs.pairs || '6' }}
+      PAIR_BUDGET_S: ${{ inputs.pair_budget_s || '300' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0   # bench/BEST_SHA may name any earlier commit
+      - name: Disk space (60M events is about 5.7 GB of CSV)
+        run: |
+          df -h / "$RUNNER_TEMP"
+          free_gb=$(df --output=avail -BG "$RUNNER_TEMP" | tail -1 | tr -dc '0-9')
+          if [ "$free_gb" -lt 16 ]; then
+            echo "only ${free_gb} GB free: removing preinstalled SDKs this job does not use"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+            df -h "$RUNNER_TEMP"
+          fi
+      - name: Python deps
+        run: python3 -m pip install --quiet polars
+      - name: Restore generator and dev answer
+        id: tools
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator and dev answer (from the track page when not cached)
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Save generator and dev answer
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Build image (linux/amd64)
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: docker buildx build --platform linux/amd64 --load -t "$IMAGE" .
+      - name: Build diagnostics image
+        run: docker buildx build --platform linux/amd64 --load -t "$DIAG_IMAGE" -f bench/diag.Dockerfile bench
+      - name: Build prior-best image (bench/BEST_SHA)
+        id: prior
+        if: hashFiles('Dockerfile') != '' && inputs.standin != true
+        run: bash bench/build_prior.sh ss-prior:latest
+      - name: Benchmark (60M events)
+        env:
+          PRIOR_IMAGE: ${{ steps.prior.outputs.image }}
+          PRIOR_SHA: ${{ steps.prior.outputs.sha }}
+          PRIOR_STATUS: ${{ steps.prior.outputs.status }}
+        run: |
+          image=""; [ -f Dockerfile ] && [ "$STANDIN" != "true" ] && image="$IMAGE"
+          python3 bench/bench.py bench60m --image "$image" --diag-image "$DIAG_IMAGE" \
+            --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
+            --out-json "$RUNNER_TEMP/evidence/bench-60m.json" --seed "$SEED_60M" \
+            --pairs "$PAIRS" --pair-budget-s "$PAIR_BUDGET_S" \
+            --prior-image "$PRIOR_IMAGE" --prior-sha "$PRIOR_SHA" --prior-status "$PRIOR_STATUS"
+      - name: Report
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 bench/report.py --job bench-60m "$RUNNER_TEMP/evidence/bench-60m.json" > "$RUNNER_TEMP/evidence/bench-60m.md"
+          cat "$RUNNER_TEMP/evidence/bench-60m.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ss-bench-60m
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  report:
+    # One sticky comment per commit SHA on the branch's open pull request, with every job's report.
+    needs: [correctness, bench-20m, bench-60m]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - name: Reports of this run
+        if: needs.correctness.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ss-*
+          path: ${{ runner.temp }}/reports
+      - name: Reports of other runs for this commit
+        # A commit can be tested by more than one run: its push, a 60M run started by hand, and
+        # the pull_request event, which runs no tests of its own for a branch of this repository.
+        # The comment is one per commit, so it gathers what all of them found.
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$HEAD_SHA" --limit 20 \
+            --json databaseId,status --jq '.[] | select(.status == "completed") | .databaseId')
+          for run_id in $others; do
+            [ "$run_id" = "$GITHUB_RUN_ID" ] && continue
+            echo "adding the reports of run $run_id"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --pattern 'ss-*' --dir "$RUNNER_TEMP/reports/run-$run_id" \
+              || echo "run $run_id has no reports to add"
+          done
+          if [ -z "$(find "$RUNNER_TEMP/reports" -name '*.json' -print -quit)" ]; then
+            echo "::notice::no finished run has results for $HEAD_SHA yet; the run that tests it posts the comment when it finishes"
+          fi
+      - name: Sticky pull-request comment
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          python3 bench/sticky_comment.py --sha "$HEAD_SHA" --reports "$RUNNER_TEMP/reports" \
+            --repo "$GITHUB_REPOSITORY" ${PR_NUMBER:+--pr "$PR_NUMBER"} --branch "$BRANCH" \
+            --summary "$GITHUB_STEP_SUMMARY"
