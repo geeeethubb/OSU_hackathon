@@ -15,7 +15,14 @@ pub struct Arena {
     chunks: Vec<Vec<u64>>,
     cursor: *mut u64,
     left: usize,
+    /// Blocks of `RECYCLE_WORDS` words that nothing reads any more
+    /// (`recycle_blocks`), handed out before new memory.
+    recycled: Vec<*mut u64>,
 }
+
+/// The size of the blocks an arena takes back: that of the event lists'
+/// blocks and of the person lists' (`EVENT_BLOCK`, `PERSON_BLOCK`).
+pub const RECYCLE_WORDS: usize = 512;
 
 /// Anonymous memory that asks for transparent huge pages. On the CI runners a
 /// gigabyte of 4 KiB pages costs 100 to 150 ms more (page faults while
@@ -77,7 +84,26 @@ unsafe impl Sync for Arena {}
 
 impl Arena {
     pub fn new() -> Self {
-        Self { chunks: Vec::new(), cursor: std::ptr::null_mut(), left: 0 }
+        Self { chunks: Vec::new(), cursor: std::ptr::null_mut(), left: 0, recycled: Vec::new() }
+    }
+
+    /// Takes the blocks of `list` back, for later allocations of their size:
+    /// memory already mapped and written, where new memory would be pages the
+    /// kernel must find and clear. Only blocks of `RECYCLE_WORDS` words.
+    ///
+    /// # Safety
+    /// Nothing may read `list` afterwards, its blocks must be `block_words`
+    /// words each, and the memory they are in must outlive this arena's lists.
+    pub unsafe fn recycle_blocks(&mut self, list: &PartList, block_words: usize) {
+        if block_words != RECYCLE_WORDS {
+            return;
+        }
+        let mut block = list.head as *mut u64;
+        while !block.is_null() {
+            let next = *block as *mut u64;
+            self.recycled.push(block);
+            block = next;
+        }
     }
 
     #[cold]
@@ -102,6 +128,11 @@ impl Arena {
     /// Uninitialized space for `words` 64-bit words.
     #[inline]
     pub fn alloc(&mut self, words: usize) -> *mut u64 {
+        if words == RECYCLE_WORDS {
+            if let Some(block) = self.recycled.pop() {
+                return block;
+            }
+        }
         if self.left < words {
             self.refill(words);
         }

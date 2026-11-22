@@ -743,6 +743,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
     timing.detail("serial_dedup_setup", serial_started.elapsed().as_secs_f64() * 1e3);
     let event_parts = ctx.event_parts();
+    // A finished event partition's blocks become room for the person lists
+    // (`Arena::recycle_blocks`) unless `SS_RECYCLE=0`.
+    let recycle = !std::env::var_os("SS_RECYCLE").is_some_and(|value| value == "0");
     let next = AtomicUsize::new(0);
     let winners_nanos = AtomicU64::new(0);
     let forward_nanos = AtomicU64::new(0);
@@ -763,6 +766,15 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 long_lists.clear();
                 long_lists.extend(long_event_lists.iter().map(|per_thread| per_thread[at]));
                 dedup::dedup_partition(link_table, &lists, &long_lists, out, &mut scratch);
+                if recycle {
+                    for list in lists.iter().chain(&long_lists) {
+                        // SAFETY: partition `at` is this thread's alone and
+                        // nothing reads its lists after `dedup_partition`;
+                        // their blocks are `EVENT_BLOCK` words, in the parse
+                        // workers' arenas, which live to the end of the run.
+                        unsafe { out.arena.recycle_blocks(list, EVENT_BLOCK) };
+                    }
+                }
             } else if let Some(batch) = click_batches.get(at - event_parts) {
                 let started = measure.then(Instant::now);
                 dedup::map_clicks(link_table, batch, out);
