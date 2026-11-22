@@ -750,6 +750,13 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let winners_nanos = AtomicU64::new(0);
     let forward_nanos = AtomicU64::new(0);
     let click_map_nanos = AtomicU64::new(0);
+    // The exotic IDs of both kinds are all known once the parse has ended
+    // and pass B adds none, so their snapshots are taken on a helper thread
+    // beside pass B instead of on one thread after it, before pass C could
+    // start. (Long hexadecimal user IDs stay values: the user_daily writers
+    // spell out the ones that name a person as they write them.)
+    let (click_exotic, user_exotic) = std::thread::scope(|scope| {
+        let snapshots = scope.spawn(|| (ctx.click_ids.snapshot().with_threads(kept_click_ids), ctx.user_ids.snapshot()));
     parallel(threads, |thread| {
         // SAFETY: slot `thread` belongs to this thread for the whole phase.
         let out = unsafe { b_out.get(thread) };
@@ -789,6 +796,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         forward_nanos.fetch_add(scratch.forward_nanos, Ordering::Relaxed);
         click_map_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
     });
+        snapshots.join().unwrap()
+    });
     timing.detail("cpu_dedup_winners", winners_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_dedup_forward", forward_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);
@@ -817,12 +826,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     timing.stage("dedup");
     let serial_started = Instant::now();
 
-    let click_exotic = ctx.click_ids.snapshot().with_threads(kept_click_ids);
-    // Long hexadecimal user IDs stay values: the user_daily writers spell
-    // out the ones that name a person as they write them, on every thread,
-    // instead of all of them being spelled out here on one (about 30 ms of
-    // a 20M input before the sessions pass could start).
-    let user_exotic = ctx.user_ids.snapshot();
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
     // Each thread's user_daily file, written while the rows are produced.
     let sinks = UserSink::slots(&ctx, output, threads, &user_exotic);
