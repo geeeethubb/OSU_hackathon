@@ -1,81 +1,44 @@
-# One-off measurement, branch exp-lab only: what one event row costs in the
-# parse stage on a hosted runner, and how much of it is the variety of row
-# formats. Nothing here is ranked or scored; the runs are not in containers.
-name: parse-lab
+# One-off calibration, branch exp-calib only: the officially scored commits timed
+# on one runner in one job (20M events, seed 2), so that their official scores
+# can be set against container times from a single machine. Not ranked.
+name: calibration
 on:
   push:
-    branches: [exp-lab]
+    branches: [exp-calib]
 permissions:
   contents: read
 jobs:
-  lab:
+  calib:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Machine
         run: |
-          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|L1d|L2 cache|L3 cache" || true
-          cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Tools
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core" || true
+      - name: Tools and data
         run: |
           bash bench/fetch_tools.sh "$HOME/ss-tools"
-          rustc -O bench/experiments/canon.rs -o "$RUNNER_TEMP/canon"
-      - name: Build
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data" >/dev/null
+          chmod -R a+rX "$RUNNER_TEMP/data"
+          cat "$RUNNER_TEMP"/data/*/*.csv > /dev/null
+      - name: Build the scored commits
         run: |
-          docker buildx build --platform linux/amd64 --load -t ss-lab .
-          cid=$(docker create ss-lab)
-          docker cp "$cid:/pipeline" "$RUNNER_TEMP/pipeline"
-          docker rm "$cid" >/dev/null
-          chmod +x "$RUNNER_TEMP/pipeline"
-      - name: Data (20M events, seed 2) in four formats
-        run: |
-          D="$RUNNER_TEMP/data"
-          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$D" >/dev/null
-          for mode in q t a; do
-            U="$RUNNER_TEMP/data-$mode"
-            mkdir -p "$U"
-            cp -al "$D/clicks" "$U/clicks"; cp -al "$D/links" "$U/links"
-            cp "$D"/*.csv "$D"/manifest.json "$U"/
-            "$RUNNER_TEMP/canon" "$D/events" "$U/events" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "format $mode: $(du -sb "$U/events" | cut -f1) bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          for sha in e4eef020ce0bb9e005c329e57ea241c6e842dde8 23b285da8246d00275b1ad191da0fffb8c5f81e4 \
+                     2b2cccd1ba1cb12bc5a074a899ce54c868205b86 4567e9532f4019fbfd0e92908fd01cc49f24f67d \
+                     2dae9298f4e1e0a5259eec54c400501b00fae26f 9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e \
+                     1033956062d3cd948462c664d822f2636bcf1153; do
+            git cat-file -e "$sha^{commit}"
+            mkdir -p "$RUNNER_TEMP/ctx-$sha"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/ctx-$sha"
+            docker buildx build --platform linux/amd64 --load -t "scored:${sha:0:8}" "$RUNNER_TEMP/ctx-$sha" > "$RUNNER_TEMP/build-${sha:0:8}.log" 2>&1 \
+              || { tail -20 "$RUNNER_TEMP/build-${sha:0:8}.log"; exit 1; }
+            echo "built ${sha:0:8}"
           done
-          echo "original: $(du -sb "$D/events" | cut -f1) bytes, $(cat "$D"/events/*.csv | wc -l) lines" | tee -a "$GITHUB_STEP_SUMMARY"
-          cat "$RUNNER_TEMP"/data*/events/*.csv "$D"/clicks/*.csv "$D"/links/*.csv > /dev/null
-      - name: The outputs of the four formats are the same tables
+      - name: Time them, fresh container per run, shuffled rounds
         run: |
-          P="$RUNNER_TEMP/pipeline"
-          for mode in "" -q -t -a; do
-            O="$RUNNER_TEMP/out$mode"; rm -rf "$O"; mkdir -p "$O"
-            DATA_DIR="$RUNNER_TEMP/data$mode" OUTPUT_DIR="$O" SCRATCH_DIR="$O" NCPU=4 "$P"
-          done
-          python3 -m pip install -q pyarrow pandas >/dev/null 2>&1 || true
-          for mode in -q -t -a; do
-            python3 scripts/compare.py "$RUNNER_TEMP/out$mode" "$RUNNER_TEMP/out" | tail -n 1 | sed "s/^/format $mode against the original: /" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
-      - name: Runs
-        run: |
-          P="$RUNNER_TEMP/pipeline"; O="$RUNNER_TEMP/out-run"
-          line() {  # label, then the environment and command prefix
-            label="$1"; shift
-            rm -rf "$O"; mkdir -p "$O"
-            out=$( { env OUTPUT_DIR="$O" SCRATCH_DIR="$O" SS_TIMING=1 "$@" "$P" 2>&1 >/dev/null || true; } )
-            parse=$(printf '%s\n' "$out" | sed -n 's/.*stage=parse ms=\([0-9.]*\).*/\1/p' | head -n 1)
-            total=$(printf '%s\n' "$out" | sed -n 's/.*stage=total ms=\([0-9.]*\).*/\1/p' | head -n 1)
-            ev=$(printf '%s\n' "$out" | sed -n 's/.*detail=cpu_parse_events ms=\([0-9.]*\).*/\1/p' | head -n 1)
-            cl=$(printf '%s\n' "$out" | sed -n 's/.*detail=cpu_parse_clicks ms=\([0-9.]*\).*/\1/p' | head -n 1)
-            note=$(printf '%s\n' "$out" | grep -o 'event_store_in_assembly=[a-z]*' | head -n 1)
-            keys=$(printf '%s\n' "$out" | grep -c 'note=keys Some' || true)
-            echo "$label | parse_stage=$parse cpu_events=$ev cpu_clicks=$cl total=$total keys=$keys $note"
-          }
-          for round in 1 2 3; do
-            echo "== round $round"
-            for mode in "" -q -t -a; do
-              D="$RUNNER_TEMP/data$mode"; name="format ${mode:-original}"
-              line "$name, DIAG=7, 1 thread          " DATA_DIR="$D" NCPU=1 SS_DIAG=7 taskset -c 0
-              line "$name, DIAG=7, 4 threads         " DATA_DIR="$D" NCPU=4 SS_DIAG=7
-              line "$name, DIAG=7 compiler, 1 thread " DATA_DIR="$D" NCPU=1 SS_DIAG=7 SS_KERNEL=plain taskset -c 0
-              line "$name, DIAG=1, 4 threads         " DATA_DIR="$D" NCPU=4 SS_DIAG=1
-              line "$name, full run, 4 threads       " DATA_DIR="$D" NCPU=4
-            done
-          done 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 bench/experiments/calib.py "$RUNNER_TEMP/data" 6 \
+            scored:e4eef020 scored:23b285da scored:2b2cccd1 scored:4567e953 scored:2dae9298 scored:9cb9ad6e scored:10339560 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
