@@ -251,6 +251,21 @@ impl HexTable {
         HexTable { slots, filled: (0..TABLE_REGIONS).map(|_| Mutex::new(Vec::new())).collect() }
     }
 
+    /// Starts loading the slot where a lookup of the ID begins.
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        let region = (hash >> 56) as usize;
+        let at = (region << TABLE_REGION_BITS) | ((hash >> (56 - TABLE_REGION_BITS)) as usize & ((1 << TABLE_REGION_BITS) - 1));
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch does not fault; the address is inside the table.
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(at) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = at;
+    }
+
     /// The ID's index, or the empty slot where it would go. Each region
     /// keeps a quarter of its slots empty, so the walk always ends.
     #[inline]
@@ -327,6 +342,22 @@ thread_local! {
 #[inline]
 pub fn take_long_value() -> (u8, u128) {
     LONG_VALUE.with(std::cell::Cell::get)
+}
+
+/// Leaves a long event ID for `take_long_value`, as coding it would.
+#[inline]
+pub fn set_long_value(first: u8, value: u128) {
+    LONG_VALUE.with(|cell| cell.set((first, value)));
+}
+
+/// The value of the 32 lowercase hexadecimal digits at `p`, if they are.
+///
+/// # Safety
+/// 32 bytes at `p` are readable.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn hex_value32(p: *const u8) -> Option<u128> {
+    hex_digits32(p)
 }
 
 /// Exotic indexes from `THREAD_INDEX_SHIFT` up are those of the IDs a parse
@@ -431,6 +462,24 @@ impl Interner {
     /// (`Exotic::with_threads`).
     pub fn per_thread() -> Self {
         Interner { per_thread: true, ..Interner::default() }
+    }
+
+    /// Starts loading what `hex_code` of the same ID will read first, so that
+    /// work in between hides the wait.
+    #[inline(always)]
+    pub fn prefetch_hex(&self, first: u8, value: u128) {
+        if let Some(table) = &self.table {
+            table.prefetch(table_hash(first, value as u64, (value >> 64) as u64));
+        }
+    }
+
+    /// The code of an ID of one byte (`first`) and 32 lowercase hexadecimal
+    /// digits (`value`), already read: what `code` gives it, for an interner
+    /// that is neither `partition_local` nor `per_thread` (user IDs).
+    #[inline]
+    pub fn hex_code(&self, first: u8, value: u128) -> u64 {
+        debug_assert!(!self.partition_local && !self.per_thread);
+        EXOTIC_BASE + u64::from(self.hex_index(first, value))
     }
 
     /// The code of an exotic ID.

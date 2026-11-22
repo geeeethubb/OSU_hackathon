@@ -254,6 +254,24 @@ pub fn long_part(first: u8, value: u128, event_shift: u32) -> usize {
 #[inline(never)]
 fn emit_long(out: &mut ParseOut, ts: u64, valid: u64, user: u64, ingest: u64, purchase: Option<(u32, u32)>) {
     let (first, value) = super::codes::take_long_value();
+    emit_long_value(out, first, value, ts, valid, user, ingest, purchase);
+}
+
+/// Stores the record of an event whose ID is one byte (`first`) and 32
+/// hexadecimal digits (`value`): the value in two words, then the usual
+/// words with the first byte on top of the first one.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_long_value(
+    out: &mut ParseOut,
+    first: u8,
+    value: u128,
+    ts: u64,
+    valid: u64,
+    user: u64,
+    ingest: u64,
+    purchase: Option<(u32, u32)>,
+) {
     let part = long_part(first, value, out.event_shift);
     let word0 = (u64::from(first) << 56) | (ts << 1) | valid;
     let word1 = (user << 22) | (ingest << 1) | u64::from(purchase.is_some());
@@ -774,8 +792,16 @@ fn event_row_declined<const MODE: u32, const INDEXED: bool>(
     position: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_row_fast, MODE_STORE, ROW_DONE, ROW_DROP, ROW_LONG};
+    use super::simd::{event_lean_long, event_row_fast, MODE_ROW, MODE_STORE, ROW_DECLINE, ROW_DONE, ROW_DROP, ROW_LONG};
     let mut row = EventRow::default();
+    if !INDEXED && MODE != MODE_ROW {
+        // SAFETY: at least ROW_PAD readable bytes follow `position`.
+        let (length, status) = unsafe { event_lean_long::<MODE>(ctx, buffer.as_ptr().add(position), out, &mut row) };
+        if status != ROW_DECLINE {
+            std::hint::black_box(row.event);
+            return position + length + 1;
+        }
+    }
     // SAFETY: at least ROW_PAD readable bytes follow `position`.
     let (length, status) =
         unsafe { event_row_fast::<MODE, INDEXED>(ctx, buffer.as_ptr().add(position), out, &mut row) };
@@ -883,6 +909,9 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
             _ => event_row_slow(ctx, line),
         };
         if checked {
+            // A long event ID is LONG_EVENT in both rows: its value is left
+            // aside by each parser in turn, and must be the same too.
+            let fast_long = super::codes::take_long_value();
             let slow = event_row_slow(ctx, line);
             assert!(
                 slow == parsed,
@@ -891,6 +920,14 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
                 parsed,
                 slow
             );
+            if parsed.as_ref().is_some_and(|row| row.event == super::codes::LONG_EVENT) {
+                assert_eq!(
+                    super::codes::take_long_value(),
+                    fast_long,
+                    "long event ID mismatch on {:?}",
+                    String::from_utf8_lossy(line)
+                );
+            }
         }
         if let Some(row) = &parsed {
             emit_event(out, row);
