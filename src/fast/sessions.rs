@@ -797,6 +797,9 @@ struct Work {
     held_most: u64,
     /// Whether a batch keeps its credited sessions back.
     hold_sessions: bool,
+    /// Whether the general path keeps its credited sessions and assists back
+    /// (`ScratchC::hold_cells`).
+    hold_cells: bool,
     /// The output columns have been given their room.
     reserved: bool,
 }
@@ -855,6 +858,7 @@ impl Work {
             held_sessions: Vec::new(),
             held_most: 0,
             hold_sessions: false,
+            hold_cells: false,
             reserved: false,
         }
     }
@@ -1071,6 +1075,26 @@ impl ScratchC {
             }
             self.work.held_most = 0;
         }
+    }
+
+    /// Whether the general path keeps the sessions it credits to campaigns and
+    /// the assists in the scratch's own counts per cell (`hold_cells`): yes
+    /// unless `SS_HOLD=0`.
+    pub fn holds_cells_by_default() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SS_HOLD").as_deref() != Ok("0"))
+    }
+
+    /// The general path's form of `hold_sessions` and `hold_assists` together:
+    /// from now on `finish_person` counts the sessions it credits to a
+    /// campaign, and each partition its assists, in the scratch's own tables
+    /// of a 32-bit count per cell (an eighth of `campaign_days`, which no near
+    /// cache keeps), and `flush` adds them to `out` at the end. `cells` is
+    /// the length of `out.campaign_days`.
+    pub fn hold_cells(&mut self, cells: usize) {
+        self.work.held_sessions = vec![0; cells];
+        self.work.held = vec![0; cells];
+        self.work.hold_cells = true;
     }
 
     /// From now on a batch keeps the sessions it credits to campaigns in a
@@ -2074,13 +2098,33 @@ fn finish_person(
         } else {
             attribute_wide(params, work, click_exotic, sessions, rows, clicks);
         }
-        for session in 0..sessions {
-            let day = work.row_day[work.row[session] as usize] as usize;
-            let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
-            cell[0] += 1;
-            if has_purchases {
-                cell[1] += i64::from(work.purchases[session] > 0);
-                cell[2] += work.revenue[session];
+        if work.hold_cells {
+            // The count of sessions per cell is kept back (`hold_cells`); the
+            // few sessions with purchases write the rest of their cell at
+            // once (a session without one adds nothing there).
+            for session in 0..sessions {
+                let day = work.row_day[work.row[session] as usize] as usize;
+                let at = work.credited[session] as usize * params.day_count + day;
+                work.held_sessions[at] += 1;
+                if has_purchases && work.purchases[session] > 0 {
+                    let cell = &mut out.campaign_days[at];
+                    cell[1] += 1;
+                    cell[2] += work.revenue[session];
+                }
+            }
+            work.held_most += sessions as u64;
+            if work.held_most > u64::from(u32::MAX) - (1 << 25) {
+                flush_held(work, out);
+            }
+        } else {
+            for session in 0..sessions {
+                let day = work.row_day[work.row[session] as usize] as usize;
+                let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
+                cell[0] += 1;
+                if has_purchases {
+                    cell[1] += i64::from(work.purchases[session] > 0);
+                    cell[2] += work.revenue[session];
+                }
             }
         }
     }
@@ -2151,7 +2195,9 @@ fn partition_core(
 ) {
     let ScratchC { params, tuning, group, work, batch } = scratch;
     assert_eq!(batch.persons, 0, "a batch of persons was left unfinished");
-    assert_eq!(work.held_most, 0, "assists were held back and never added to the output");
+    // Unless the scratch holds its cells (`hold_cells`), nothing may be held
+    // back from an earlier partition.
+    assert!(work.hold_cells || work.held_most == 0, "assists were held back and never added to the output");
     // The first block of every list, while the lists are measured.
     for list in event_lists.iter().chain(click_lists) {
         if let Some(block) = list.blocks().next() {
@@ -2196,7 +2242,11 @@ fn partition_core(
         );
         starts = ends;
     }
-    apply_assists(&mut work.pending, &mut out.campaign_days);
+    if work.hold_cells {
+        hold_pending(work, out);
+    } else {
+        apply_assists(&mut work.pending, &mut out.campaign_days);
+    }
     work.profile.lap(9);
     work.profile.end(part);
     if !work.reserved {
@@ -2212,6 +2262,45 @@ fn partition_core(
         out.events.reserve(rows);
         out.revenue.reserve(rows);
         out.top_category.reserve(rows);
+    }
+}
+
+/// The general path's `ScratchC::hold_assists` (`hold_cells`): the pending
+/// assists into the held counts, or, if those could overflow, everything
+/// held and pending into `out` at once.
+fn hold_pending(work: &mut Work, out: &mut PassCOut) {
+    // An entry counts sessions of one person: fewer than `BUCKETS + 1`.
+    let most = work.pending.len() as u64 * (BUCKETS as u64 + 1);
+    if work.held_most + most > u64::from(u32::MAX) - (1 << 25) {
+        flush_held(work, out);
+        return;
+    }
+    work.held_most += most;
+    for at in 0..work.pending.len() {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(&later) = work.pending.get(at + 12) {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: a prefetch reads nothing, whatever the address.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(work.held.as_ptr().wrapping_add((later >> 32) as usize) as *const i8) };
+        }
+        let entry = work.pending[at];
+        work.held[(entry >> 32) as usize] += entry as u32;
+    }
+    work.pending.clear();
+}
+
+/// Adds the pending assists and everything held back to `out`, and empties
+/// the held counts (as `ScratchC::flush` does).
+fn flush_held(work: &mut Work, out: &mut PassCOut) {
+    apply_assists(&mut work.pending, &mut out.campaign_days);
+    if work.held_most != 0 {
+        for (cell, held) in out.campaign_days.iter_mut().zip(&mut work.held) {
+            cell[3] += i64::from(std::mem::take(held));
+        }
+        for (cell, held) in out.campaign_days.iter_mut().zip(&mut work.held_sessions) {
+            cell[0] += i64::from(std::mem::take(held));
+        }
+        work.held_most = 0;
     }
 }
 
