@@ -224,6 +224,7 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
             return;
         }
         let [hash, at] = links.probe(word1 >> 22);
+        prefetch_own_writer(&out.events, hash, out.person_shift);
         if waiting == AHEAD {
             forward_ring(links, out, ring[slot]);
         } else {
@@ -307,6 +308,7 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
             return;
         }
         let [hash, at] = links.probe(word1 >> 22);
+        prefetch_own_writer(&out.events, hash, out.person_shift);
         if waiting == AHEAD {
             forward_ring(links, out, ring[slot]);
         } else {
@@ -324,6 +326,24 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
     }
+}
+
+/// Starts loading the writer of the person partition that `hash` (a mixed
+/// user code, as `LinkTable::probe` returns it) routes to: the one a user
+/// in no link line (about half of all) is written through once it leaves
+/// the ring, whose cursor read would otherwise wait at the end of that
+/// record's chain. A wasted request for a linked user.
+#[inline(always)]
+fn prefetch_own_writer(writers: &[PartWriter], hash: u64, person_shift: u32) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch reads nothing and never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            writers.as_ptr().wrapping_add((hash >> person_shift) as usize) as *const i8,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (writers, hash, person_shift);
 }
 
 /// Writes one surviving event waiting in a ring (record words, then what
@@ -397,6 +417,7 @@ pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
     for block in blocks {
         for click in block.chunks_exact(RAW_CLICK_WORDS) {
             let [hash, at] = links.probe(click[0]);
+            prefetch_own_writer(&out.clicks, hash, out.person_shift);
             if waiting == AHEAD {
                 forward_click_ring(links, out, ring[slot]);
             } else {
