@@ -78,7 +78,6 @@ pub struct ParseOut {
     pub keys: Option<Keys>,
     /// `Keys::index_shift`, for `emit_indexed`.
     pub index_shift: u32,
-    pub links: Vec<(u64, u64)>,
     /// The long click IDs this worker kept (`Interner::per_thread`).
     pub click_ids: Vec<(u8, u128)>,
 }
@@ -100,7 +99,6 @@ impl ParseOut {
             user_clicks: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| click_parts(&keys))],
             keys: ctx.keys,
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
-            links: Vec::new(),
             click_ids: Vec::new(),
         }
     }
@@ -1106,7 +1104,7 @@ pub fn parse_clicks_chunk_with(
     });
 }
 
-pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
+pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, links: &mut Vec<(u64, u64)>) {
     #[allow(unused_mut)]
     let mut position = first_line_start(buffer, start);
     #[cfg(target_arch = "x86_64")]
@@ -1120,14 +1118,14 @@ pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out
             // SAFETY: at least ROW_PAD readable bytes follow `position`.
             let (length, status) = unsafe { link_row_fast(ctx, buffer.as_ptr().add(position), &mut pair) };
             if status == ROW_EMIT && !verify {
-                out.links.push(pair);
+                links.push(pair);
                 position += length + 1;
                 continue;
             }
             if status == ROW_LONG {
                 let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
                 if let Some(pair) = link_row_slow(ctx, &buffer[position..line_end]) {
-                    out.links.push(pair);
+                    links.push(pair);
                 }
                 position = line_end + 1;
                 continue;
@@ -1149,14 +1147,14 @@ pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out
                 );
             }
             if let Some(pair) = fast {
-                out.links.push(pair);
+                links.push(pair);
             }
             position += length + 1;
         }
     }
     lines_from(buffer, position, end, |line| {
         if let Some(pair) = link_row_slow(ctx, line) {
-            out.links.push(pair);
+            links.push(pair);
         }
     });
 }
