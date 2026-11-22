@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub const P37: [u64; 9] =
@@ -98,6 +98,16 @@ fn hex_id(id: &[u8]) -> Option<u128> {
     if id.len() != 33 {
         return None;
     }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `id[1..33]` is 32 readable bytes.
+    return unsafe { hex_digits32(id.as_ptr().add(1)) };
+    #[cfg(not(target_arch = "x86_64"))]
+    hex_digits32_scalar(&id[1..33])
+}
+
+/// The value of 32 lowercase hexadecimal digits, one at a time.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn hex_digits32_scalar(digits: &[u8]) -> Option<u128> {
     let half = |digits: &[u8]| -> Option<u64> {
         let mut value = 0u64;
         let mut bad = 0u8;
@@ -109,8 +119,37 @@ fn hex_id(id: &[u8]) -> Option<u128> {
         // A digit is at most 15, so any 0xFF shows in the high bits.
         (bad < 16).then_some(value)
     };
-    let high = half(&id[1..17])?;
-    let low = half(&id[17..33])?;
+    let high = half(&digits[..16])?;
+    let low = half(&digits[16..32])?;
+    Some(u128::from(high) << 64 | u128::from(low))
+}
+
+/// The value of the 32 lowercase hexadecimal digits at `p`, all at once:
+/// every byte checked to be `0-9` or `a-f`, turned into its value, and the
+/// pairs joined into bytes, most significant first.
+///
+/// # Safety
+/// 32 bytes at `p` are readable.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn hex_digits32(p: *const u8) -> Option<u128> {
+    use std::arch::x86_64::*;
+    let bytes = _mm256_loadu_si256(p as *const __m256i);
+    let digit = _mm256_sub_epi8(bytes, _mm256_set1_epi8(b'0' as i8));
+    let letter = _mm256_sub_epi8(bytes, _mm256_set1_epi8(b'a' as i8));
+    // Unsigned "at most 9" and "at most 5": the minimum is the value itself.
+    let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(digit, _mm256_set1_epi8(9)), digit);
+    let is_letter = _mm256_cmpeq_epi8(_mm256_min_epu8(letter, _mm256_set1_epi8(5)), letter);
+    if _mm256_movemask_epi8(_mm256_or_si256(is_digit, is_letter)) != -1 {
+        return None;
+    }
+    let nibbles = _mm256_blendv_epi8(_mm256_add_epi8(letter, _mm256_set1_epi8(10)), digit, is_digit);
+    // Each pair: the first digit times 16 plus the second, as 16-bit words.
+    let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+    // Words to bytes; in each 128-bit lane the low eight bytes are its pairs.
+    let packed = _mm256_packus_epi16(pairs, pairs);
+    let high = (_mm256_extract_epi64::<0>(packed) as u64).swap_bytes();
+    let low = (_mm256_extract_epi64::<2>(packed) as u64).swap_bytes();
     Some(u128::from(high) << 64 | u128::from(low))
 }
 
@@ -146,6 +185,133 @@ impl Hasher for HexHasher {
 
 type HexShard = HashMap<(u8, u128), u32, BuildHasherDefault<HexHasher>>;
 const HEX_SHARDS: usize = 256;
+
+/// Regions of a `HexTable`, and slots per region (as bits): 2^20 slots of
+/// 32 bytes, of which a region takes three quarters at most. Generated data
+/// has about 10,000 long user IDs per million events, so 60M events fill a
+/// little over half; the pages are mapped as they are first written.
+const TABLE_REGIONS: usize = 256;
+const TABLE_REGION_BITS: u32 = 12;
+const TABLE_REGION_MOST: usize = (3 << TABLE_REGION_BITS) / 4;
+
+/// One slot of a `HexTable`.
+#[derive(Default)]
+#[repr(C, align(32))]
+struct HexSlot {
+    /// The first byte in bits 56..64 and the index plus one in bits 0..32;
+    /// 0 while the slot is empty. Written last, with Release.
+    meta: AtomicU64,
+    low: AtomicU64,
+    high: AtomicU64,
+}
+
+/// Long hexadecimal IDs by value, for IDs whose codes must be equal exactly
+/// when the IDs are (user IDs), looked up by all parse threads at once with
+/// no lock. A slot is filled once, under the lock of its region, key words
+/// first and meta word last; it never changes after, so a reader that sees
+/// the meta word (Acquire) sees the key. A region that is three quarters
+/// full takes no more IDs: they go to the interner's locked maps, which a
+/// lookup reaches after it found no slot here (an ID is never in both: the
+/// table is asked first, under the region's lock, and a region never takes
+/// IDs again once it refused one).
+struct HexTable {
+    slots: Box<[HexSlot]>,
+    /// Per region, behind its lock, the slots filled so far (snapshots).
+    filled: Box<[Mutex<Vec<u32>>]>,
+}
+
+/// Where a lookup in a `HexTable` ended.
+enum Probe {
+    Found(u32),
+    /// The empty slot where the ID would go.
+    Empty(usize),
+}
+
+#[inline]
+fn table_hash(first: u8, low: u64, high: u64) -> u64 {
+    let folded = low ^ high.rotate_left(29) ^ u64::from(first);
+    (folded ^ (folded >> 31)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+impl HexTable {
+    fn new() -> Self {
+        let count = TABLE_REGIONS << TABLE_REGION_BITS;
+        // Zeroed memory from the allocator (mapped page by page as it is
+        // first written) rather than slots written one by one here.
+        let layout = std::alloc::Layout::array::<HexSlot>(count).expect("table layout");
+        // SAFETY: all zero is a valid `HexSlot` (three `AtomicU64` of 0: an
+        // empty slot); the box frees the memory with the same layout.
+        let slots: Box<[HexSlot]> = unsafe {
+            let pointer = std::alloc::alloc_zeroed(layout) as *mut HexSlot;
+            if pointer.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, count))
+        };
+        HexTable { slots, filled: (0..TABLE_REGIONS).map(|_| Mutex::new(Vec::new())).collect() }
+    }
+
+    /// The ID's index, or the empty slot where it would go. Each region
+    /// keeps a quarter of its slots empty, so the walk always ends.
+    #[inline]
+    fn find(&self, hash: u64, first: u8, low: u64, high: u64) -> Probe {
+        let region = (hash >> 56) as usize;
+        let mask = (1usize << TABLE_REGION_BITS) - 1;
+        let base = region << TABLE_REGION_BITS;
+        let mut at = (hash >> (56 - TABLE_REGION_BITS)) as usize & mask;
+        loop {
+            // SAFETY: `base + at` is inside the region, inside the table.
+            let slot = unsafe { self.slots.get_unchecked(base + at) };
+            let meta = slot.meta.load(AtomicOrdering::Acquire);
+            if meta == 0 {
+                return Probe::Empty(base + at);
+            }
+            if meta >> 56 == u64::from(first)
+                && slot.low.load(AtomicOrdering::Relaxed) == low
+                && slot.high.load(AtomicOrdering::Relaxed) == high
+            {
+                return Probe::Found(meta as u32 - 1);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// The ID's index, given one from `next` if it is new; `None` when its
+    /// region is full (the caller then uses its locked maps).
+    #[cold]
+    #[inline(never)]
+    fn insert(&self, hash: u64, first: u8, low: u64, high: u64, next: &AtomicU32) -> Option<u32> {
+        let mut filled = self.filled[(hash >> 56) as usize].lock().unwrap();
+        match self.find(hash, first, low, high) {
+            Probe::Found(index) => Some(index),
+            Probe::Empty(_) if filled.len() >= TABLE_REGION_MOST => None,
+            Probe::Empty(at) => {
+                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                let slot = &self.slots[at];
+                slot.low.store(low, AtomicOrdering::Relaxed);
+                slot.high.store(high, AtomicOrdering::Relaxed);
+                slot.meta.store(u64::from(first) << 56 | (u64::from(index) + 1), AtomicOrdering::Release);
+                filled.push(at as u32);
+                Some(index)
+            }
+        }
+    }
+
+    /// Calls `visit(first, value, index)` for every ID in the table.
+    fn for_each(&self, mut visit: impl FnMut(u8, u128, u32)) {
+        for region in self.filled.iter() {
+            // The lock: an ID whose index was given out is in its slot.
+            let filled = region.lock().unwrap();
+            for &at in filled.iter() {
+                let slot = &self.slots[at as usize];
+                let meta = slot.meta.load(AtomicOrdering::Acquire);
+                let value = u128::from(slot.high.load(AtomicOrdering::Relaxed)) << 64
+                    | u128::from(slot.low.load(AtomicOrdering::Relaxed));
+                visit((meta >> 56) as u8, value, meta as u32 - 1);
+            }
+        }
+    }
+}
 
 /// The code event IDs of one character and 32 lowercase hexadecimal digits
 /// get from an interner made by `Interner::partition_local`: never a real
@@ -220,6 +386,9 @@ pub struct Interner {
     next: AtomicU32,
     generic: Mutex<HashMap<Box<[u8]>, u32>>,
     hex: Box<[Mutex<HexShard>]>,
+    /// Long hexadecimal IDs that threads look up without a lock, before the
+    /// locked maps (`Interner::looked_up`).
+    table: Option<HexTable>,
     /// Event IDs: they only need to be equal or not, inside the partition
     /// their value picks, so long hexadecimal ones are not interned here at
     /// all (`LONG_EVENT`): the dedup step compares their values.
@@ -238,6 +407,7 @@ impl Default for Interner {
             next: AtomicU32::new(0),
             generic: Mutex::new(HashMap::new()),
             hex: (0..HEX_SHARDS).map(|_| Mutex::new(HexShard::default())).collect(),
+            table: None,
             partition_local: false,
             per_thread: false,
         }
@@ -248,6 +418,12 @@ impl Interner {
     /// An interner whose long hexadecimal IDs get `LONG_EVENT` (event IDs).
     pub fn partition_local() -> Self {
         Interner { partition_local: true, ..Interner::default() }
+    }
+
+    /// An interner whose long hexadecimal IDs are looked up without a lock
+    /// (user IDs: every row has one, and equal IDs need equal codes).
+    pub fn looked_up() -> Self {
+        Interner { table: Some(HexTable::new()), ..Interner::default() }
     }
 
     /// An interner whose long hexadecimal IDs a parse worker keeps for
@@ -275,6 +451,22 @@ impl Interner {
 
     #[inline]
     fn hex_index(&self, first: u8, value: u128) -> u32 {
+        if let Some(table) = &self.table {
+            let (low, high) = (value as u64, (value >> 64) as u64);
+            let hash = table_hash(first, low, high);
+            if let Probe::Found(index) = table.find(hash, first, low, high) {
+                return index;
+            }
+            if let Some(index) = table.insert(hash, first, low, high, &self.next) {
+                return index;
+            }
+        }
+        self.hex_index_locked(first, value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn hex_index_locked(&self, first: u8, value: u128) -> u32 {
         let mut shard = self.hex[(value >> 120) as usize].lock().unwrap();
         if let Some(&at) = shard.get(&(first, value)) {
             return at;
@@ -310,19 +502,25 @@ impl Interner {
                 entries[at as usize] = Entry::Bytes { start, end: arena.len() as u32 };
             }
         }
+        let mut place = |first: u8, value: u128, at: u32| {
+            if (at as usize) >= count {
+                return;
+            }
+            entries[at as usize] = if materialize {
+                let start = arena.len() as u32;
+                arena.push(first);
+                push_hex(value, &mut arena);
+                Entry::Bytes { start, end: arena.len() as u32 }
+            } else {
+                Entry::Hex { first, value }
+            };
+        };
+        if let Some(table) = &self.table {
+            table.for_each(&mut place);
+        }
         for shard in self.hex.iter() {
             for (&(first, value), &at) in shard.lock().unwrap().iter() {
-                if (at as usize) >= count {
-                    continue;
-                }
-                entries[at as usize] = if materialize {
-                    let start = arena.len() as u32;
-                    arena.push(first);
-                    push_hex(value, &mut arena);
-                    Entry::Bytes { start, end: arena.len() as u32 }
-                } else {
-                    Entry::Hex { first, value }
-                };
+                place(first, value, at);
             }
         }
         Exotic { entries, arena, threads: Vec::new() }
@@ -565,6 +763,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hex_digits_read_like_the_scalar_reading() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet: Vec<u8> = (0u8..=255).collect();
+        for round in 0..20_000 {
+            let mut id = vec![b'u'];
+            for _ in 0..32 {
+                let pick = next();
+                // Mostly hexadecimal digits; now and then any byte at all.
+                let byte = if round % 3 == 0 && pick % 29 == 0 {
+                    alphabet[(pick >> 8) as usize % 256]
+                } else {
+                    HEX_DIGITS[(pick >> 8) as usize % 16]
+                };
+                id.push(byte);
+            }
+            assert_eq!(hex_id(&id), hex_digits32_scalar(&id[1..33]), "{:?}", String::from_utf8_lossy(&id));
+        }
+        for edge in [b'/', b':', b'`', b'g', b'A', b'F', 0x80, 0xFF, 0] {
+            let mut id = b"u0123456789abcdef0123456789abcdef".to_vec();
+            id[7] = edge;
+            assert_eq!(hex_id(&id), None);
+        }
+        assert_eq!(hex_id(b"u0123456789abcdef0123456789abcdef"), Some(0x0123456789abcdef0123456789abcdef));
     }
 
     #[test]

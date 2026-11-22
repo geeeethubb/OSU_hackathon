@@ -205,7 +205,7 @@ impl Ctx {
             campaign_by_number: Vec::new(),
             organic: 0,
             event_ids: Interner::partition_local(),
-            user_ids: Interner::default(),
+            user_ids: Interner::looked_up(),
             // SS_VERIFY=1 compares the codes two parsers give one row: there
             // one ID must have one code.
             click_ids: if std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1") {
