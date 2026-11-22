@@ -81,130 +81,80 @@ pub struct ParseOut {
     pub links: Vec<(u64, u64)>,
     /// The long click IDs this worker kept (`Interner::per_thread`).
     pub click_ids: Vec<(u8, u128)>,
-    /// Valid rows with a long user ID whose user code waits for its
-    /// user-table slot (`defer_row`); `deferred_count` of them, the oldest at
-    /// `deferred_head` once the ring is full. Empty at the end of every chunk.
-    pub deferred: [Deferred; DEFER],
-    pub deferred_head: usize,
-    pub deferred_count: usize,
-    /// The same ring for click rows with a long user ID (`defer_click`).
-    pub deferred_clicks: [DeferredClick; DEFER],
-    pub deferred_clicks_head: usize,
-    pub deferred_clicks_count: usize,
+    /// Stored records of valid rows with a long user ID whose user code
+    /// waits for its user-table slot (`defer_user`); `pending_count` of them,
+    /// the oldest at `pending_head` once the ring is full (`pending_depth`
+    /// entries, a power of two). Empty at the end of every chunk.
+    pub pending: [Pending; PENDING_MOST],
+    pub pending_head: usize,
+    pub pending_count: usize,
+    pub pending_depth: usize,
 }
 
-/// A valid click row whose user ID is long and hexadecimal, read but not
-/// yet stored: as `Deferred` for events, its user's code is looked up when
-/// it leaves the ring.
+/// The most entries the ring of pending user codes can have.
+pub const PENDING_MOST: usize = 32;
+
+/// How many stored records a worker's lookups of long user IDs trail its
+/// parse by: `SS_PENDING` (1, 2, 4, 8, 16 or 32; default 16).
+pub fn pending_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        let depth = std::env::var("SS_PENDING").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(16);
+        depth.clamp(1, PENDING_MOST).next_power_of_two()
+    })
+}
+
+/// A record already stored whose user code is not in it yet: the address of
+/// the word that takes the code (as 0 until then), the code's shift in it,
+/// and the user ID, one byte (`first`) and 32 hexadecimal digits (`value`).
 #[derive(Clone, Copy, Default)]
-pub struct DeferredClick {
-    pub user_value: u128,
-    pub code_and_campaign: u64,
-    /// Milliseconds since `window_start - 7 days`.
-    pub ts: u64,
-    pub user_first: u8,
+pub struct Pending {
+    pub value: u128,
+    pub word: usize,
+    pub first: u8,
+    pub shift: u8,
 }
 
-/// Puts a click into the worker's ring; the oldest click, once the ring is
-/// full, gets its user's code and is stored. A person's clicks are put in
-/// order by their time and then by their click IDs' bytes, never by their
-/// place in a worker's list (whose order across chunks depends on the
-/// threads anyway), so the order within it does not matter.
+/// Puts a stored record's pending user code into the worker's ring; the
+/// oldest entry, once the ring is full, gets its user's code, by when the
+/// user-table slot asked for (`Interner::prefetch_hex`) has arrived. The
+/// record's words are only read after the parse, and every chunk settles
+/// its ring before it ends (`settle_pending`).
 #[inline(always)]
-pub fn defer_click(ctx: &Ctx, out: &mut ParseOut, click: DeferredClick) {
-    let at = out.deferred_clicks_head;
-    if out.deferred_clicks_count == DEFER {
-        let oldest = out.deferred_clicks[at];
-        store_deferred_click(ctx, out, &oldest);
+pub fn defer_user(ctx: &Ctx, out: &mut ParseOut, word: *mut u64, shift: u32, first: u8, value: u128) {
+    let at = out.pending_head;
+    if out.pending_count == out.pending_depth {
+        let oldest = out.pending[at];
+        settle(ctx, &oldest);
     } else {
-        out.deferred_clicks_count += 1;
+        out.pending_count += 1;
     }
-    out.deferred_clicks[at] = click;
-    out.deferred_clicks_head = (at + 1) % DEFER;
+    out.pending[at] = Pending { value, word: word as usize, first, shift: shift as u8 };
+    out.pending_head = (at + 1) & (out.pending_depth - 1);
 }
 
-/// Stores a deferred click as `emit_click` would have.
+/// Puts the user's code into the record's word.
 #[inline(always)]
-fn store_deferred_click(ctx: &Ctx, out: &mut ParseOut, click: &DeferredClick) {
-    let user = ctx.user_ids.hex_code(click.user_first, click.user_value);
-    emit_code_click(out, user, click.code_and_campaign, click.ts);
+fn settle(ctx: &Ctx, pending: &Pending) {
+    let code = ctx.user_ids.hex_code(pending.first, pending.value);
+    // SAFETY: the word is in a record this worker stored in its arena,
+    // which nothing reads before the parse ends.
+    unsafe {
+        *(pending.word as *mut u64) |= code << pending.shift;
+    }
 }
 
-/// Stores every click still in the worker's ring, oldest first.
-pub fn flush_deferred_clicks(ctx: &Ctx, out: &mut ParseOut) {
-    let count = out.deferred_clicks_count;
-    let first = (out.deferred_clicks_head + DEFER - count) % DEFER;
+/// Settles every entry still in the worker's ring.
+pub fn settle_pending(ctx: &Ctx, out: &mut ParseOut) {
+    let depth = out.pending_depth;
+    let count = out.pending_count;
+    let first = (out.pending_head + depth - count) & (depth - 1);
     for offset in 0..count {
-        let click = out.deferred_clicks[(first + offset) % DEFER];
-        store_deferred_click(ctx, out, &click);
+        let pending = out.pending[(first + offset) & (depth - 1)];
+        settle(ctx, &pending);
     }
-    out.deferred_clicks_count = 0;
-    out.deferred_clicks_head = 0;
-}
-
-/// Rows a worker's lookups of long user IDs trail its parse by.
-pub const DEFER: usize = 8;
-
-/// A valid event row whose user ID is long and hexadecimal, read but not yet
-/// stored: its user's code is looked up when it leaves the ring, after the
-/// next `DEFER` such rows, by when the slot asked for has arrived.
-#[derive(Clone, Copy, Default)]
-pub struct Deferred {
-    pub user_value: u128,
-    /// The event ID's value if it is long too (`long_event`), else 0.
-    pub event_value: u128,
-    /// The event ID's code if it is short.
-    pub event_short: u64,
-    pub ts: u64,
-    pub ingest: u64,
-    /// Price (low) and category (high) of a purchase (`purchase`).
-    pub bought: u64,
-    pub user_first: u8,
-    pub event_first: u8,
-    pub long_event: bool,
-    pub purchase: bool,
-}
-
-/// Puts a row into the worker's ring; the oldest row, once the ring is full,
-/// gets its user's code and is stored. Rows are compared by their content
-/// only (dedup keeps the smallest ingest_ts, whose equal copies are
-/// identical), so their order within a worker's lists does not matter.
-#[inline(always)]
-pub fn defer_row(ctx: &Ctx, out: &mut ParseOut, row: Deferred) {
-    let at = out.deferred_head;
-    if out.deferred_count == DEFER {
-        let oldest = out.deferred[at];
-        store_deferred(ctx, out, &oldest);
-    } else {
-        out.deferred_count += 1;
-    }
-    out.deferred[at] = row;
-    out.deferred_head = (at + 1) % DEFER;
-}
-
-/// Stores a deferred row as `event_lean_long` would have: its user's code
-/// now, then the record of a short or of a long event ID.
-#[inline(always)]
-fn store_deferred(ctx: &Ctx, out: &mut ParseOut, row: &Deferred) {
-    let user = ctx.user_ids.hex_code(row.user_first, row.user_value);
-    let purchase = row.purchase.then_some((row.bought as u32, (row.bought >> 32) as u32));
-    if row.long_event {
-        emit_long_value(out, row.event_first, row.event_value, row.ts, 1, user, row.ingest, purchase);
-    } else {
-        emit_raw(out, row.event_short, row.ts, 1, user, row.ingest, purchase);
-    }
-}
-
-/// Stores every row still in the worker's ring, oldest first.
-pub fn flush_deferred(ctx: &Ctx, out: &mut ParseOut) {
-    let count = out.deferred_count;
-    let first = (out.deferred_head + DEFER - count) % DEFER;
-    for offset in 0..count {
-        let row = out.deferred[(first + offset) % DEFER];
-        store_deferred(ctx, out, &row);
-    }
-    out.deferred_count = 0;
-    out.deferred_head = 0;
+    out.pending_count = 0;
+    out.pending_head = 0;
 }
 
 /// Words per block of a worker's click list, and words per click in it.
@@ -226,12 +176,10 @@ impl ParseOut {
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
             click_ids: Vec::new(),
-            deferred: [Deferred::default(); DEFER],
-            deferred_head: 0,
-            deferred_count: 0,
-            deferred_clicks: [DeferredClick::default(); DEFER],
-            deferred_clicks_head: 0,
-            deferred_clicks_count: 0,
+            pending: [Pending::default(); PENDING_MOST],
+            pending_head: 0,
+            pending_count: 0,
+            pending_depth: pending_depth(),
         }
     }
 }
@@ -263,7 +211,7 @@ pub fn click_indexed_form(keys: &Keys, click: ClickRecord) -> ClickRecord {
 /// Stores a click whose user is known by its code: three words in the
 /// worker's click list.
 #[inline(always)]
-pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts: u64) {
+pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts: u64) -> *mut u64 {
     let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
     // SAFETY: `reserve` returned room for three words.
     unsafe {
@@ -271,6 +219,8 @@ pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts
         *at.add(1) = code_and_campaign;
         *at.add(2) = ts;
     }
+    // The user word.
+    at
 }
 
 /// Index mode: stores a click of a generated user ID, known by its user
@@ -301,7 +251,9 @@ pub fn emit_click(out: &mut ParseOut, click: &ClickRecord) {
         // SAFETY: the number's user index is below the keys' bound: the
         // kernels and `user_number_of_code` hand out no other numbers.
         Some(number) => unsafe { emit_number_click(out, number, click.code_and_campaign, u64::from(click.ts)) },
-        None => emit_code_click(out, click.user, click.code_and_campaign, u64::from(click.ts)),
+        None => {
+            emit_code_click(out, click.user, click.code_and_campaign, u64::from(click.ts));
+        }
     }
 }
 
@@ -331,6 +283,58 @@ pub fn lines_from<'a>(buffer: &'a [u8], mut position: usize, end: usize, mut vis
         let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
         visit(&buffer[position..line_end]);
         position = line_end + 1;
+    }
+}
+
+/// `emit_raw` of a short event ID's record whose user code comes later
+/// (`defer_user`): stored with user 0; returns the word that takes the
+/// code, at bit 22.
+#[inline(always)]
+pub fn emit_raw_pending(out: &mut ParseOut, event: u64, ts: u64, ingest: u64, purchase: Option<(u32, u32)>) -> *mut u64 {
+    debug_assert!(event != super::codes::LONG_EVENT);
+    let mixed = mix(event);
+    let part = (mixed >> out.event_shift) as usize;
+    let word0 = (mixed << 32) | (ts << 1) | 1;
+    let word1 = (ingest << 1) | u64::from(purchase.is_some());
+    // SAFETY: as in `emit_raw`.
+    unsafe {
+        let writer = out.events.get_unchecked_mut(part);
+        let at = writer.reserve(&mut out.arena, EVENT_BLOCK, 2 + usize::from(purchase.is_some()));
+        *at = word0;
+        *at.add(1) = word1;
+        if let Some((price, category)) = purchase {
+            *at.add(2) = u64::from(price) | (u64::from(category) << 32);
+        }
+        at.add(1)
+    }
+}
+
+/// `emit_long_value` of a record whose user code comes later (`defer_user`):
+/// stored with user 0; returns the word that takes the code, at bit 22.
+#[inline(always)]
+pub fn emit_long_value_pending(
+    out: &mut ParseOut,
+    first: u8,
+    value: u128,
+    ts: u64,
+    ingest: u64,
+    purchase: Option<(u32, u32)>,
+) -> *mut u64 {
+    let part = long_part(first, value, out.event_shift);
+    let word0 = (u64::from(first) << 56) | (ts << 1) | 1;
+    let word1 = (ingest << 1) | u64::from(purchase.is_some());
+    // SAFETY: as in `emit_long_value`.
+    unsafe {
+        let writer = out.long_events.get_unchecked_mut(part);
+        let at = writer.reserve(&mut out.arena, EVENT_BLOCK, 4 + usize::from(purchase.is_some()));
+        *at = value as u64;
+        *at.add(1) = (value >> 64) as u64;
+        *at.add(2) = word0;
+        *at.add(3) = word1;
+        if let Some((price, category)) = purchase {
+            *at.add(4) = u64::from(price) | (u64::from(category) << 32);
+        }
+        at.add(3)
     }
 }
 
@@ -1168,7 +1172,7 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
             }
         }
     });
-    flush_deferred(ctx, out);
+    settle_pending(ctx, out);
 }
 
 /// The fast loop over click rows, specialized for what happens to a parsed
@@ -1309,7 +1313,7 @@ pub fn parse_clicks_chunk_with(
             emit_click(out, &click);
         }
     });
-    flush_deferred_clicks(ctx, out);
+    settle_pending(ctx, out);
 }
 
 pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {

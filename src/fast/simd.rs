@@ -1654,27 +1654,18 @@ pub unsafe fn event_lean_long<const MODE: u32>(
             None => valid = false,
         }
     }
-    // A valid row of a long user ID waits in the worker's ring for the slot
-    // asked for above, and is stored when it leaves it.
+    // A valid row of a long user ID is stored now with its user left 0; the
+    // worker's ring puts the user's code in once the slot asked for above
+    // has arrived.
     if MODE == MODE_STORE && valid && defer_lookups() {
         if let Some(value) = user_value {
-            let (bought, purchase) = match purchase {
-                Some((price, category)) => (u64::from(price) | (u64::from(category) << 32), true),
-                None => (0, false),
+            let word = match event_value {
+                Some(event) => {
+                    super::parse::emit_long_value_pending(out, *event_at, event, ts, ingest_seconds as u64, purchase)
+                }
+                None => super::parse::emit_raw_pending(out, event_short, ts, ingest_seconds as u64, purchase),
             };
-            let deferred = super::parse::Deferred {
-                user_value: value,
-                event_value: event_value.unwrap_or(0),
-                event_short,
-                ts,
-                ingest: ingest_seconds as u64,
-                bought,
-                user_first: *user_at,
-                event_first: *event_at,
-                long_event: event_value.is_some(),
-                purchase,
-            };
-            super::parse::defer_row(ctx, out, deferred);
+            super::parse::defer_user(ctx, out, word, 22, *user_at, value);
             return (length, ROW_DONE);
         }
     }
@@ -1915,27 +1906,18 @@ pub unsafe fn event_lean_wide<const MODE: u32>(
             None => valid = false,
         }
     }
-    // A valid row of a long user ID waits in the worker's ring for the slot
-    // asked for above, and is stored when it leaves it.
+    // A valid row of a long user ID is stored now with its user left 0; the
+    // worker's ring puts the user's code in once the slot asked for above
+    // has arrived.
     if MODE == MODE_STORE && valid && defer_lookups() {
         if let Some(value) = user_value {
-            let (bought, purchase) = match purchase {
-                Some((price, category)) => (u64::from(price) | (u64::from(category) << 32), true),
-                None => (0, false),
+            let word = match event_value {
+                Some(event) => {
+                    super::parse::emit_long_value_pending(out, *event_at, event, ts, ingest_seconds as u64, purchase)
+                }
+                None => super::parse::emit_raw_pending(out, event_short, ts, ingest_seconds as u64, purchase),
             };
-            let deferred = super::parse::Deferred {
-                user_value: value,
-                event_value: event_value.unwrap_or(0),
-                event_short,
-                ts,
-                ingest: ingest_seconds as u64,
-                bought,
-                user_first: *user_at,
-                event_first: *event_at,
-                long_event: event_value.is_some(),
-                purchase,
-            };
-            super::parse::defer_row(ctx, out, deferred);
+            super::parse::defer_user(ctx, out, word, 22, *user_at, value);
             return (length, ROW_DONE);
         }
     }
@@ -3984,15 +3966,12 @@ pub unsafe fn click_lean_long(ctx: &Ctx, p: *const u8, out: &mut ParseOut) -> (u
     match user_value {
         Some(value) => {
             ctx.user_ids.prefetch_hex(*p.add(s1), value);
-            let deferred = super::parse::DeferredClick {
-                user_value: value,
-                code_and_campaign,
-                ts: since,
-                user_first: *p.add(s1),
-            };
-            super::parse::defer_click(ctx, out, deferred);
+            let word = emit_code_click(out, 0, code_and_campaign, since);
+            super::parse::defer_user(ctx, out, word, 0, *p.add(s1), value);
         }
-        None => emit_code_click(out, user_fast_code, code_and_campaign, since),
+        None => {
+            emit_code_click(out, user_fast_code, code_and_campaign, since);
+        }
     }
     (length, ROW_DONE)
 }
