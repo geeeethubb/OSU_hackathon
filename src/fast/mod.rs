@@ -447,6 +447,30 @@ struct Task {
     end: usize,
 }
 
+/// The offset of the first newline in `bytes`, 32 bytes at a time (for the
+/// `SS_DIAG_UNIQ` diagnostic).
+fn diag_newline(bytes: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8, __m256i};
+        let mut at = 0;
+        while at + 32 <= bytes.len() {
+            // SAFETY: 32 bytes from `at` are inside `bytes`.
+            let mask = unsafe {
+                let block = _mm256_loadu_si256(bytes.as_ptr().add(at) as *const __m256i);
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(b'\n' as i8))) as u32
+            };
+            if mask != 0 {
+                return Some(at + mask.trailing_zeros() as usize);
+            }
+            at += 32;
+        }
+        bytes[at..].iter().position(|&byte| byte == b'\n').map(|offset| at + offset)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    bytes.iter().position(|&byte| byte == b'\n')
+}
+
 fn chunk_tasks(kind: Kind, files: &[Mapped], chunk: usize, tasks: &mut Vec<Task>) {
     for (file, mapped) in files.iter().enumerate() {
         let mut start = 0;
@@ -596,6 +620,59 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         });
         timing.detail("pretouch_checksum", (checksum.load(Ordering::Relaxed) % 1000) as f64);
         timing.stage("pretouch");
+    }
+    if std::env::var_os("SS_DIAG_UNIQ").is_some_and(|value| value == "1") {
+        // Diagnostic only (Design B's lower bound): find every event row's ID,
+        // hash it, set a bit in a per-thread bitset of 2^24 bits. No merge
+        // across threads and no record written: the cheapest form of a pass
+        // that tells single-copy events apart. Changes no result.
+        let next = AtomicUsize::new(0);
+        let flagged = AtomicU64::new(0);
+        let rows_seen = AtomicU64::new(0);
+        parallel(threads, |_| {
+            let mut bits = vec![0u64; 1 << 18];
+            let (mut repeats, mut rows) = (0u64, 0u64);
+            while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                if task.kind != Kind::Events {
+                    continue;
+                }
+                let buffer = event_files[task.file].bytes();
+                let mut at = task.start;
+                // A task's first row starts after the first newline at or past
+                // its start (the file's first line is the header).
+                match buffer[at..].iter().position(|&byte| byte == b'\n') {
+                    Some(offset) => at += offset + 1,
+                    None => continue,
+                }
+                while at < task.end.min(buffer.len()) {
+                    let row = &buffer[at..];
+                    let end = diag_newline(row).unwrap_or(row.len());
+                    let line = &row[..end];
+                    let comma = line.iter().position(|&byte| byte == b',').unwrap_or(line.len());
+                    let mut id = &line[..comma];
+                    if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' {
+                        id = &id[1..id.len() - 1];
+                    }
+                    let mut hash = 0x9E37_79B9_7F4A_7C15u64 ^ id.len() as u64;
+                    for chunk in id.chunks(8) {
+                        let mut word = [0u8; 8];
+                        word[..chunk.len()].copy_from_slice(chunk);
+                        hash = (hash ^ u64::from_le_bytes(word)).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29);
+                    }
+                    let bucket = (hash >> 40) as usize;
+                    let (word, bit) = (bucket >> 6, 1u64 << (bucket & 63));
+                    repeats += u64::from(bits[word] & bit != 0);
+                    bits[word] |= bit;
+                    rows += 1;
+                    at += end + 1;
+                }
+            }
+            flagged.fetch_add(repeats, Ordering::Relaxed);
+            rows_seen.fetch_add(rows, Ordering::Relaxed);
+        });
+        timing.detail("diag_uniq_rows", rows_seen.load(Ordering::Relaxed) as f64);
+        timing.detail("diag_uniq_repeats", flagged.load(Ordering::Relaxed) as f64);
+        timing.stage("uniq_prepass");
     }
     let next = AtomicUsize::new(0);
     let measure = timing.enabled();
