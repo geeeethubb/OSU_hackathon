@@ -1,0 +1,72 @@
+# Hardware-counter probe of the scored build (diagnostics only, never a ranking).
+#
+# Criterion (a) of the input lead-ahead experiment: the same binary, built from
+# the root Dockerfile, run natively on 20M seed 2 (warm page cache, 4 threads on
+# CPUs 0-3) with SS_LEAD=0 (each row prefetches only its own lines) and with the
+# default lead, under cpu-clock sampling (these VMs expose no hardware counters).
+# Reported per setting: in-process stages, per-function shares, and the short-row
+# loop's hottest instructions with the instructions before them. The addresses
+# are the same in both settings (one binary), so the shares compare directly.
+#
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore generator and dev answer
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator and dev answer (from the track page when not cached)
+        run: bash bench/fetch_tools.sh "$HOME/ss-tools"
+      - name: Data (20M events, seed 2)
+        run: |
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data"
+      - name: Scored build (root Dockerfile), binary copied out
+        run: |
+          docker build -q -t ss-probe .
+          id=$(docker create ss-probe)
+          docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline"
+          docker rm "$id" >/dev/null
+          sha256sum "$RUNNER_TEMP/pipeline"
+      - name: perf
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1)
+          [ -x "$PERF" ] || PERF=$(command -v perf)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          lscpu | grep -E "Model name|Thread|Core|L1d|L2|L3"
+          W="$RUNNER_TEMP"
+          find "$W/data" -type f -exec cat {} + > /dev/null
+          for round in 1 2; do
+            for lead in 0 default; do
+              rm -rf "$W/out" && mkdir -p "$W/out"
+              if [ "$lead" = default ]; then setting=""; else setting="SS_LEAD=$lead"; fi
+              echo "=== round $round, lead $lead"
+              env $setting DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 SS_TIMING=1 \
+                "$PERF" record -F 9999 -e cpu-clock -o "$W/clock.data" -- taskset -c 0-3 "$W/pipeline" 2> "$W/rec.txt" || true
+              grep -E "stage=|cpu_parse|samples" "$W/rec.txt" | sed 's/SS_TIMING //' | paste -sd' '
+              "$PERF" report -i "$W/clock.data" --stdio --no-children --sort symbol --percent-limit 1 2>&1 | grep -E "^ +[0-9]" | head -n 16
+              sym='ss::fast::parse::events_assembly_run_codes'
+              "$PERF" annotate -i "$W/clock.data" --stdio --no-source "$sym" > "$W/ann.txt" 2>/dev/null || true
+              echo "--- $sym: the 8 hottest instructions, each with the 8 before it"
+              for at in $(awk '/^ +[0-9]+\.[0-9]+ +:/ {print $1 " " NR}' "$W/ann.txt" | sort -rn | head -n 8 | cut -d' ' -f2); do
+                echo "- line $at"
+                sed -n "$((at > 8 ? at - 8 : 1)),$((at + 1))p" "$W/ann.txt" | cut -c1-130
+              done
+            done
+          done
