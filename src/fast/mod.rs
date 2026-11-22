@@ -717,6 +717,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let winners_nanos = AtomicU64::new(0);
     let forward_nanos = AtomicU64::new(0);
     let click_map_nanos = AtomicU64::new(0);
+    let filter_counts = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     parallel(threads, |thread| {
         // SAFETY: slot `thread` belongs to this thread for the whole phase.
         let out = unsafe { b_out.get(thread) };
@@ -746,7 +747,20 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         winners_nanos.fetch_add(scratch.winners_nanos, Ordering::Relaxed);
         forward_nanos.fetch_add(scratch.forward_nanos, Ordering::Relaxed);
         click_map_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
+        filter_counts[0].fetch_add(scratch.filtered_records, Ordering::Relaxed);
+        filter_counts[1].fetch_add(scratch.flagged_records, Ordering::Relaxed);
+        filter_counts[2].fetch_add(scratch.third_nanos, Ordering::Relaxed);
     });
+    if timing.enabled() {
+        // The duplicate filter of `dedup::dedup_filtered`: records counted,
+        // and those it set aside for the winner table.
+        eprintln!(
+            "SS_TIMING note=dedup_filter records={} flagged={} third_ms={:.1}",
+            filter_counts[0].load(Ordering::Relaxed),
+            filter_counts[1].load(Ordering::Relaxed),
+            filter_counts[2].load(Ordering::Relaxed) as f64 / 1e6
+        );
+    }
     timing.detail("cpu_dedup_winners", winners_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_dedup_forward", forward_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("cpu_click_map", click_map_nanos.load(Ordering::Relaxed) as f64 / 1e6);

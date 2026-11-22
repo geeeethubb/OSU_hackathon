@@ -66,6 +66,12 @@ pub struct ScratchB {
     table: Vec<Slot>,
     /// One bit per record, in iteration order: set for losing copies.
     lost: Vec<u64>,
+    /// The duplicate filter of `dedup_filtered`: per word of buckets, the
+    /// buckets seen at least once and those seen at least twice.
+    filter: Vec<[u64; 2]>,
+    /// The records of flagged buckets, in iteration order: word 0, word 1
+    /// and the purchase word (0 unless the record is a purchase).
+    flagged: Vec<[u64; 3]>,
     /// The same two for the long event IDs of a partition.
     long_table: Vec<LongSlot>,
     long_lost: Vec<u64>,
@@ -74,6 +80,12 @@ pub struct ScratchB {
     pub measure: bool,
     pub winners_nanos: u64,
     pub forward_nanos: u64,
+    /// Records of coded event IDs that went through the duplicate filter,
+    /// and how many of them it set aside for the winner table.
+    pub filtered_records: u64,
+    pub flagged_records: u64,
+    /// Diagnostics: nanoseconds in the third step of `dedup_filtered`.
+    pub third_nanos: u64,
 }
 
 /// Calls `visit(word0, word1, purchase_word)` for every record of the lists.
@@ -229,10 +241,29 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
     }
 }
 
+/// Extra filter bits per record bit of `dedup_filtered`: the filter has
+/// `2^(extra)` buckets per record of the partition, rounded up to a power of
+/// two. `SS_FILTER=0` turns the filter off (every record goes through the
+/// winner table, as before); `SS_FILTER_EXTRA=N` sets the extra bits.
+fn filter_extra() -> Option<u32> {
+    static EXTRA: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *EXTRA.get_or_init(|| {
+        if std::env::var_os("SS_FILTER").is_some_and(|value| value == "0") {
+            return None;
+        }
+        let extra = std::env::var("SS_FILTER_EXTRA").ok().and_then(|value| value.parse().ok()).unwrap_or(3u32);
+        Some(extra.min(8))
+    })
+}
+
 /// Dedup the coded event IDs of one partition and forward the survivors.
 fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch: &mut ScratchB) {
     let words: usize = lists.iter().map(PartList::words).sum();
     if words == 0 {
+        return;
+    }
+    if let Some(extra) = filter_extra() {
+        dedup_filtered(links, lists, words, extra, out, scratch);
         return;
     }
     // Every record has at least two words.
@@ -306,6 +337,182 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
     for offset in 0..waiting {
         forward_ring(links, out, ring[(first + offset) % AHEAD]);
     }
+    if let (Some(started), Some(between)) = (started, between) {
+        scratch.winners_nanos += (between - started).as_nanos() as u64;
+        scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+    }
+}
+
+/// Survivors waiting while their person-table slot loads: `AHEAD` records
+/// in the order they were pushed, each with what `LinkTable::probe`
+/// returned for its user.
+struct Ring {
+    entries: [[u64; 5]; AHEAD],
+    waiting: usize,
+    slot: usize,
+}
+
+impl Ring {
+    fn new() -> Self {
+        Self { entries: [[0; 5]; AHEAD], waiting: 0, slot: 0 }
+    }
+
+    /// Starts the lookup of a survivor's person; forwards the oldest
+    /// waiting survivor when the ring is full.
+    #[inline(always)]
+    fn push(&mut self, links: &LinkTable, out: &mut PassBOut, word0: u64, word1: u64, purchase: u64) {
+        let [hash, at] = links.probe(word1 >> 22);
+        if self.waiting == AHEAD {
+            forward_ring(links, out, self.entries[self.slot]);
+        } else {
+            self.waiting += 1;
+        }
+        self.entries[self.slot] = [word0, word1, purchase, hash, at];
+        self.slot = (self.slot + 1) % AHEAD;
+    }
+
+    /// Forwards every survivor still waiting, oldest first.
+    fn drain(&mut self, links: &LinkTable, out: &mut PassBOut) {
+        // A full ring starts at `slot`, a partly filled one at 0.
+        let first = if self.waiting == AHEAD { self.slot } else { 0 };
+        for offset in 0..self.waiting {
+            forward_ring(links, out, self.entries[(first + offset) % AHEAD]);
+        }
+        self.waiting = 0;
+        self.slot = 0;
+    }
+}
+
+/// A second hash of a local event key for the winner table of
+/// `dedup_filtered`. The keys that reach that table are those whose filter
+/// buckets collided, so they share the top bits of the filter's hash; the
+/// table must not take its slot from the same bits, or they would crowd
+/// together there (as in `dedup_long`).
+#[inline(always)]
+fn rehash(key: u32) -> u32 {
+    let mut hash = key ^ (key >> 16);
+    hash = hash.wrapping_mul(0x85EB_CA6B);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xC2B2_AE35);
+    hash ^ (hash >> 16)
+}
+
+/// `dedup_coded` with a duplicate filter in front of the winner table.
+///
+/// Every copy of an event ID is in the partition its code picks, and within
+/// it has the same local key; a key that occurs once in the partition is an
+/// event with one copy, which wins whatever its ingest. Only a few percent
+/// of the records have a key that occurs twice or more. So:
+///
+/// 1. Every record of the partition is counted, by its key's bucket, in a
+///    filter of two bits per bucket: seen, and seen again. The filter is
+///    complete before anything is forwarded.
+/// 2. A record whose bucket was seen exactly once is the only record with
+///    its key, so the only copy of its event: it is forwarded when it is
+///    valid, with no table. A record whose bucket was seen twice or more (all
+///    copies of every duplicated ID, and the single copies of the IDs that
+///    share a bucket with another key) is set aside, in iteration order.
+/// 3. The records set aside go through the exact winner table of
+///    `dedup_coded`: per key the copy with the smallest ingest, the first
+///    seen among equal ones (which are identical). A winner is forwarded
+///    when it is valid; an invalid winner drops the event.
+///
+/// The same records survive as in `dedup_coded`; only the order in which
+/// they are written to the person partitions differs, and nothing reads
+/// that order.
+fn dedup_filtered(
+    links: &LinkTable,
+    lists: &[PartList],
+    words: usize,
+    extra: u32,
+    out: &mut PassBOut,
+    scratch: &mut ScratchB,
+) {
+    // Every record has at least two words.
+    let most_records = words / 2;
+    let bits = (most_records.max(64).next_power_of_two().trailing_zeros() + extra).min(22);
+    let shift = 32 - bits;
+    scratch.filter.clear();
+    scratch.filter.resize(1 << (bits - 6), [0; 2]);
+    let filter = &mut scratch.filter[..];
+
+    let started = scratch.measure.then(std::time::Instant::now);
+    let mut records = 0u64;
+    for_each_record(lists, |word0, _, _| {
+        records += 1;
+        let bucket = ((word0 >> 32) as u32).wrapping_mul(0x9E37_79B1) >> shift;
+        // SAFETY: `bucket` has `bits` bits, and the filter has a word for
+        // every 64 buckets.
+        let pair = unsafe { filter.get_unchecked_mut((bucket >> 6) as usize) };
+        let bit = 1u64 << (bucket & 63);
+        pair[1] |= pair[0] & bit;
+        pair[0] |= bit;
+    });
+    let between = scratch.measure.then(std::time::Instant::now);
+
+    let filter = &scratch.filter[..];
+    let flagged = &mut scratch.flagged;
+    flagged.clear();
+    let mut ring = Ring::new();
+    for_each_record(lists, |word0, word1, purchase| {
+        let bucket = ((word0 >> 32) as u32).wrapping_mul(0x9E37_79B1) >> shift;
+        // SAFETY: as in the first pass.
+        let twice = unsafe { filter.get_unchecked((bucket >> 6) as usize)[1] >> (bucket & 63) } & 1;
+        if twice != 0 {
+            flagged.push([word0, word1, purchase]);
+            return;
+        }
+        if word0 & 1 == 0 {
+            return;
+        }
+        ring.push(links, out, word0, word1, purchase);
+    });
+
+    let third = scratch.measure.then(std::time::Instant::now);
+    if !flagged.is_empty() {
+        let bits = (flagged.len().max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+        let capacity = 1usize << bits;
+        scratch.table.clear();
+        scratch.table.resize(capacity, Slot::default());
+        let table = &mut scratch.table[..];
+        for (index, record) in flagged.iter().enumerate() {
+            let key = (record[0] >> 32) as u32;
+            let ingest = ((record[1] >> 1) & INGEST_MASK) as u32;
+            let mut at = (rehash(key) >> (32 - bits)) as usize;
+            loop {
+                // SAFETY: `at` is always masked into the table.
+                let slot = unsafe { table.get_unchecked_mut(at) };
+                if slot.tag == 0 {
+                    *slot = Slot { tag: index as u32 + 1, key, ingest };
+                    break;
+                }
+                if slot.key == key {
+                    if ingest < slot.ingest {
+                        slot.tag = index as u32 + 1;
+                        slot.ingest = ingest;
+                    }
+                    break;
+                }
+                at = (at + 1) & (capacity - 1);
+            }
+        }
+        for slot in table.iter() {
+            if slot.tag == 0 {
+                continue;
+            }
+            // SAFETY: a tag is the index of a flagged record plus one.
+            let [word0, word1, purchase] = unsafe { *flagged.get_unchecked(slot.tag as usize - 1) };
+            if word0 & 1 == 1 {
+                ring.push(links, out, word0, word1, purchase);
+            }
+        }
+        scratch.flagged_records += flagged.len() as u64;
+    }
+    ring.drain(links, out);
+    if let Some(third) = third {
+        scratch.third_nanos += third.elapsed().as_nanos() as u64;
+    }
+    scratch.filtered_records += records;
     if let (Some(started), Some(between)) = (started, between) {
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
