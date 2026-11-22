@@ -979,3 +979,25 @@ base was `b890895` and the comparison was against candidate E.
   Skylake-family Xeon (Cascade Lake) and no Ice Lake Xeon (one 8370C was seen once in about 60 earlier
   runs). The branch-erratum question (padded jumps) and the stage profile on the scorer's kind of core
   cannot be measured in CI; an official A/B would need the user's authorization.
+
+### 01:50 UTC
+
+- **D, click index built while event rows are parsed: REJECTED** (`bf947ce`, branch `exp-ci-click-early`,
+  against F4): +5.0 / +1.8 / +2.7 ms, 14/18 pairs (run 44971495438); +2.4 / +0.8 ms, 7/12, EPYC 7763
+  (run 44971502510); same image with the old phase -4.4 / +0.6 ms. Below the criterion set before
+  measurement (+5 ms on both seeds with 10/12). MEASURED lesson: with both hardware threads of a core
+  busy parsing, the grouping does not ride in idle issue slots; the phase's work moved and cost about
+  the same (consistent with the core being throughput-bound under SMT).
+- **G(b)(2), invalid-timestamp rows inside the assembly (`069f752`): not demonstrated** (+4.2 / +7.5 /
+  +1.1, 13/18, EPYC 9V74; -9.8 / -0.6, 5/12, EPYC 7763; `SS_RARE=b` variant inside the noise), as its
+  2.5 ms bound predicted. Not integrated.
+- **Attribution split, MEASURED** (same-image variants of `SS_DIAG_ATTR`, branch `exp-ci-attr2`, seed 2):
+  | skipped | runner | container | partitions CPU-ms | kernel CPU-ms |
+  |---|---|---|---|---|
+  | all attribution | Xeon 6973P-C | -67.8 ms (12/12... 6/6) | 553 -> 374 | 231 -> 67 |
+  | assists only | EPYC 9V74 | -27.9 ms (5/6) | 515 -> 432 | 232 -> 168 (flush 20 -> 0) |
+  | credited-cell writes only | Xeon 6975P-C | -2.5 ms (5/6) | 539 -> 511 | 229 -> 213 |
+  Assists (distinct assisting campaigns per session, per person-day entries, flush) about 83 CPU-ms,
+  about 5% of container time, about 7 ns per (person, campaign, day) entry over 11.5M entries; credited
+  cells cheap; reach, credit and setup about 70 CPU-ms (cross-runner subtraction, approximate).
+- **E3, allocator with 2 MiB-aligned own mappings** (`ea7d6ac`, branch `exp-ci-align`, with 60M): in CI.
