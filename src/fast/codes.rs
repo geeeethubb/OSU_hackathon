@@ -219,7 +219,55 @@ struct HexTable {
     /// (`arena::zeroed_pages`).
     slots: *const HexSlot,
     /// Per region, behind its lock, the slots filled so far (snapshots).
-    filled: Box<[Mutex<Vec<u32>>]>,
+    /// Each on its own cache line: threads inserting into neighbouring
+    /// regions would otherwise take turns at one line.
+    filled: Box<[Padded<Mutex<Vec<u32>>>]>,
+}
+
+/// A value on a cache line of its own.
+#[repr(C, align(64))]
+struct Padded<T>(T);
+
+impl<T> std::ops::Deref for Padded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Indexes a thread takes from an interner's counter at a time
+/// (`take_index`): one shared atomic add per block instead of per new ID.
+/// `SS_INDEX_BLOCK` sets it (1 = one at a time, as before; at most 4096).
+fn index_block() -> u32 {
+    static BLOCK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BLOCK.get_or_init(|| {
+        std::env::var("SS_INDEX_BLOCK").ok().and_then(|value| value.parse().ok()).unwrap_or(64u32).clamp(1, 4096)
+    })
+}
+
+thread_local! {
+    /// The indexes this thread has taken from a counter and not given out:
+    /// the counter's address, the next index, the end of the block.
+    static TAKEN: std::cell::Cell<(usize, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// A new exotic index from `next`, out of this thread's block. Indexes are
+/// labels: an ID's index only has to be its own, and a block's unused end
+/// leaves gaps that `snapshot_with` fills with empty entries nothing names.
+#[inline]
+fn take_index(next: &AtomicU32) -> u32 {
+    let owner = next as *const AtomicU32 as usize;
+    TAKEN.with(|cell| {
+        let (holder, at, end) = cell.get();
+        if holder == owner && at < end {
+            cell.set((holder, at + 1, end));
+            return at;
+        }
+        let block = index_block();
+        let start = next.fetch_add(block, AtomicOrdering::Relaxed);
+        cell.set((owner, start + 1, start + block));
+        start
+    })
 }
 
 // SAFETY: the slots are atomics, shared by design; the pointer is to memory
@@ -250,7 +298,7 @@ impl HexTable {
         if slots.is_null() {
             std::alloc::handle_alloc_error(std::alloc::Layout::new::<HexSlot>());
         }
-        HexTable { slots, filled: (0..TABLE_REGIONS).map(|_| Mutex::new(Vec::new())).collect() }
+        HexTable { slots, filled: (0..TABLE_REGIONS).map(|_| Padded(Mutex::new(Vec::new()))).collect() }
     }
 
     /// Slot `at` (below `TABLE_REGIONS << TABLE_REGION_BITS`).
@@ -310,7 +358,7 @@ impl HexTable {
             Probe::Found(index) => Some(index),
             Probe::Empty(_) if filled.len() >= TABLE_REGION_MOST => None,
             Probe::Empty(at) => {
-                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                let index = take_index(next);
                 let slot = self.slot(at);
                 slot.low.store(low, AtomicOrdering::Relaxed);
                 slot.high.store(high, AtomicOrdering::Relaxed);
