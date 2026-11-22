@@ -49,6 +49,27 @@ mod huge {
     }
 }
 
+/// `bytes` of zeroed memory, aligned to 64, that is never given back (it
+/// lives until the process exits). On Linux a fresh anonymous mapping with
+/// huge pages advised: its pages are zero by construction and are mapped
+/// where and when they are first written, by whichever thread writes them,
+/// instead of all being zeroed here (a large zeroed block from the heap may
+/// be cleared in full by the allocator). Null if there is no memory.
+pub fn zeroed_pages(bytes: usize) -> *mut u8 {
+    #[cfg(target_os = "linux")]
+    {
+        let block = huge::alloc(bytes);
+        if !block.is_null() {
+            return block;
+        }
+    }
+    match std::alloc::Layout::from_size_align(bytes.max(64), 64) {
+        // SAFETY: the layout has a non-zero size.
+        Ok(layout) => unsafe { std::alloc::alloc_zeroed(layout) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // SAFETY: an arena is owned and written by one thread at a time; the blocks it
 // hands out are only read after that thread is done.
 unsafe impl Send for Arena {}

@@ -215,10 +215,17 @@ struct HexSlot {
 /// table is asked first, under the region's lock, and a region never takes
 /// IDs again once it refused one).
 struct HexTable {
-    slots: Box<[HexSlot]>,
+    /// `TABLE_REGIONS << TABLE_REGION_BITS` slots, never freed
+    /// (`arena::zeroed_pages`).
+    slots: *const HexSlot,
     /// Per region, behind its lock, the slots filled so far (snapshots).
     filled: Box<[Mutex<Vec<u32>>]>,
 }
+
+// SAFETY: the slots are atomics, shared by design; the pointer is to memory
+// that is never freed or moved.
+unsafe impl Send for HexTable {}
+unsafe impl Sync for HexTable {}
 
 /// Where a lookup in a `HexTable` ended.
 enum Probe {
@@ -236,19 +243,22 @@ fn table_hash(first: u8, low: u64, high: u64) -> u64 {
 impl HexTable {
     fn new() -> Self {
         let count = TABLE_REGIONS << TABLE_REGION_BITS;
-        // Zeroed memory from the allocator (mapped page by page as it is
-        // first written) rather than slots written one by one here.
-        let layout = std::alloc::Layout::array::<HexSlot>(count).expect("table layout");
-        // SAFETY: all zero is a valid `HexSlot` (three `AtomicU64` of 0: an
-        // empty slot); the box frees the memory with the same layout.
-        let slots: Box<[HexSlot]> = unsafe {
-            let pointer = std::alloc::alloc_zeroed(layout) as *mut HexSlot;
-            if pointer.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, count))
-        };
+        // Zero pages mapped as the parse first writes them (all zero is an
+        // empty slot: three `AtomicU64` of 0), not 32 MiB cleared here on
+        // one thread before anything else can start.
+        let slots = super::arena::zeroed_pages(count * std::mem::size_of::<HexSlot>()) as *const HexSlot;
+        if slots.is_null() {
+            std::alloc::handle_alloc_error(std::alloc::Layout::new::<HexSlot>());
+        }
         HexTable { slots, filled: (0..TABLE_REGIONS).map(|_| Mutex::new(Vec::new())).collect() }
+    }
+
+    /// Slot `at` (below `TABLE_REGIONS << TABLE_REGION_BITS`).
+    #[inline(always)]
+    fn slot(&self, at: usize) -> &HexSlot {
+        debug_assert!(at < TABLE_REGIONS << TABLE_REGION_BITS);
+        // SAFETY: `at` is inside the table, which lives as long as the process.
+        unsafe { &*self.slots.add(at) }
     }
 
     /// Starts loading the slot where a lookup of the ID begins.
@@ -260,7 +270,7 @@ impl HexTable {
         // SAFETY: a prefetch does not fault; the address is inside the table.
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(at) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(self.slots.add(at) as *const i8);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = at;
@@ -275,8 +285,7 @@ impl HexTable {
         let base = region << TABLE_REGION_BITS;
         let mut at = (hash >> (56 - TABLE_REGION_BITS)) as usize & mask;
         loop {
-            // SAFETY: `base + at` is inside the region, inside the table.
-            let slot = unsafe { self.slots.get_unchecked(base + at) };
+            let slot = self.slot(base + at);
             let meta = slot.meta.load(AtomicOrdering::Acquire);
             if meta == 0 {
                 return Probe::Empty(base + at);
@@ -302,7 +311,7 @@ impl HexTable {
             Probe::Empty(_) if filled.len() >= TABLE_REGION_MOST => None,
             Probe::Empty(at) => {
                 let index = next.fetch_add(1, AtomicOrdering::Relaxed);
-                let slot = &self.slots[at];
+                let slot = self.slot(at);
                 slot.low.store(low, AtomicOrdering::Relaxed);
                 slot.high.store(high, AtomicOrdering::Relaxed);
                 slot.meta.store(u64::from(first) << 56 | (u64::from(index) + 1), AtomicOrdering::Release);
@@ -318,7 +327,7 @@ impl HexTable {
             // The lock: an ID whose index was given out is in its slot.
             let filled = region.lock().unwrap();
             for &at in filled.iter() {
-                let slot = &self.slots[at as usize];
+                let slot = self.slot(at as usize);
                 let meta = slot.meta.load(AtomicOrdering::Acquire);
                 let value = u128::from(slot.high.load(AtomicOrdering::Relaxed)) << 64
                     | u128::from(slot.low.load(AtomicOrdering::Relaxed));
