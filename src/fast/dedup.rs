@@ -354,7 +354,12 @@ pub fn forward_mixed(out: &mut PassBOut, mixed: u64, word0: u64, is_purchase: u6
 /// `ts` is in milliseconds since seven days before the window.
 #[inline(always)]
 pub fn forward_click(out: &mut PassBOut, name: u64, ts: u64, code_and_campaign: u64) {
-    let mixed = mix(name);
+    forward_click_mixed(out, mix(name), ts, code_and_campaign);
+}
+
+/// `forward_click` with the name already mixed (`codes::mix`).
+#[inline(always)]
+pub fn forward_click_mixed(out: &mut PassBOut, mixed: u64, ts: u64, code_and_campaign: u64) {
     let part = (mixed >> out.person_shift) as usize;
     // SAFETY: a mixed code has `CODE_BITS` bits, so `part` is below the
     // number of writers; `reserve` returns room for two words.
@@ -368,12 +373,37 @@ pub fn forward_click(out: &mut PassBOut, name: u64, ts: u64, code_and_campaign: 
 /// Map a batch of parsed clicks (blocks of `[user, click code and campaign,
 /// ts]` triples) to their persons' partitions.
 pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
+    // As the forward of events: each click waits in a ring of 16 while its
+    // link-table slot loads, and the probe made for that prefetch is where
+    // its lookup starts (no second hash and rank); a person named by the
+    // click's own user takes the probe's hash as its mixed name.
+    let mut ring = [[0u64; 5]; AHEAD];
+    let mut waiting = 0usize;
+    let mut slot = 0usize;
     for block in blocks {
-        for (index, click) in block.chunks_exact(RAW_CLICK_WORDS).enumerate() {
-            if let Some(&later) = block.get((index + AHEAD) * RAW_CLICK_WORDS) {
-                links.prefetch(later);
+        for click in block.chunks_exact(RAW_CLICK_WORDS) {
+            let [hash, at] = links.probe(click[0]);
+            if waiting == AHEAD {
+                forward_click_ring(links, out, ring[slot]);
+            } else {
+                waiting += 1;
             }
-            forward_click(out, links.person(click[0]), click[2], click[1]);
+            ring[slot] = [click[0], click[1], click[2], hash, at];
+            slot = (slot + 1) % AHEAD;
         }
     }
+    // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
+    let first = if waiting == AHEAD { slot } else { 0 };
+    for offset in 0..waiting {
+        forward_click_ring(links, out, ring[(first + offset) % AHEAD]);
+    }
+}
+
+/// Writes one click waiting in a ring (user, click code and campaign, ts,
+/// then what `LinkTable::probe` returned for the user) to its person's
+/// partition.
+#[inline(always)]
+fn forward_click_ring(links: &LinkTable, out: &mut PassBOut, waiting: [u64; 5]) {
+    let [user, code_and_campaign, ts, hash, at] = waiting;
+    forward_click_mixed(out, links.person_mixed_probed(user, [hash, at]), ts, code_and_campaign);
 }
