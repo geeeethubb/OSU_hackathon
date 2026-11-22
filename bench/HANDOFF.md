@@ -4,9 +4,23 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 07:30 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 08:45 UTC, shopping-sessions-5)
 
-- **Candidate F11 = head of `pipeline` (this commit)** = F10 + long-ID link kernel (`SS_LINK_LONG`) + user
+- **Candidate F12 = head of `pipeline` (this commit)** = F11 + the ring of pending user codes (`SS_PENDING`) +
+  16-byte partition writers + the ID snapshots beside pass B + lists sealed by their own workers; build
+  inputs = `9226397`. F11 `8f39109` and F10 `20d2f71` are the fallbacks.
+  Against F11: Intel CI +0.1 / +7.8 / +6.0 ms (6975P-C, 13/18), e1 native 74/90 pairs (+0.4-2.1%); AMD
+  fresh seeds +9 to +26 ms (179/181/191 never used: +8.9 / +13.5 / -2.3); 60M +17.8 ms, 19/19 MATCH,
+  peak 2.14 GiB; local gate all MATCH (LEDGER 08:45).
+- Rejected since 07:45: the branchless link lookup (-20 ms on Intel, 0/54), the two-word link table,
+  the pdep commas (C5); dropped on the laptop before Intel: mixed names in link entries, per-block slot
+  prefetch for the winner and person tables.
+- Profile of F11 by call site (e1, LEDGER 08:25): pass B 24% (link probe 12-13% of all CPU, winners about
+  6%), assembly loop 19%, `event_lean_long` 12.6-14.2%, pass C about 17%, clicks about 10%.
+
+## Checkpoint 2026-11-22 07:30 UTC (superseded above)
+
+- **F11 `8f39109` (then the candidate, now the first fallback)** = F10 + long-ID link kernel (`SS_LINK_LONG`) + user
   indexes in per-thread blocks with padded region locks (`SS_INDEX_BLOCK`); build inputs = `9612344` (C4).
   Against F10: Intel +7 to +16 ms (CI 34/36, e1 native 68/72), AMD +10 to +14 (49/54 incl. fresh seeds),
   60M 19/19 MATCH (LEDGER 07:30). F10 `20d2f71` and F8 `8652004` are the fallbacks.

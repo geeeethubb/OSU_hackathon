@@ -1451,3 +1451,118 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
 - In flight: a link table with two-word entries so the bitmap can shrink (`4117620`, SS_LINK_SPREAD; e1's
   bound: forward + click map -20% (8573C) to -30% (6975P-C) with the bitmap always cached), and
   `event_lean_long` finding its commas with pdep (`5c7749b`).
+
+### 07:45 UTC: the link bitmap: bound measured, restructure rejected
+
+- **Bound** (timing-only diagnostic `SS_DIAG_BITMAP`, branch exp-diag-bitmap, wrong answers by design): with
+  the bitmap and rank words read from 512 always-cached bytes and the entry traffic kept real (mode 2),
+  forward + click map thread time fell 20% on a Xeon 8573C and 29-32% on three Xeon 6975P-C (e1, native,
+  runs 44997502153, -486330, -495615, -505108); mode 1 (entry traffic dropped too) -35% and -52 to -55%.
+- **Restructure (`4117620`)**: entries of two words [name, whole hash], so the position count is free
+  (SS_LINK_SPREAD positions per entry; 4 = half today's bitmap and rank words). Exact everywhere locally.
+  e1, native, against F11: Xeon 6975P-C +7.0 / +10.5 / +13.9 and +10.8 / +9.8 / +11.7 ms (31/36), forward +
+  click map -4 to -6%; **Xeon 8573C -5.2 / +6.7 / +3.4 and -9.1 / -2.2 / +0.6 ms (16/36)**, forward + click
+  map -1 to +2%. Spread 2 worse everywhere (-9 to -21 ms, 2/72); spread 8 (today's bitmap size, wider
+  entries) better on the 8573C, worse on the 6975P-C. It captures about a fifth of the bound on Granite
+  Rapids and none on Emerald Rapids: **REJECTED** (the scorer's generation is unknown).
+- **ID snapshots beside pass B** (exp-snap): the click and user snapshots taken on a helper thread while
+  pass B runs; serial_sessions_setup 4.2 -> 1.2 ms on the laptop at 8 threads. All sets MATCH, 60M MATCH.
+  e1, native whole images against F11 (5 Intel draws: two 8573C, three 6975P-C; seeds 2/3/5, 18 pairs each):
+  +4.3 / -0.6 / +0.6, +8.2 / -0.2 / +1.4, +1.0 / -1.4 / -0.1, +2.8 / +9.4 / +4.7, +1.1 / -0.9 / +2.4 ms (53/90
+  pairs; A/A F11 medians -3.4 to +2.1, 43/90). CI (run 44999034299, Xeon 8573C): -1.0 / -4.0 / +6.4 ms (10/18).
+  Not demonstrated alone.
+
+### 08:00 UTC: 16-byte partition writers (`3d40691`, on top of the snapshots)
+
+- **Change**: `PartWriter` is the cursor and the end of its block (two words, not four): the block being
+  filled is the `block_words` before the end, and every block's header carries the list's first block
+  (third header word), so `finish` takes the block size; the assembly scales writer indexes by 16. Aimed at
+  e1's writer-cursor stalls on Intel (asm loop 8.6%, `event_lean_long` 4.8%, click map 7.1% of their time).
+  Exact everywhere locally (unit tests, 36/36, 43/43, every mutated set with and without SS_VERIFY, index
+  mode, the compiled and general kernels, SS_FAST=0, NCPU=3, new 60M).
+- **Measured against F11**: CI run 44999592188 (EPYC 7763): +14.3 / +20.5 / +42.6 ms (6/6, 5/6, 5/6; A/A
+  +1.8 / +5.5 / +0.2; a few pairs of +-150 to 250 ms on both sides). e1, native whole images, Intel:
+  8573C +2.6 / +3.6 / +3.2 (13/18) and -2.0 / +2.7 / +10.0 (11/18); 6975P-C +1.0 / +0.6 / +1.9 (11/18),
+  -6.3 / +2.1 / +3.8 (11/18), +3.3 / +4.9 / +1.8 (13/18): 59/90 pairs against the A/A's 43/90, about
+  +2 ms. **Small but consistent; folded into the next candidate with the snapshots (branch scratch-f12
+  = pipeline + `58670ca` + `3d40691`, build inputs identical to `3d40691`), not gated alone.**
+- Laptop, one thread: a row handed out of the assembly loop and back costs about 4 ns (forcing one row
+  per call on short rows: 82 -> 89 ms for 1.7M rows); long-ID rows cost 98 ns against 47 for short rows.
+  About 25% of event rows leave the loop (23% with a long ID, 3% purchases), so batching them would save
+  about 1% of the event parse: not pursued. The long rows' cost is inside `event_lean_long`.
+
+### 08:25 UTC: F11's profile by call site; the ring kept, the branchless link lookup rejected
+
+- **e1's F11 profile, every sample resolved to its call site (addr2line -i; Xeon 8573C x3, 6975P-C x1;
+  probe 87cd81d).** Shares of CPU: pass B 24.2% (the link probe's bitmap word and rank 43-47% of pass B
+  plus the click map, about 12-13% of all CPU; winner table 20-23%), assembly loop 18.7%,
+  `event_lean_long` 12.6% (14.2% on an Ice Lake 8370C), pass C about 17% (grouping 29-30% of it,
+  attribution 22-23%, sessionize 13-14%), clicks about 10%, kernel_init_pages 2.2-2.9%, link builder
+  1.7% (4.0-4.1% of the parse window: about 20 ms of parse wall at 4 threads). Inside `event_lean_long`:
+  masks/commas/quotes 26-32%, timestamps 11-13%, store of rows not deferred 10-11%, **ring push 11.5-13.5%
+  (8573C; 3.2% on the 6975P-C) and store of the row leaving the ring 5.9-7.3%; the deferred user lookup
+  itself 0-0.5%** (the ring hides it completely).
+- **Ring of pending user codes (`439917f`, SS_PENDING)**: a long-user row is stored at once with its user
+  field 0; the ring keeps the address of the user word, the shift and the ID (32 bytes, not an 80-byte
+  row) and ORs the code in when the entry leaves. Exact everywhere locally (incl. SS_PENDING=1/32,
+  SS_DEFER=0, index mode, 60M). **Against `3d40691`: e1 native, Xeon 6975P-C x3: +4.8 / +5.8 / +5.7,
+  +6.4 / +4.7 / +3.8, +4.9 / +5.2 / +5.8 ms (45/54; A/A -2.7 to +2.2); CI run 45001455896, EPYC 9V74:
+  +3.7 / +9.8 / +13.8 ms (16/18; A/A -9.3 / +4.6 / +1.5), event parse CPU -1.3 to -2.5%.** Depth 8
+  against 16 (same image): +1.0 / -2.2 / -1.6 ms, no difference. **KEPT** (default 16).
+- **Branchless probed lookup (`933026c`)**: the entry or a static word read with select_unpredictable,
+  the mixed name picked between probe[0] and mix(name). About half of all lookups hit an entry (61.6%
+  of event rows name a user some link line names). **e1 native, 6975P-C x3: -18.9 / -21.1 / -20.1,
+  -18.2 / -18.0 / -18.9, -23.7 / -20.6 / -22.2 ms (0/54); CI run 45001819572 (6975P-C): -21.0 / -17.6 /
+  -23.1 (1/18), forward 534-543 -> 620-633 thread-ms.** The branch lets the processor run ahead on the
+  unlinked half; the select puts a load and two multiplies on every survivor's store-address chain.
+  **REJECTED.** Reading: the forward is bound by the latency of that chain.
+- **Lists sealed by their own workers (`bdc0e87`)**: each parse worker seals its event, long-event and
+  click lists after its last chunk, each pass-B worker its person lists (not in index mode); the serial
+  steps only collect them. Exact everywhere locally (incl. index mode, 60M). CI run 45002200940 (EPYC
+  9V74) against `3d40691`: -3.2 / +7.8 / -2.6 ms (9/18, noise), serial_dedup_setup 1.38-1.54 -> 1.08-1.30
+  ms there (4.0 ms on a Xeon 8573C at 4 threads; twice the lists at 8 threads). Kept for the scorer's 8
+  threads, as an exact change with no measurable cost.
+- **Dropped before any Intel run** (laptop, 4 threads, alternating with the ring's build, 4 runs each):
+  link entries holding the mixed name, so that pass B routes a linked user with no mix (`exp-mixname`,
+  exact everywhere): forward 393-709 ms against 304-324, unexplained; the winner table's slots of a
+  block prefetched before the block is walked, and the same for the sessions person table
+  (`exp-winpf`): winner step 220-227 ms against 179-187, sessions no better.
+
+### 08:35 UTC: F12 assembled
+
+- **F12 = `9226397`** (branch scratch-f12) = F11 (`8f39109`) + the snapshots (`58670ca`) + 16-byte writers
+  (`3d40691`) + the ring of pending user codes (`439917f`) + lists sealed by their workers (`bdc0e87`),
+  cherry-picked in that order (one conflict, the field list of `ParseOut`, both kept). In flight: the
+  local gate; CI against F11's code `af07f59` with [60m] (exp-f12-a) and with fresh seeds 131/137/139
+  (exp-f12-b); e1's native whole-image pairs against F11 on Intel.
+
+### 08:45 UTC: F12 passes its gate
+
+- **Local gate on F12's exact tree (`9226397`)**: unit tests (57), 36/36 and 43/43 fixtures, dev and dev_new,
+  new 20M, old 20M seeds 2 and 3, the mutated long-ID, click, wide-row and link sets with and without
+  SS_VERIFY, index mode, the compiled and general kernels, SS_FAST=0, SS_PENDING=1, SS_DEFER=0,
+  SS_RECYCLE=0, SS_RELEASE=0, dev_new at 1, 3 and 4 threads, new 60M; the switch sweep (ten modes over
+  fixtures and dev) and 180/180 small and mutated sets against `reference.exe`: **all MATCH**.
+- **CI against F11's code `af07f59`** (all 36/36, 43/43, dev and every 20M run MATCH):
+  | Runner | Run | Seeds | Saved (F11 - F12) | Pairs |
+  |---|---|---|---|---|
+  | Xeon 6975P-C | 45002966497 | 2 / 3 / 5 | +0.1 / +7.8 / +6.0 ms (A/A +4.8 / +1.4 / -1.8) | 13/18 |
+  | EPYC 9V74 | 45002974494 | fresh 131 / 137 / 139 | +8.9 / -3.5 / +15.3 ms | 14/18 |
+  | EPYC 9V74 | 45003066062 | fresh 149 / 151 / 157 | +25.8 / +23.8 / +18.6 ms | 17/18 |
+  | EPYC 9V45 | 45003081769 | never used before: 179 / 181 / 191 | +8.9 / +13.5 / -2.3 ms | 13/18 |
+  (131-139 and 149-157 were F10's and F11's holdouts, never used for tuning; 179-191 are new.)
+- **60M** (run 45002966497, EPYC 9V45): F12 1,921.6 ms against F11 1,936.7 ms, **+17.8 ms (5/6; A/A max
+  12.8 ms)**; F12's **19/19 runs MATCH `/reference`**; peak memory 2.14 GiB (F11 2.14).
+- **e1, native whole images against F11** (probe 2483ec3; five Intel draws): Xeon 6975P-C +1.1 / +6.2 /
+  +7.8, +3.1 / +8.1 / +3.2, +2.2 / +3.5 / +8.9, +2.6 / +7.9 / +4.4 ms; Xeon 6973P-C +6.4 / +18.9 / +12.6
+  ms: **74/90 pairs** (F11 A/A: 37/90), about +0.4-1.1% on Granite Rapids and +0.7-2.1% on the 6973P-C.
+  No Emerald Rapids or Ice Lake draw for F12 itself; its largest part, the ring, measured +4 to +6 ms on
+  6975P-C and its profile target was larger on the 8573C.
+- **F12 is the new candidate** (head of `pipeline`, this commit; build inputs = `9226397`). F11 `8f39109`
+  and F10 `20d2f71` are the fallbacks. Not submitted; the submission watch decides.
+- **Next (e1's instruction-level profile of F12's assembly loop, seven Intel draws incl. an Ice Lake
+  8370C)**: no region dominates (head, codes, ts and store each about a sixth of the loop); the single
+  top instruction is the first use of the partition writer's cursor (`lea r13,[r11+0x10]`: 5.3% of the
+  loop on Ice Lake, 7.6-8.9% on 8573C and 6975P-C, 10.2% on the 6973P-C), at the end of the row's
+  dependency chain (codes, mix, writer index, cursor load). Bounded experiment: the mix and the cursor
+  load hoisted to right after `lean_codes`, so the load overlaps ts, ingest, type and tail.
