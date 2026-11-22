@@ -2713,7 +2713,8 @@ unsafe fn product_category(ctx: &Ctx, p: *const u8, length: usize) -> u32 {
 }
 
 /// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
-/// it). Only rows shorter than 64 bytes take the fast path.
+/// it). Rows of up to 127 bytes take the fast path: a click row with an ID of
+/// 33 characters (current generated data has them) is about 70 to 100.
 ///
 /// With `INDEXED` (`ctx.keys` must be set), a generated user ID comes back
 /// as its user number (`user_is_number`), so that storing the click does not
@@ -2724,27 +2725,44 @@ pub unsafe fn click_row_fast<const INDEXED: bool>(
     p: *const u8,
     click: &mut ClickRecord,
 ) -> (usize, u32) {
-    let block0 = _mm256_loadu_si256(p as *const __m256i);
-    let block1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let newlines = mask(block0, _mm256_set1_epi8(b'\n' as i8)) | (mask(block1, _mm256_set1_epi8(b'\n' as i8)) << 32);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let blocks = [
+        _mm256_loadu_si256(p as *const __m256i),
+        _mm256_loadu_si256(p.add(32) as *const __m256i),
+        _mm256_loadu_si256(p.add(64) as *const __m256i),
+        _mm256_loadu_si256(p.add(96) as *const __m256i),
+    ];
+    let wide = |byte: __m256i| -> u128 {
+        let low = mask(blocks[0], byte) | (mask(blocks[1], byte) << 32);
+        let high = mask(blocks[2], byte) | (mask(blocks[3], byte) << 32);
+        (u128::from(high) << 64) | u128::from(low)
+    };
+    let newlines = wide(newline);
     if newlines == 0 {
         return (0, ROW_LONG);
     }
     let length = newlines.trailing_zeros() as usize;
-    let below = (1u64 << length) - 1;
-    let commas = (mask(block0, _mm256_set1_epi8(b',' as i8)) | (mask(block1, _mm256_set1_epi8(b',' as i8)) << 32)) & below;
-    let quotes = (mask(block0, _mm256_set1_epi8(b'"' as i8)) | (mask(block1, _mm256_set1_epi8(b'"' as i8)) << 32)) & below;
+    let below = (1u128 << length) - 1;
+    let commas = wide(comma) & below;
+    let quotes = wide(quote) & below;
     // Four fields and a first field that is not empty (an empty click_id
     // drops the line just as a wrong field count does).
     if commas.count_ones() != 3 || commas & 1 != 0 {
         return (length, ROW_DROP);
     }
-    // Same quote rule as for events, in one word.
-    let separators = commas | (1u64 << length);
+    // Same quote rule as for events, in two words.
+    let separators = commas | (1u128 << length);
     let starts = (separators << 1) | 1;
     let ends = separators >> 1;
-    let opened = _pext_u64(quotes, starts);
-    if ((quotes & !(starts | ends)) | (quotes & starts & ends) | (opened ^ _pext_u64(quotes, ends))) != 0 {
+    let pext128 = |bits: u128, select: u128| -> u64 {
+        let (low, high) = (bits as u64, (bits >> 64) as u64);
+        let (select_low, select_high) = (select as u64, (select >> 64) as u64);
+        _pext_u64(low, select_low) | (_pext_u64(high, select_high) << select_low.count_ones())
+    };
+    let opened = pext128(quotes, starts);
+    if ((quotes & !(starts | ends)) | (quotes & starts & ends)) != 0 || opened != pext128(quotes, ends) {
         return (length, ROW_DROP);
     }
     let c0 = commas.trailing_zeros() as usize;
