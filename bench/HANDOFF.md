@@ -1,113 +1,94 @@
 # Handoff: where the work stands
 
-Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11-21 unless said otherwise.
-Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC.
+Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11-22 unless said otherwise.
+Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
+from about 13:00 the effort shifts to validating one reliable final candidate.
 
 ## Best verified implementation
 
-- **Accepted official best: 0.64 s**, commit `2dae9298f4e1e0a5259eec54c400501b00fae26f` (also 0.64 s:
-  `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e`). Earlier: 0.66 s `4567e9532f4019fbfd0e92908fd01cc49f24f67d`,
-  0.71 s `2b2cccd1ba1cb12bc5a074a899ce54c868205b86`, 0.84 s `23b285da8246d00275b1ad191da0fffb8c5f81e4`.
-  Official scores are relayed by the user's submission watch; nothing here submits.
-- **Best confirmed in CI, not yet scored officially:** candidate E,
-  `5704266f417ff89b1d4d2627eb3188e706eb4e4e` (+56 to +67 ms against `2dae9298`, 60M +177 ms). It is the
-  commit in `bench/BEST_SHA` (every CI run pairs HEAD against it) and the commit the PR names.
-- **Candidate F** (pushed 23:10 with `[60m]`; see the PR for its state): E plus the steps listed below,
-  each confirmed alone. The PR names it only once its own CI run confirms the integrated tree.
-- Move `bench/BEST_SHA` only to a commit with a confirmed paired win, and read the hash from git
-  (`git rev-parse`), never from memory.
+- **Official best: 0.5231 s**, candidate F, `1033956062d3cd948462c664d822f2636bcf1153` (receipt
+  BB-337F162E). Previous: 0.6389 s `2dae9298f4e1e0a5259eec54c400501b00fae26f`, 0.66 s `4567e953...`,
+  0.71 s `2b2cccd1...`. Board best when last checked: 0.2778 s. Official scores are relayed by the
+  user's submission watch; nothing here submits.
+- `bench/BEST_SHA` = F: every CI run pairs HEAD against the officially scored commit. F must stay
+  recoverable: it is the commit named in the PR until a successor is confirmed.
+- **Candidate F2 in CI** (pushed 00:00): `9e31bf35b6926a20b282ad270c8005082c6ec40f` = F + parser chain
+  to `64eecd8` + index-pass chain to `4f16ecb` + links `cfdf102`. Named in the PR only if its own run
+  confirms it against F (20M three seeds, fresh seeds, 60M).
+
+## What the measurements say about the bottleneck (details: LEDGER 23:30 and 23:58)
+
+- F on a 2-core x 2-thread Xeon 6975P-C runner: container 670 ms, process 608 ms: event+click parse
+  435 (event parse 1,435 CPU-ms, click 202), index pass 156 (place 128, session kernel 226, rest 179
+  CPU-ms), link stage 10, whale tail 12.5, output 1. The process is compute-bound and parallel.
+- Event parse: the kernel is 86% of it, the lists' memory traffic 9%, input page faults ~3%, the variety
+  of row formats 3-5%. 4.45% of rows (purchases, declines) take ~30% of kernel time.
+- With both hardware threads of a core busy, a core is throughput-bound (the second thread adds only
+  23-32%): only fewer uops or fewer stalls make a row cheaper; latency hiding inside a thread does not.
+- Index pass (time-stamp counters): place 22-24%, batch finish (rows, attribution, cells, output)
+  37-39%, one-slot path 14-17%, tight loop 9-10%, assists 6-7%, run ends 6-7%.
+- No single change identified removes half of the time. A 40-50% cut would need the per-row parse cost
+  and the index pass each roughly halved; that is the direction of the registry below.
+- Unknown: the scorer's CPU model (an n2 Xeon: Cascade Lake or Ice Lake), its run-to-run variation, its
+  container overhead. From `2dae9298` to F, CI pairs added 183-236 ms and the official score moved 116 ms.
+
+## Experiment registry (hypotheses, not candidates)
+
+| ID | Architectural difference | Correctness argument | Measured / bounded benefit | Added costs | Decision |
+|---|---|---|---|---|---|
+| G | Purchases and declined rows finished inside the assembly instead of leaving for slower parsers that re-read them | the assembly takes exactly the rows the general parser accepts, with identical values; per-case proof for rows rejected inside; differential tests both ways | 4.45% of rows take ~30% of kernel time; bound ~25% of event parse, ~10% of process | code size, a purchase path | BUILD, parser agent (`SS_RARE=0` switch) |
+| H | Slot scan four slots per step, purchases and invalid winners included | per-slot semantics unchanged; tested against one-at-a-time code | one-slot path 14-17% of the partition pass (3.75M mispredicted exits) | AVX2 classification per four slots | IN CI (`2764dfa`, `SS_WIDE=1`), sessions agent |
+| I | Batch finish (attribution, cells, rows) restructured to remove work | rules for credited/assists/organic unchanged | 37-39% of the partition pass; bound not yet known | unknown | DESIGN FIRST, sessions agent; stop if under 5% |
+| J | Clicks grouped per partition inside the index pass; no click-index phase and no 80 MB second copy | same click set per user and same filter; the kernel is order-free over a person's clicks | the phase is 19.6-25.2 ms elapsed (3-4% of process) | ranges straddling two partitions read twice or built once with a wait | BUILD, click agent (`SS_CLICK_GROUP=0`); kill on no paired win |
+| K | The five whale persons spread over threads (split at session gaps or stitch the boundary sessions) and chains started early | session boundaries come from consecutive ts; a session's day and attribution depend on its start only | tail 12.5 ms on CI; larger share with 8 threads | stitching code | MEASURE the tail left in F2 first; lead |
+| L | 8-byte records | needs at least 80 bits without truncation; truncating user numbers would make the layout check unsound | lists are 9% of event parse | | KILLED on paper (bit budget); 12-byte variant bounded at ~3%, not now |
+| M | Two rows interleaved per loop iteration | | none: with both hardware threads busy the core is already throughput-bound | | KILLED by measurement |
+| N | Eight rows per vector lane (transposed) for timestamp and ID arithmetic | same decode, vertical | arithmetic ~90 of 197 straight-line instructions; transposition eats much of it; estimate under 15% | large rewrite | PAPER SCREEN by the parser agent after G; build only above 15% |
+| O | EVEX-256 kernel (AVX-512 F/BW/VL/VNNI) with runtime dispatch; AVX2 fallback | same acceptance set | unknown; the scorer's n2 Xeons have these instructions | second kernel; the scorer's exact CPU cannot be tested | PAPER SCREEN (uop count) by the parser agent |
+| P | Decode after dedup (offsets instead of records) | | measured earlier: at most 2-4% of parse before the random re-read of 1.6 GB | | KILLED; nothing has changed since |
+| Q | Index pass overlapped with the parse | any file holds copies of any event: no partition is final before the last row | | | KILLED on paper |
+| R | Scorer calibration through official submissions: R1 an identical binary again (run-to-run variation); R2 F + jumps padded off 32-byte boundaries (Skylake-family erratum; CI has no affected CPU) | both builds pass every CI check | R2 unknown; CI cost of the padding 1-5 ms on an EPYC 7763 | two submissions | RECOMMENDED to the submission watch |
+
+Bounded incremental stream on F, one step at a time: the parser's kernel steps, the sessions agent's
+scan steps, links and click kernels (small), memory reuse of consumed list blocks (small).
 
 ## How the engine works now (index mode, the default)
 
 1. Startup: Parquet files left in the output folders are removed; manifest; event files mapped; the
    generator's two ID scramble keys found from the first 64 KiB of the largest events file and the
-   layout checked on those samples. Lookup tables (products, campaigns) load on a side thread while
-   links are parsed.
+   layout checked on those samples. Lookup tables load on a side thread while links are parsed.
 2. Parse stage, all threads: event rows -> 16-byte records appended to per-thread lists by index
    partition (2^14 event indexes each), the common row through one piece of assembly; click rows ->
-   per-user-range lists through a table-driven kernel. Beside it, one thread resolves links
-   (`links::build_indexed`). Then, all threads: the click index (clicks grouped by user), while two
-   helper threads let go of the input mappings.
+   per-user-range lists through a table-driven kernel. Beside it, one thread resolves links. Then, all
+   threads: the click index, while two helper threads let go of the input mappings.
 3. Index pass, all threads, partition by partition: `place` puts each record in the slot of its index
    (smallest ingest wins: the dedup; the slot word carries the partition's tag), a scan reads the slots
-   in order (events of one user are one run), persons whose IDs are one simple link component are
-   sessionized in batches of 32 while their slots are read, everything else goes to the general path.
-   First and last run of every partition are joined across partitions afterwards ("chains"; the five
-   whale users end up here). Each thread writes its user_daily row groups as they fill.
-4. General-path remainder (complex link components, odd IDs), the campaign table, exit.
+   in order, persons whose IDs are one simple link component are sessionized in batches of 32 while
+   their slots are read, everything else goes to the general path. First and last runs are joined
+   across partitions afterwards ("chains"; the whales end up here). Each thread writes its user_daily
+   row groups as they fill.
+4. General-path remainder, the campaign table, exit.
 
-What must be complete before anything is final: every file must be parsed before any partition can be
-placed (rows are fully shuffled across files; any file can hold a copy of any event). What the fast
-path assumes and checks: IDs are scrambled dense numbers (keys found on samples, every row checked;
-rows that do not fit go to the general path), user indexes never decrease along the event-index order
-(checked on every surviving event; a violation restarts the run on the general path, exercised by
-`SS_FORCE_RESTART=1` and by mutation tests).
+What the fast path assumes and checks: IDs are scrambled dense numbers (keys found on samples, every
+row checked; rows that do not fit go to the general path); user indexes never decrease along the
+event-index order (checked on every surviving event; a violation restarts on the general path).
 
-Switches (each keeps the previous behaviour for same-image comparisons): `SS_STRUCT=0` general path;
-`SS_KERNEL=plain` compiler's event kernel instead of the assembly; `SS_CLICK_KERNEL=lean|general`;
-`SS_BATCH=0` persons one at a time; `SS_STREAM=0` output written at the end; `SS_RELEASE=0` mappings
-left to the exit; `SS_EXIT=drop` ordinary return; `SS_INDEX_SHIFT`; `SS_VERIFY=1` fast parsers checked
-against the slow one row by row; `SS_TIMING=1` stage times (never in ranked samples).
-
-## Measured critical path
-
-Candidate E + fast exit, run 44953815755, EPYC 9V45, 4 logical CPUs = 2 cores x 2 threads, seed 2, one
-instrumented run: container 618.8 ms (no-op container 60); process 524.7 = startup 2.1, link parse
-14.5, parse stage 319.3 (workers 299.4, click index 19.6), odd events 2.4, index pass 173.0, general
-remainder 3.8, output about 13; then 17 to 34 ms between the last stage and the container's end beyond
-a no-op (mapping teardown at exit). Summed worker time, for scale only: event parse 1,034, click parse
-161 CPU-ms. The same tree on an EPYC 7763: parse 411, index pass 229; on Intel runners (Xeon 6975P-C,
-8370C) the parse stage is 510 to 550 ms.
-Measured on that runner: two threads on two cores take 27% longer than four threads (second hardware
-thread per core). Unknown: the scorer's container lifecycle time, its exact CPU, how its runs vary, and
-the relation between CI times and official scores (five official points; see the calibration table in
-the ledger, which is data and not a model).
-
-## Steps confirmed alone since candidate E (all in candidate F)
-
-| Step | Commit | Paired result against E (or its parent) |
-|---|---|---|
-| Event kernel in assembly | `5db6322` | +69 to +82 ms (Xeon 6975P-C), +24 to +31 ms (EPYC 9V45), 36/36 pairs |
-| Sessions while slots are read; batches; slot tags | `9a2b760`, `2d58de3`, `cfc7799` | step 1 +13 to +19; step 3 +7 to +29 over step 2; batch 20 to 23 ms with tags |
-| Output during the index pass | `bec7dfd` | 12 to 17 ms (Xeon 8370C, same-image variant) |
-| Mappings let go before exit | `9a9c467` | about 5 to 10 ms (39/54 pairs over nine seeds) |
-| Table-driven click kernel | `ff5feff` | about 5 ms |
-| Links: packed summaries | `f080503` | about 3 to 5 ms |
-| Fast exit | `b890895` | about 4 ms |
-
-## Open experiments (ranked by what they could remove)
-
-| # | Change | Could remove at most | State |
-|---|---|---:|---|
-| 1 | More of the event row in assembly: loop + store (`dafe006`), eleven instructions fewer (`94f1cbb`), constants in registers | proportional to instructions; the Intel runner pays more per instruction | in CI / agent `exp-parse` |
-| 2 | Branch padding for the Skylake-family erratum (build flag `-x86-branches-within-32B-boundaries`) | unknown; cannot show on CI runners (none is affected); only an official score can tell | lead, next |
-| 3 | `place` variants (`SS_PLACE=1/2/3`), batch size, per-partition assists table (`SS_ASSISTS=1`) | place is about 35 ms elapsed, assists unknown | in CI / agent `exp-sessions` |
-| 4 | Stage before the event parse: link rows through a vector kernel | 11 to 16 ms elapsed today | click + links agents |
-| 5 | Whale tail of the index pass (chains start early; extras kept in time order) | 12 ms on one or two threads | lead (dispatch) + sessions agent (extras) |
-
-Rejected, with evidence in the ledger: forward-only index mode; partition-owned winners by direct
-atomic scatter (1.5-2.2x slower than lists); one stream per owner with prefetched plain stores (2-3x
-slower); two-level partitioning (slower at 20M, equal at 60M); write-combining/non-temporal list
-writes (no gain); 2^13 and 2^15 partitions (CPU-dependent, no robust gain); decode-after-dedup (at most
-2-4% of parse, before reread costs); link builder as an 8-thread bottleneck (official score
-unchanged); parser "two halves out of step" (CI regression); probing the forest instead of a lookup
-table (slower dedup); rows-in-file order (there is none); click lists of 4,096 or 16,384 users (no gain
-/ 7 to 11 ms slower); one-window click timestamp (no difference).
-
-Not allowed and not used: reconstructing rows from generator state, hard-coded seeds or answers.
+Switches (each keeps the previous behaviour for same-image comparisons): `SS_STRUCT=0`, `SS_KERNEL=plain`,
+`SS_CLICK_KERNEL=lean|general`, `SS_BATCH=0|n`, `SS_PLACE=0..3`, `SS_ASSISTS=0|1|2`, `SS_WIDE=1`,
+`SS_STREAM=0`, `SS_RELEASE=0`, `SS_EXIT=drop`, `SS_INDEX_SHIFT`, `SS_VERIFY=1`, `SS_TIMING=1`,
+`SS_DIAG=1|7|8` (diagnostics, stop after the parse).
 
 ## Working rules that cost time when forgotten
 
 - Windows laptop: no Docker/WSL; containers are timed only in GitHub Actions (push to any branch runs
-  `ci.yml`; `[60m]` and `[variant=NAME=VALUE]` in the head commit message; `workflow_dispatch` with
-  `-f seeds=... -f variant_env=...`). Laptop times do not rank candidates; they have misranked twice.
+  `ci.yml`; `[60m]`, `[variant=NAME=VALUE]`, `[diag=...]` in the head commit message; `workflow_dispatch`
+  with `-f seeds=... -f variant_env=... -f diag_envs=...`). Laptop times do not rank candidates.
 - In the CI report's same-image variant block A is the default and B the variant: a negative
   "A minus B" means the default is faster.
-- One step per branch: an agent's verified commit is pushed to `exp-ci-<name>` and paired against
-  candidate E; `scratchpad/lead/pair_with.sh` pairs a commit against any other commit directly.
-- Agents work in `C:\Users\zuyua\dev\ss_work\wt\<name>` on `exp-<name>` branches; no `git stash`
-  (shared across worktrees); timed runs through `ss_work/tools/timed.sh`, builds and correctness runs
-  outside it.
-- Verification before a candidate: `cargo test --release`; 36 fixtures and 43 extra fixtures through
-  `scripts/run_fixtures.py`; dev against `dev-answer`; 20M seeds 2 and 3 against `ss_work/out/s?_ref`;
-  small generated sets and the mutated sets under `ss_work/data/small` against `reference.exe`.
+- One step per branch: `scratchpad/lead/pair_with.sh COMMIT PRIOR BRANCH` pairs any commit against any
+  other directly. Combined candidates are benchmarked as a whole; separate gains are never added up.
+- Agents work in `C:\Users\zuyua\dev\ss_work\wt\<name>`; no `git stash`; timed runs through
+  `ss_work/tools/timed.sh`, builds and correctness runs outside it; never edit timed.sh while waiters exist.
+- Verification before a candidate: `cargo test --release`; 36 + 43 fixtures; dev against `dev-answer`;
+  20M seeds 2 and 3 against `ss_work/out/s?_ref`; small and mutated sets against `reference.exe`;
+  in CI: three seeds paired, fresh seeds, 60M.
