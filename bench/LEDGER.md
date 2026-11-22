@@ -1001,3 +1001,35 @@ base was `b890895` and the comparison was against candidate E.
   about 5% of container time, about 7 ns per (person, campaign, day) entry over 11.5M entries; credited
   cells cheap; reach, credit and setup about 70 CPU-ms (cross-runner subtraction, approximate).
 - **E3, allocator with 2 MiB-aligned own mappings** (`ea7d6ac`, branch `exp-ci-align`, with 60M): in CI.
+
+### 02:00-03:40 UTC: the republished generator, and the opaque-ID engine
+
+- **Republish, MEASURED (about 01:30 UTC):** the track page's `rules.md`, generator and dev answer
+  changed (generator.zip sha256 `78f973f7...`, dev-answer.zip `c2439e0e...`; `bench/fetch_tools.sh`
+  pins both). New rules text: "pipelines must treat IDs as opaque variable-width strings rather than
+  fixed-width or invertible generator numbers". One in eight distinct user, event and click IDs is now
+  a prefix and 32 lowercase hexadecimal digits (33 bytes); every ID passes a per-seed keyed bijection.
+  23.1% of event rows of new 20M seed 2 carry a long ID.
+- **Index mode is outside the new rules** (it recovers the generator's keys and reads IDs as numbers)
+  and the new data defeats it anyway: F4 `bad5c1b` on new 20M stays exact but takes 4.7-5.2 s in CI
+  (run 44972016492: keys not found, every long ID through one lock). Index mode is now off unless
+  `SS_STRUCT=1`; the general path, which codes IDs by their text only, is the engine.
+- **Steps on the new data** (each paired directly against its parent; A = parent, B = step):
+
+  | step | what | run | paired ms saved (seeds 2/3/5) | runner |
+  |---|---|---|---|---|
+  | `9735a63` | general path default; long hex IDs interned by value in 256 locked shards | 44973966804 | +3,100 / +3,010 / +3,153 vs F4 (18/18); 60M 6,350 vs 16,833 ms, MATCH, peak 3.41 GiB | EPYC 7763 |
+  | `4cea00c` | event kernel takes rows up to 127 bytes | 44974331774 | +385 / +392 / +385 (18/18) | EPYC 7763 |
+  | `727afb7` | long event IDs never interned: deduplicated by value in their partition | 44975293020 | **-526 / -500 / -507 (0/18)**: parse -210 ms, dedup +750 ms | EPYC 9V45 |
+  | `da20171` | click kernel takes rows up to 127 bytes | 44975511792 | +36 / +63 / +46 (17/18) | EPYC 9V74 |
+  | `a2cf9f0` | long click IDs kept per parse worker (no table, no lock) | in CI | | |
+  | `e2aed79` | fix of `727afb7`: table slot from a second multiply (was the partition's own bits: quadratic probing) | in CI against `4cea00c` | | |
+  | `6d9ec1f` | user IDs looked up without a lock (2^20-slot table, write-once slots); hex digits as one vector | in CI | | |
+
+- **Where long IDs cost, MEASURED on the laptop** (one thread, parse only, new 2M set against the old
+  generator's 2M set of the same seed): event parse 134 vs 92 ms, click parse 30 vs 14 ms. Faking codes
+  (wrong output, timing only): the user interner was 12 ms of 141 (8.5%) of event parse, the click-ID
+  interner 10 of 33 ms of click parse. Four threads on new 20M: the user lock cost grows with threads
+  (event parse CPU -20% with the lock-free table).
+- Lesson recorded: `727afb7` passed every correctness check and lost 500 ms; a step is judged by its
+  paired CI run, never by its local parse timing alone.
