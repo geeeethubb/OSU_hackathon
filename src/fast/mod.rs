@@ -527,9 +527,23 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let ctx = ctx;
     timing.stage("links_parse");
 
+    // Index mode builds the click index while the event rows are still being
+    // parsed: click rows go first, and once every worker has moved on to
+    // event rows the click lists are complete and their grouping is handed
+    // out in small steps between event chunks. The grouping waits on memory
+    // more than it computes, the event kernel the other way round, so on a
+    // core whose two hardware threads both parse it takes issue slots the
+    // parser leaves idle instead of a phase of its own after the parse.
+    // `SS_CLICK_EARLY=0`: events first, the click index in its own phase.
+    let click_early = ctx.keys.is_some() && !std::env::var_os("SS_CLICK_EARLY").is_some_and(|value| value == "0");
     let mut tasks = Vec::new();
-    chunk_tasks(Kind::Events, &event_files, EVENT_CHUNK, &mut tasks);
-    chunk_tasks(Kind::Clicks, &click_files, EVENT_CHUNK, &mut tasks);
+    if click_early {
+        chunk_tasks(Kind::Clicks, &click_files, EVENT_CHUNK, &mut tasks);
+        chunk_tasks(Kind::Events, &event_files, EVENT_CHUNK, &mut tasks);
+    } else {
+        chunk_tasks(Kind::Events, &event_files, EVENT_CHUNK, &mut tasks);
+        chunk_tasks(Kind::Clicks, &click_files, EVENT_CHUNK, &mut tasks);
+    }
     if std::env::var_os("SS_PRETOUCH").is_some_and(|value| value == "1") {
         // Diagnostic only: fault every input page in first, so the parse stage
         // that follows shows parsing without first-touch costs.
@@ -562,6 +576,54 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
+    // The early click index: each worker's finished click lists, the clicks
+    // per user range summed over workers, the builder once the last worker
+    // has finished its lists, and the next range to fill.
+    let click_ranges = if click_early { ctx.keys.as_ref().map_or(0, parse::click_parts) } else { 0 };
+    let sealed_lists: Vec<std::sync::OnceLock<Vec<PartList>>> = (0..threads).map(|_| std::sync::OnceLock::new()).collect();
+    let sealed_count = AtomicUsize::new(0);
+    let early_counts: Vec<AtomicU32> = (0..click_ranges).map(|_| AtomicU32::new(0)).collect();
+    let early_build: std::sync::OnceLock<(indexed::ClickIndexBuilder, indexed::ClickTarget)> = std::sync::OnceLock::new();
+    let next_fill = AtomicUsize::new(0);
+    let fill_nanos = AtomicU64::new(0);
+    // A worker that has no click row left to parse: its lists are final.
+    let seal = |out: &mut ParseOut, thread: usize| {
+        let lists: Vec<PartList> = out.user_clicks.iter_mut().map(|writer| writer.finish()).collect();
+        for (range, list) in lists.iter().enumerate() {
+            let words = list.words();
+            if words != 0 {
+                early_counts[range].fetch_add((words / 2) as u32, Ordering::Relaxed);
+            }
+        }
+        let _ = sealed_lists[thread].set(lists);
+        if sealed_count.fetch_add(1, Ordering::AcqRel) + 1 == threads {
+            // The last worker to finish its lists: every click is in a list.
+            let counts: Vec<u32> = early_counts.iter().map(|count| count.load(Ordering::Relaxed)).collect();
+            let _ = early_build.set(indexed::ClickIndexBuilder::new(&counts));
+        }
+    };
+    // One step of the grouping, if the builder is there and a range is left.
+    const FILL_STEP: usize = 4;
+    let fill_step = |lists: &mut Vec<PartList>| -> bool {
+        let Some((builder, target)) = early_build.get() else {
+            return false;
+        };
+        let from = next_fill.fetch_add(FILL_STEP, Ordering::Relaxed);
+        let ranges = builder.ranges();
+        if from >= ranges {
+            return false;
+        }
+        let started = measure.then(Instant::now);
+        for range in from..(from + FILL_STEP).min(ranges) {
+            lists.clear();
+            lists.extend(sealed_lists.iter().map(|per_thread| per_thread.get().expect("every worker sealed")[range]));
+            builder.fill(range, lists, *target);
+        }
+        if let Some(started) = started {
+            fill_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        true
+    };
     let (link_table, click_index) = std::thread::scope(|scope| {
         // The links are resolved beside the parse, on one thread. In index
         // mode almost every link joins two IDs of one user, and those are
@@ -580,7 +642,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
             let out = unsafe { parse_out.get(thread) };
             let (mut events_spent, mut clicks_spent) = (0u64, 0u64);
+            let mut sealed = !click_early;
+            let mut fill_lists: Vec<PartList> = Vec::with_capacity(threads);
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                if task.kind == Kind::Events && !sealed {
+                    // Click rows come first: this worker has none left.
+                    seal(out, thread);
+                    sealed = true;
+                }
                 let started = measure.then(Instant::now);
                 if task.kind == Kind::Events {
                     parse::parse_events_chunk(&ctx, event_files[task.file].bytes(), task.start, task.end, out);
@@ -595,9 +664,27 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                         clicks_spent += spent;
                     }
                 }
+                if click_early && task.kind == Kind::Events {
+                    fill_step(&mut fill_lists);
+                }
             }
             event_nanos.fetch_add(events_spent, Ordering::Relaxed);
             click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
+            if click_early {
+                if !sealed {
+                    seal(out, thread);
+                }
+                // The parse is over for this worker: help finish the grouping.
+                // The builder appears as soon as the last worker has sealed,
+                // which every worker does at the latest when its last chunk ends.
+                while early_build.get().is_none() {
+                    std::hint::spin_loop();
+                    if sealed_count.load(Ordering::Acquire) < threads {
+                        std::thread::yield_now();
+                    }
+                }
+                while fill_step(&mut fill_lists) {}
+            }
         });
         timing.detail("parse_workers_done", timing.since_last());
         // Every row is in the workers' lists now and nothing reads the input
@@ -619,7 +706,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         // Index mode: the clicks of generated user IDs, grouped by user
         // index. Nothing in it needs the links, so it is built here, while
         // the link builder may still be running.
-        let click_index = ctx.keys.as_ref().map(|_| {
+        if click_early {
+            timing.detail("cpu_click_fill", fill_nanos.load(Ordering::Relaxed) as f64 / 1e6);
+        }
+        let click_index = if click_early { None } else { ctx.keys.as_ref().map(|_| {
             let started = Instant::now();
             // Per worker, the clicks by user range.
             let user_click_lists: Vec<Vec<PartList>> = (0..threads)
@@ -660,9 +750,15 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 }
             });
             (builder.finish(), started.elapsed())
-        });
+        }) };
         (builder.join().unwrap(), click_index)
     });
+    // The early click index, built during the parse.
+    let click_index = if click_early {
+        early_build.into_inner().map(|(builder, _)| (builder.finish(), std::time::Duration::ZERO))
+    } else {
+        click_index
+    };
     let link_table: &links::LinkTable = &link_table;
     if let Some((_, spent)) = &click_index {
         timing.detail("click_index", spent.as_secs_f64() * 1e3);
