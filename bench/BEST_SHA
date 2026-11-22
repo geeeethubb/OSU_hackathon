@@ -1,4 +1,4 @@
 # The best commit so far: bench-20m builds its image and times HEAD against it,
 # six shuffled AB/BA pairs per seed on the same runner and input.
 # Move this to a commit only after its paired saving is confirmed (see LEDGER.md).
-bad5c1b1bc3178508db7de5d7459197741497236
+1ffd2782cee7b79a088f996c1acbfcef390ada2e
