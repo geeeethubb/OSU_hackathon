@@ -3654,6 +3654,123 @@ unsafe fn small_number(p: *const u8, digits: usize) -> Option<usize> {
     Some((fours.wrapping_mul(10_000) + (fours >> 32)) as u32 as usize)
 }
 
+/// Whether link rows longer than `link_row_fast` takes go through
+/// `link_lean_long` first: yes unless `SS_LINK_LONG=0` (for A/B runs).
+pub fn link_long_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SS_LINK_LONG").as_deref() != Ok("0"))
+}
+
+/// The link rows `link_row_fast` leaves to the general parser because they
+/// are 32 bytes or longer: in current generated data the rows with a long
+/// ID (one byte and 32 lowercase hexadecimal digits), a quarter of them.
+/// `link_row_fast`'s reading of the row with masks of 128 bytes; each ID is
+/// a short one of the kind `link_row_fast` codes from its text, or a long
+/// one coded as `Interner::code` codes it (both user-table slots asked for
+/// before either is looked up). Any other row (no newline within 128
+/// bytes, a malformed or dropped one, an ID of another kind) it declines
+/// (`ROW_DECLINE`) before coding anything, and the general parser reads it.
+///
+/// # Safety
+/// `ROW_PAD` bytes after `p` are readable.
+#[inline(never)]
+pub unsafe fn link_lean_long(ctx: &Ctx, p: *const u8, pair: &mut (u64, u64)) -> (usize, u32) {
+    const DECLINE: (usize, u32) = (0, ROW_DECLINE);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let blocks = [
+        _mm256_loadu_si256(p as *const __m256i),
+        _mm256_loadu_si256(p.add(32) as *const __m256i),
+        _mm256_loadu_si256(p.add(64) as *const __m256i),
+        _mm256_loadu_si256(p.add(96) as *const __m256i),
+    ];
+    let wide = |byte: __m256i| -> u128 {
+        let low = mask(blocks[0], byte) | (mask(blocks[1], byte) << 32);
+        let high = mask(blocks[2], byte) | (mask(blocks[3], byte) << 32);
+        (u128::from(high) << 64) | u128::from(low)
+    };
+    let newlines = wide(newline);
+    if newlines == 0 {
+        return DECLINE;
+    }
+    let length = newlines.trailing_zeros() as usize;
+    let below = (1u128 << length) - 1;
+    let commas = wide(comma) & below;
+    let quotes = wide(quote) & below;
+    if commas.count_ones() != 1 || commas & 1 != 0 {
+        return DECLINE;
+    }
+    // `link_row_fast`'s quote rule, in two words.
+    let separators = commas | (1u128 << length);
+    let starts = (separators << 1) | 1;
+    let ends = separators >> 1;
+    let pext128 = |bits: u128, select: u128| -> u64 {
+        let (low, high) = (bits as u64, (bits >> 64) as u64);
+        let (select_low, select_high) = (select as u64, (select >> 64) as u64);
+        _pext_u64(low, select_low) | (_pext_u64(high, select_high) << select_low.count_ones())
+    };
+    let opened = pext128(quotes, starts);
+    if ((quotes & !(starts | ends)) | (quotes & starts & ends)) != 0 || opened != pext128(quotes, ends) {
+        return DECLINE;
+    }
+    let c0 = commas.trailing_zeros() as usize;
+    let q0 = (opened & 1) as usize;
+    let q1 = ((opened >> 1) & 1) as usize;
+    let (s0, e0) = (q0, c0 - q0);
+    let (s1, e1) = (c0 + 1 + q1, length - q1);
+    if e0 == s0 || e1 == s1 {
+        return DECLINE;
+    }
+    // Both IDs, with no side effect yet.
+    let a_chars = e0 - s0 - 1;
+    let b_chars = e1 - s1 - 1;
+    let a_text = _bzhi_u64(read_u64(p.add(s0 + 1)), (a_chars as u32).wrapping_mul(8));
+    let b_text = _bzhi_u64(read_u64(p.add(s1 + 1)), (b_chars as u32).wrapping_mul(8));
+    let (a_fast_code, b_fast_code, known) = two_codes(a_text, b_text);
+    let a_value = if e0 - s0 == 33 {
+        match hex_value32(p.add(s0 + 1)) {
+            Some(value) => Some(value),
+            None => return DECLINE,
+        }
+    } else {
+        let a_need = (1u32 << (a_chars & 15)) - 1;
+        if !((a_chars.wrapping_sub(1) < 8) & (*p.add(s0) == b'u') & (known & a_need == a_need)) {
+            return DECLINE;
+        }
+        None
+    };
+    let b_value = if e1 - s1 == 33 {
+        match hex_value32(p.add(s1 + 1)) {
+            Some(value) => Some(value),
+            None => return DECLINE,
+        }
+    } else {
+        let b_need = (1u32 << (b_chars & 15)) - 1;
+        if !((b_chars.wrapping_sub(1) < 8) & (*p.add(s1) == b'u') & ((known >> 8) & b_need == b_need)) {
+            return DECLINE;
+        }
+        None
+    };
+    // The row is taken: both slots asked for, then both looked up.
+    if let Some(value) = a_value {
+        ctx.user_ids.prefetch_hex(*p.add(s0), value);
+    }
+    if let Some(value) = b_value {
+        ctx.user_ids.prefetch_hex(*p.add(s1), value);
+    }
+    let a = match a_value {
+        Some(value) => ctx.user_ids.hex_code(*p.add(s0), value),
+        None => a_fast_code,
+    };
+    let b = match b_value {
+        Some(value) => ctx.user_ids.hex_code(*p.add(s1), value),
+        None => b_fast_code,
+    };
+    *pair = (a, b);
+    (length, ROW_EMIT)
+}
+
 /// Parses the link row starting at `p` (with `ROW_PAD` readable bytes after
 /// it). Only rows shorter than 32 bytes take the fast path.
 #[inline(always)]

@@ -1330,6 +1330,27 @@ pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out
                 position += length + 1;
                 continue;
             }
+            if status == ROW_LONG && super::simd::link_long_path() {
+                // SAFETY: at least ROW_PAD readable bytes follow `position`.
+                let (length, status) =
+                    unsafe { super::simd::link_lean_long(ctx, buffer.as_ptr().add(position), &mut pair) };
+                if status == ROW_EMIT {
+                    if verify {
+                        let line = &buffer[position..position + length];
+                        let slow = link_row_slow(ctx, line);
+                        assert!(
+                            slow == Some(pair),
+                            "long link row mismatch on {:?}: fast {:?}, slow {:?}",
+                            String::from_utf8_lossy(line),
+                            pair,
+                            slow
+                        );
+                    }
+                    out.links.push(pair);
+                    position += length + 1;
+                    continue;
+                }
+            }
             if status == ROW_LONG {
                 let line_end = find_newline(&buffer[position..]).map_or(buffer.len(), |offset| position + offset);
                 if let Some(pair) = link_row_slow(ctx, &buffer[position..line_end]) {
