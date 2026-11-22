@@ -721,6 +721,14 @@ pub fn input_lead() -> usize {
     })
 }
 
+/// Whether the user-table lookups of long user IDs trail the parse in a
+/// ring (`parse::defer_row`): yes unless `SS_DEFER=0` (for A/B runs on one
+/// binary).
+pub fn defer_lookups() -> bool {
+    static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEFER.get_or_init(|| std::env::var("SS_DEFER").as_deref() != Ok("0"))
+}
+
 /// Asks for the input `lead` bytes after `p`: two cache lines, as much as a
 /// row of up to 128 bytes spans. On Intel the hardware streamer stops at
 /// every 4 KB page of the input; this keeps the next page coming.
@@ -1644,6 +1652,30 @@ pub unsafe fn event_lean_long<const MODE: u32>(
         match parse_price(price) {
             Some(price) => purchase = Some((price, product_category(ctx, p.add(c4 + 1 + q5), product_length))),
             None => valid = false,
+        }
+    }
+    // A valid row of a long user ID waits in the worker's ring for the slot
+    // asked for above, and is stored when it leaves it.
+    if MODE == MODE_STORE && valid && defer_lookups() {
+        if let Some(value) = user_value {
+            let (bought, purchase) = match purchase {
+                Some((price, category)) => (u64::from(price) | (u64::from(category) << 32), true),
+                None => (0, false),
+            };
+            let deferred = super::parse::Deferred {
+                user_value: value,
+                event_value: event_value.unwrap_or(0),
+                event_short,
+                ts,
+                ingest: ingest_seconds as u64,
+                bought,
+                user_first: *user_at,
+                event_first: *event_at,
+                long_event: event_value.is_some(),
+                purchase,
+            };
+            super::parse::defer_row(ctx, out, deferred);
+            return (length, ROW_DONE);
         }
     }
     // An invalid row keeps neither its time nor its user, as in

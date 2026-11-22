@@ -81,6 +81,77 @@ pub struct ParseOut {
     pub links: Vec<(u64, u64)>,
     /// The long click IDs this worker kept (`Interner::per_thread`).
     pub click_ids: Vec<(u8, u128)>,
+    /// Valid rows with a long user ID whose user code waits for its
+    /// user-table slot (`defer_row`); `deferred_count` of them, the oldest at
+    /// `deferred_head` once the ring is full. Empty at the end of every chunk.
+    pub deferred: [Deferred; DEFER],
+    pub deferred_head: usize,
+    pub deferred_count: usize,
+}
+
+/// Rows a worker's lookups of long user IDs trail its parse by.
+pub const DEFER: usize = 8;
+
+/// A valid event row whose user ID is long and hexadecimal, read but not yet
+/// stored: its user's code is looked up when it leaves the ring, after the
+/// next `DEFER` such rows, by when the slot asked for has arrived.
+#[derive(Clone, Copy, Default)]
+pub struct Deferred {
+    pub user_value: u128,
+    /// The event ID's value if it is long too (`long_event`), else 0.
+    pub event_value: u128,
+    /// The event ID's code if it is short.
+    pub event_short: u64,
+    pub ts: u64,
+    pub ingest: u64,
+    /// Price (low) and category (high) of a purchase (`purchase`).
+    pub bought: u64,
+    pub user_first: u8,
+    pub event_first: u8,
+    pub long_event: bool,
+    pub purchase: bool,
+}
+
+/// Puts a row into the worker's ring; the oldest row, once the ring is full,
+/// gets its user's code and is stored. Rows are compared by their content
+/// only (dedup keeps the smallest ingest_ts, whose equal copies are
+/// identical), so their order within a worker's lists does not matter.
+#[inline(always)]
+pub fn defer_row(ctx: &Ctx, out: &mut ParseOut, row: Deferred) {
+    let at = out.deferred_head;
+    if out.deferred_count == DEFER {
+        let oldest = out.deferred[at];
+        store_deferred(ctx, out, &oldest);
+    } else {
+        out.deferred_count += 1;
+    }
+    out.deferred[at] = row;
+    out.deferred_head = (at + 1) % DEFER;
+}
+
+/// Stores a deferred row as `event_lean_long` would have: its user's code
+/// now, then the record of a short or of a long event ID.
+#[inline(always)]
+fn store_deferred(ctx: &Ctx, out: &mut ParseOut, row: &Deferred) {
+    let user = ctx.user_ids.hex_code(row.user_first, row.user_value);
+    let purchase = row.purchase.then_some((row.bought as u32, (row.bought >> 32) as u32));
+    if row.long_event {
+        emit_long_value(out, row.event_first, row.event_value, row.ts, 1, user, row.ingest, purchase);
+    } else {
+        emit_raw(out, row.event_short, row.ts, 1, user, row.ingest, purchase);
+    }
+}
+
+/// Stores every row still in the worker's ring, oldest first.
+pub fn flush_deferred(ctx: &Ctx, out: &mut ParseOut) {
+    let count = out.deferred_count;
+    let first = (out.deferred_head + DEFER - count) % DEFER;
+    for offset in 0..count {
+        let row = out.deferred[(first + offset) % DEFER];
+        store_deferred(ctx, out, &row);
+    }
+    out.deferred_count = 0;
+    out.deferred_head = 0;
 }
 
 /// Words per block of a worker's click list, and words per click in it.
@@ -102,6 +173,9 @@ impl ParseOut {
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
             click_ids: Vec::new(),
+            deferred: [Deferred::default(); DEFER],
+            deferred_head: 0,
+            deferred_count: 0,
         }
     }
 }
@@ -1027,6 +1101,7 @@ pub fn parse_events_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, ou
             }
         }
     });
+    flush_deferred(ctx, out);
 }
 
 /// The fast loop over click rows, specialized for what happens to a parsed
