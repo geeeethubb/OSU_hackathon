@@ -206,7 +206,13 @@ impl Ctx {
             organic: 0,
             event_ids: Interner::partition_local(),
             user_ids: Interner::default(),
-            click_ids: Interner::default(),
+            // SS_VERIFY=1 compares the codes two parsers give one row: there
+            // one ID must have one code.
+            click_ids: if std::env::var_os("SS_VERIFY").is_some_and(|value| value == "1") {
+                Interner::default()
+            } else {
+                Interner::per_thread()
+            },
             #[cfg(target_arch = "x86_64")]
             ts_tables: simd::TsTables::new(window_start, window_start.div_euclid(1_000) - 4 * 86_400),
             event_part_bits: MIN_PART_BITS,
@@ -583,6 +589,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
             let out = unsafe { parse_out.get(thread) };
             let (mut events_spent, mut clicks_spent) = (0u64, 0u64);
+            codes::begin_thread_ids(thread);
             while let Some(task) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
                 let started = measure.then(Instant::now);
                 if task.kind == Kind::Events {
@@ -599,6 +606,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                     }
                 }
             }
+            out.click_ids = codes::take_thread_ids();
             event_nanos.fetch_add(events_spent, Ordering::Relaxed);
             click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
         });
@@ -685,6 +693,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
 
     // Pass B.
     let mut parse_out = parse_out.into_inner();
+    // The long click IDs the workers kept, by worker slot (= thread).
+    let kept_click_ids: Vec<Vec<(u8, u128)>> =
+        parse_out.iter_mut().map(|out| std::mem::take(&mut out.click_ids)).collect();
     let event_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     // Events whose ID is long and hexadecimal, by the same partitions.
@@ -759,7 +770,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     };
     timing.stage("dedup");
 
-    let click_exotic = ctx.click_ids.snapshot();
+    let click_exotic = ctx.click_ids.snapshot().with_threads(kept_click_ids);
     let user_exotic = ctx.user_ids.snapshot_with(true);
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
     // Each thread's user_daily file, written while the rows are produced.

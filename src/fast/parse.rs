@@ -79,6 +79,8 @@ pub struct ParseOut {
     /// `Keys::index_shift`, for `emit_indexed`.
     pub index_shift: u32,
     pub links: Vec<(u64, u64)>,
+    /// The long click IDs this worker kept (`Interner::per_thread`).
+    pub click_ids: Vec<(u8, u128)>,
 }
 
 /// Words per block of a worker's click list, and words per click in it.
@@ -99,6 +101,7 @@ impl ParseOut {
             keys: ctx.keys,
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
+            click_ids: Vec::new(),
         }
     }
 }

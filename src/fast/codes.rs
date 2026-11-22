@@ -163,6 +163,57 @@ pub fn take_long_value() -> (u8, u128) {
     LONG_VALUE.with(std::cell::Cell::get)
 }
 
+/// Exotic indexes from `THREAD_INDEX_SHIFT` up are those of the IDs a parse
+/// worker kept for itself (`Interner::per_thread`): worker slot plus one in
+/// the bits above the shift, the position in that worker's list below.
+const THREAD_INDEX_SHIFT: u32 = 32;
+/// Worker slots that fit: (slot + 1) << 32 stays inside the exotic part of
+/// the 42-bit code space.
+const THREAD_SLOTS: u32 = 127;
+
+thread_local! {
+    /// This thread's worker slot (`u32::MAX`: none) and the hexadecimal IDs
+    /// it kept, in the order their codes number them.
+    static THREAD_IDS: std::cell::RefCell<(u32, Vec<(u8, u128)>)> =
+        const { std::cell::RefCell::new((u32::MAX, Vec::new())) };
+}
+
+/// Makes this thread worker `slot` for the IDs an `Interner::per_thread`
+/// codes, with an empty list. A slot that does not fit leaves the thread
+/// with none: its IDs then take the shared map.
+pub fn begin_thread_ids(slot: usize) {
+    THREAD_IDS.with(|cell| {
+        let mut ids = cell.borrow_mut();
+        ids.0 = if slot < THREAD_SLOTS as usize { slot as u32 } else { u32::MAX };
+        ids.1.clear();
+    });
+}
+
+/// The IDs this thread kept since `begin_thread_ids`, by position; the
+/// thread has no slot afterwards.
+pub fn take_thread_ids() -> Vec<(u8, u128)> {
+    THREAD_IDS.with(|cell| {
+        let mut ids = cell.borrow_mut();
+        ids.0 = u32::MAX;
+        std::mem::take(&mut ids.1)
+    })
+}
+
+/// The code of a hexadecimal ID this thread keeps for itself, or `None`
+/// when the thread is no worker (or its list is full).
+#[inline]
+fn thread_code(first: u8, value: u128) -> Option<u64> {
+    THREAD_IDS.with(|cell| {
+        let mut ids = cell.borrow_mut();
+        let position = ids.1.len() as u64;
+        if ids.0 == u32::MAX || position >> THREAD_INDEX_SHIFT != 0 {
+            return None;
+        }
+        ids.1.push((first, value));
+        Some(EXOTIC_BASE + ((u64::from(ids.0) + 1) << THREAD_INDEX_SHIFT) + position)
+    })
+}
+
 /// Exotic IDs of one kind (events, users or clicks).
 pub struct Interner {
     /// The next exotic index, for both maps.
@@ -173,6 +224,12 @@ pub struct Interner {
     /// their value picks, so long hexadecimal ones are not interned here at
     /// all (`LONG_EVENT`): the dedup step compares their values.
     partition_local: bool,
+    /// Click IDs: only their byte-wise order matters (two clicks of one
+    /// person in one millisecond), never whether two are equal (copies of a
+    /// click are identical, so either may stand for it). A parse worker
+    /// appends each long hexadecimal one to its own list and codes it by
+    /// its position there: no lookup, no lock. Copies get different codes.
+    per_thread: bool,
 }
 
 impl Default for Interner {
@@ -182,6 +239,7 @@ impl Default for Interner {
             generic: Mutex::new(HashMap::new()),
             hex: (0..HEX_SHARDS).map(|_| Mutex::new(HexShard::default())).collect(),
             partition_local: false,
+            per_thread: false,
         }
     }
 }
@@ -192,6 +250,13 @@ impl Interner {
         Interner { partition_local: true, ..Interner::default() }
     }
 
+    /// An interner whose long hexadecimal IDs a parse worker keeps for
+    /// itself (click IDs); a snapshot needs the workers' lists
+    /// (`Exotic::with_threads`).
+    pub fn per_thread() -> Self {
+        Interner { per_thread: true, ..Interner::default() }
+    }
+
     /// The code of an exotic ID.
     #[inline(never)]
     pub fn code(&self, id: &[u8]) -> u64 {
@@ -200,7 +265,10 @@ impl Interner {
                 LONG_VALUE.with(|cell| cell.set((id[0], value)));
                 LONG_EVENT
             }
-            Some(value) => EXOTIC_BASE + u64::from(self.hex_index(id[0], value)),
+            Some(value) => match self.per_thread.then(|| thread_code(id[0], value)).flatten() {
+                Some(code) => code,
+                None => EXOTIC_BASE + u64::from(self.hex_index(id[0], value)),
+            },
             None => self.generic_code(id),
         }
     }
@@ -257,7 +325,7 @@ impl Interner {
                 };
             }
         }
-        Exotic { entries, arena }
+        Exotic { entries, arena, threads: Vec::new() }
     }
 
     /// The exotic IDs interned so far, by index (hexadecimal ones as values).
@@ -284,6 +352,8 @@ enum Entry {
 pub struct Exotic {
     entries: Vec<Entry>,
     arena: Vec<u8>,
+    /// The IDs parse workers kept for themselves, by worker slot.
+    threads: Vec<Vec<(u8, u128)>>,
 }
 
 impl Exotic {
@@ -298,6 +368,25 @@ impl Exotic {
         exotic
     }
 
+    /// With the IDs the parse workers kept, by worker slot.
+    pub fn with_threads(mut self, threads: Vec<Vec<(u8, u128)>>) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Exotic ID `index`.
+    #[inline]
+    fn entry(&self, index: usize) -> Entry {
+        match index >> THREAD_INDEX_SHIFT {
+            0 => self.entries[index],
+            slot => {
+                let (first, value) = self.threads[slot - 1][index & ((1 << THREAD_INDEX_SHIFT) - 1)];
+                Entry::Hex { first, value }
+            }
+        }
+    }
+
+    /// How many IDs the shared maps hold (those a worker kept not counted).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -308,7 +397,7 @@ impl Exotic {
 
     /// Appends the bytes of exotic ID `index`.
     pub fn append(&self, index: usize, out: &mut Vec<u8>) {
-        match self.entries[index] {
+        match self.entry(index) {
             Entry::Bytes { start, end } => out.extend_from_slice(&self.arena[start as usize..end as usize]),
             Entry::Hex { first, value } => {
                 out.push(first);
@@ -320,7 +409,7 @@ impl Exotic {
     /// The bytes of exotic ID `index`, when the snapshot holds them as bytes
     /// (always, for a snapshot made with `materialize`).
     pub fn text(&self, index: usize) -> &[u8] {
-        match self.entries[index] {
+        match self.entry(index) {
             Entry::Bytes { start, end } => &self.arena[start as usize..end as usize],
             Entry::Hex { .. } => panic!("exotic ID {index} was not materialized"),
         }
@@ -331,7 +420,7 @@ impl Exotic {
     /// the text order is the numeric order).
     #[inline]
     fn hex_order(&self, a: usize, b: usize) -> Option<Ordering> {
-        match (self.entries[a], self.entries[b]) {
+        match (self.entry(a), self.entry(b)) {
             (Entry::Hex { first: fa, value: va }, Entry::Hex { first: fb, value: vb }) if fa == fb => Some(va.cmp(&vb)),
             _ => None,
         }
@@ -476,6 +565,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ids_kept_per_thread_order_like_bytes() {
+        // Two workers keep their own long IDs; an ID coded on a thread with no
+        // slot goes to the shared map. Order must be byte-wise across all.
+        let interner = Interner::per_thread();
+        let ids: Vec<Vec<u8>> = vec![
+            b"ke1f1e03abf0a711a0019d40e7ca04632".to_vec(),
+            b"k00000000000000000000000000000000".to_vec(),
+            b"kffffffffffffffffffffffffffffffff".to_vec(),
+            b"ke1f1e03abf0a711a0019d40e7ca04633".to_vec(),
+            b"kE1F1E03ABF0A711A0019D40E7CA04632".to_vec(),
+            b"k9efba8ez".to_vec(),
+            b"ke1f1e03abf0a711a0019d40e7ca04632".to_vec(),
+        ];
+        let mut codes = Vec::new();
+        begin_thread_ids(0);
+        codes.extend(ids[..3].iter().map(|id| id_code(id, b'k', &interner)));
+        let first = take_thread_ids();
+        begin_thread_ids(1);
+        codes.extend(ids[3..6].iter().map(|id| id_code(id, b'k', &interner)));
+        let second = take_thread_ids();
+        // No slot: the shared map.
+        codes.push(id_code(&ids[6], b'k', &interner));
+        assert_eq!((first.len(), second.len()), (3, 1));
+        assert!(codes[0] != codes[6], "copies kept by a worker get their own code");
+        let exotic = interner.snapshot().with_threads(vec![first, second]);
+        for (a, id_a) in ids.iter().enumerate() {
+            let mut out = Vec::new();
+            id_bytes(codes[a], b'k', &exotic, &mut out);
+            assert_eq!(&out, id_a);
+            for (b, id_b) in ids.iter().enumerate() {
+                assert_eq!(id_cmp(codes[a], codes[b], b'k', &exotic), id_a.cmp(id_b), "{a} {b}");
+            }
+        }
+        // Every code stays inside the 42 bits a click record has for it.
+        assert!(codes.iter().all(|&code| code <= CODE_MASK));
+        begin_thread_ids(THREAD_SLOTS as usize);
+        let code = id_code(&ids[1], b'k', &interner);
+        assert!(take_thread_ids().is_empty(), "a slot that does not fit keeps nothing");
+        assert!(code < EXOTIC_BASE + (1 << THREAD_INDEX_SHIFT));
     }
 
     #[test]
