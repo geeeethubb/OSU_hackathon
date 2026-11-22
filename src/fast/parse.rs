@@ -642,6 +642,15 @@ fn event_row_rare<const MODE: u32>(
             return (*frame).next.offset_from(buffer.as_ptr()) as usize;
         }
     }
+    // A declined row. The compiled lean kernel takes the same rows as the
+    // assembly except where the row's end was not where the assembly looked
+    // first (730 of 319,915 declined rows on 20M seed 2), so it would read
+    // nearly every one of them again only to decline it too: such rows go
+    // straight to the general kernel, which takes every row the lean kernel
+    // takes, with the same values. `SS_RARE=0` or `=a` keeps the old route.
+    if super::simd::rare_rows() & 2 != 0 {
+        return event_row_declined::<MODE, true>(ctx, buffer, position, out);
+    }
     event_row_plain::<MODE, true>(ctx, buffer, position, out, row)
 }
 

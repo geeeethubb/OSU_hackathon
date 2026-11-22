@@ -688,6 +688,8 @@ pub fn event_kernel() -> u32 {
 /// plain `view` or `cart` (`SS_RARE`, for A/B runs on one binary): bit 0,
 /// it finishes purchases. `SS_RARE=0`: nothing, every purchase goes back to
 /// its caller as it did before; `SS_RARE=a`: purchases; unset: everything.
+/// Bit 1: a row the assembly declines goes straight to the general kernel
+/// (`event_row_rare`) instead of through the compiled lean kernel first.
 pub fn rare_rows() -> u64 {
     static RARE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RARE.get_or_init(|| match std::env::var("SS_RARE").as_deref() {
