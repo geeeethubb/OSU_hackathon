@@ -4,7 +4,7 @@
 //! rules.md field by field. The AVX2 fast paths in `simd.rs` must produce the
 //! same rows for the lines they accept.
 
-use super::arena::{Arena, PartWriter};
+use super::arena::{Arena, PartList, PartWriter};
 use super::codes::{id_code, mix};
 use super::keys::{base36_value, Keys};
 use super::{Ctx, EVENT_BLOCK};
@@ -81,6 +81,9 @@ pub struct ParseOut {
     pub links: Vec<(u64, u64)>,
     /// The long click IDs this worker kept (`Interner::per_thread`).
     pub click_ids: Vec<(u8, u128)>,
+    /// The worker's event, long-event and click lists, sealed by the worker
+    /// itself once it has parsed its last chunk (`seal`).
+    pub sealed: Option<Sealed>,
     /// Valid rows with a long user ID whose user code waits for its
     /// user-table slot (`defer_row`); `deferred_count` of them, the oldest at
     /// `deferred_head` once the ring is full. Empty at the end of every chunk.
@@ -207,6 +210,29 @@ pub fn flush_deferred(ctx: &Ctx, out: &mut ParseOut) {
     out.deferred_head = 0;
 }
 
+/// A parse worker's lists of events by event partition, of long events by
+/// the same partitions, and of clicks, sealed.
+pub struct Sealed {
+    pub events: Vec<PartList>,
+    pub long_events: Vec<PartList>,
+    pub clicks: PartList,
+}
+
+impl ParseOut {
+    /// Seals the event, long-event and click lists: on the worker's own
+    /// thread, beside the other workers, rather than all workers' lists one
+    /// after another on one thread once the parse has ended (three per
+    /// partition and worker: some 12,000 at 4 threads, each a block header
+    /// that is no longer in any cache). The writers are not used after it.
+    pub fn seal(&mut self) {
+        self.sealed = Some(Sealed {
+            events: self.events.iter_mut().map(|writer| writer.finish(super::EVENT_BLOCK)).collect(),
+            long_events: self.long_events.iter_mut().map(|writer| writer.finish(super::EVENT_BLOCK)).collect(),
+            clicks: self.clicks.finish(RAW_CLICK_BLOCK),
+        });
+    }
+}
+
 /// Words per block of a worker's click list, and words per click in it.
 pub const RAW_CLICK_BLOCK: usize = 512;
 pub const RAW_CLICK_WORDS: usize = 3;
@@ -226,6 +252,7 @@ impl ParseOut {
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
             click_ids: Vec::new(),
+            sealed: None,
             deferred: [Deferred::default(); DEFER],
             deferred_head: 0,
             deferred_count: 0,
