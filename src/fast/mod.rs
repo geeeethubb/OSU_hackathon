@@ -115,6 +115,23 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The category of a product by its ID text: the table for `p` + a
+    /// canonical number it covers, the map for anything else (see
+    /// `load_tables`); `unknown_category` when the file has no such line.
+    pub fn category_of(&self, product: &[u8]) -> u32 {
+        if let Some(digits) = product.strip_prefix(b"p") {
+            let canonical =
+                (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+            if canonical {
+                let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+                if number < self.category_by_product_number.len() {
+                    return self.category_by_product_number[number];
+                }
+            }
+        }
+        self.product_category.get(product).copied().unwrap_or(self.unknown_category)
+    }
+
     #[cold]
     pub fn request_fallback(&self) {
         self.fallback.store(true, Ordering::Relaxed);
@@ -208,9 +225,18 @@ impl Ctx {
         let products = fs::read(data.join("products.csv"))?;
         let mut category_names: Vec<Box<[u8]>> = Vec::new();
         let mut category_index: FastMap<Box<[u8]>, u32> = HashMap::default();
-        // A product line is at least a dozen bytes: room for all of them at once.
-        let mut product_category: FastMap<Box<[u8]>, u32> =
-            HashMap::with_capacity_and_hasher(products.len() / 12, Default::default());
+        // Products are looked up by number when their ID is `p` + a canonical
+        // number below 2^22 (every ID of generated data), and by text
+        // otherwise. A product goes into the table or into the map, never
+        // both: the readers try the table first and fall back to the map,
+        // so a canonical ID below the bound that is not in the table is not
+        // in the file either. The first line of a repeated product wins in
+        // both. (One map entry per product, 50K heap allocations, took 15 ms
+        // on the critical path of the start.)
+        let mut product_category: FastMap<Box<[u8]>, u32> = HashMap::default();
+        // Category indexes are small; this value marks "no line yet".
+        const NO_LINE: u32 = u32::MAX;
+        let mut category_by_product_number: Vec<u32> = Vec::new();
         for_each_data_line(&products, |line| {
             if let Some([product, category]) = split_fields::<2>(line) {
                 if product.is_empty() {
@@ -226,25 +252,27 @@ impl Ctx {
                         next
                     }
                 };
-                product_category.entry(product.into()).or_insert(at);
+                let digits = product.strip_prefix(b"p").unwrap_or(&[]);
+                let canonical =
+                    (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
+                let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
+                if canonical && number < (1 << 22) {
+                    if category_by_product_number.len() <= number {
+                        category_by_product_number.resize(number + 1, NO_LINE);
+                    }
+                    if category_by_product_number[number] == NO_LINE {
+                        category_by_product_number[number] = at;
+                    }
+                } else {
+                    product_category.entry(product.into()).or_insert(at);
+                }
             }
         });
         let unknown_category = category_names.len() as u32;
         category_names.push((&b"unknown"[..]).into());
-        let mut category_by_product_number: Vec<u32> = Vec::new();
-        for (id, &category) in &product_category {
-            let digits = id.strip_prefix(b"p").unwrap_or(&[]);
-            let canonical = (1..=7).contains(&digits.len()) && digits[0] != b'0' && digits.iter().all(u8::is_ascii_digit);
-            if !canonical {
-                continue;
-            }
-            let number = digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'));
-            // Bigger numbers than this stay in the hash map only.
-            if number < (1 << 22) {
-                if category_by_product_number.len() <= number {
-                    category_by_product_number.resize(number + 1, unknown_category);
-                }
-                category_by_product_number[number] = category;
+        for slot in &mut category_by_product_number {
+            if *slot == NO_LINE {
+                *slot = unknown_category;
             }
         }
 

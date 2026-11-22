@@ -353,7 +353,7 @@ pub fn event_row_slow(ctx: &Ctx, line: &[u8]) -> Option<EventRow> {
         let Some(price) = parse_price(price_cents) else {
             return Some(invalid);
         };
-        Some((price, ctx.product_category.get(product_id).copied().unwrap_or(ctx.unknown_category)))
+        Some((price, ctx.category_of(product_id)))
     } else {
         None
     };
