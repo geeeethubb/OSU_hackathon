@@ -57,6 +57,39 @@ from about 13:00 the effort shifts to validating one reliable final candidate.
 Bounded incremental stream on F, one step at a time: the parser's kernel steps, the sessions agent's
 scan steps, links and click kernels (small), memory reuse of consumed list blocks (small).
 
+## Architecture pass from the rules (lead, 2026-11-22 01:30 UTC; own review passes, not independent agents)
+
+What the outputs require (traced back from rules.md):
+- A person's sessions depend on ALL of that person's surviving events (an intermediate event can merge
+  two sessions), so no session is final before every event file is read: rows are shuffled across files
+  (MEASURED). Barrier 1: all event copies read. Dedup needs every copy's event_id and ingest_ts; the other
+  fields matter only for the winning copy, which is known only after all copies are seen.
+- Persons need all link lines (transitive, name = byte-wise smallest ID incl. link-only IDs). Barrier 2:
+  all links read before persons are final (links are 1% of the input and are read first).
+- Credit and assists need the person's final sessions and all of their valid clicks. Barrier 3: all
+  click files read. Click dedup is unnecessary for exact output (copies are identical: same ts, same
+  click_id, same campaign).
+- user_daily needs per (person, start day): sessions, events, revenue, and per-category revenue sums for
+  top_category (ties byte-wise, `unknown` competes): not mergeable as a single top value.
+- campaign_daily needs per (campaign, day): credited sessions, purchasing sessions, revenue, and distinct
+  assisting campaigns per session aggregated by day: sums, mergeable across persons in any order.
+
+Essential versus implementation choice: scanning every byte (malformed lines) ESSENTIAL; event_id and
+ingest for every copy ESSENTIAL; decoding user/ts/type/product/price for losing copies CHOICE (bounded:
+deferral measured at 2-4% of parse before the random re-read of 1.6 GB: REJECTED); grouping by person
+ESSENTIAL; a global sort CHOICE (the engine places by dense index instead, a checked data property);
+waiting for all rows before sessions ESSENTIAL (barrier 1); click dedup CHOICE (skipped); materializing
+every output row before writing CHOICE (the engine streams).
+
+Designs considered this round, ranked by plausible saving x confidence / effort:
+| ID | Design (family) | Removes / moves | Bound on CI container time | Decision |
+|---|---|---|---|---|
+| E1 | Measure on the scorer's class of CPU (Skylake-family / Ice Lake Xeon): stage profile, padded jumps | nothing; tests whether the scorer's front end penalizes the assembly loop | unknown | DONE: 20 runners drew EPYC 7763/9V74/9V45 and Xeon 6975P-C/8573C only; the scorer's CPU class is not reproducible here. Padded jumps stay untested (needs an authorized official run) |
+| D | Click index built while the event parse still runs (memory-bound grouping beside uop-bound parsing on SMT siblings; B: scheduling) | the 20 ms barrier phase after the parse; its work moves to idle issue slots of busy cores | <= 20 ms | PROTOTYPE 1 |
+| I2 | Attribution by one merge walk per person over time-sorted clicks and sessions (A) | per-click reach searches and range masks (about 56 CPU-ms) and most assist generation (about 52) | about 15-25 ms | PROTOTYPE 2, after D |
+| X | EVEX-256 event kernel with VBMI2 compress, runtime dispatch (parser) | quote handling and part of field finding (about 30 of 216 instructions) | up to about 60 ms on VBMI2 CPUs, 0 on Cascade Lake and Zen 3 | DEFER: large, scorer CPU unknown, the AVX2 kernel stays the fallback |
+| L, P, Q, M2, J | 8-byte records; decode after dedup; overlap of the index pass with the parse; two rows per pass; on-demand click grouping | see registry | | REJECTED (impossible / bounded / measured slower) |
+
 ## How the engine works now (index mode, the default)
 
 1. Startup: Parquet files left in the output folders are removed; manifest; event files mapped; the

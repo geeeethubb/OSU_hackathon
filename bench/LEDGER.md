@@ -968,3 +968,14 @@ base was `b890895` and the comparison was against candidate E.
   process start: both discarded). **No single removable block**; a redesign could plausibly save about a
   third of attribution, about 20 ms of CI container time (3%): an exploitation item, not an architecture
   change. Recorded as hypothesis I with that bound.
+
+### 01:30 UTC
+
+- **Architecture workflow stalled** (its first agent's request at 01:10 never returned; other model
+  agents are unavailable): stopped; the architecture pass is the lead's own, written into
+  `bench/HANDOFF.md` (spec traced back from the outputs, essential versus choice, designs D, I2, X ranked).
+- **E1, the scorer's class of CPU, MEASURED unavailable:** a 20-job matrix (run 44971115429) drew AMD EPYC
+  7763 x6, 9V74 x7, 9V45 x2 and Intel Xeon 6975P-C x3, 8573C x3; 14 of 20 have AVX-512 VBMI2. No
+  Skylake-family Xeon (Cascade Lake) and no Ice Lake Xeon (one 8370C was seen once in about 60 earlier
+  runs). The branch-erratum question (padded jumps) and the stage profile on the scorer's kind of core
+  cannot be measured in CI; an official A/B would need the user's authorization.
