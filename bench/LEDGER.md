@@ -1124,3 +1124,12 @@ base was `b890895` and the comparison was against candidate E.
   instructions for a view/cart row; about 10 reloads of spilled pointers, the F2 branch laid out as the
   fall-through. An opaque-ID assembly loop could plausibly cut 20-25% of decode (about 4-5% of thread
   time): not yet started.
+
+### 04:15 UTC: link rows in the pool not demonstrated; F6 assembled
+
+- `b236711` (link rows inside the parse pool) against `9643656`: -2.7 / +3.3 / -6.9 ms (7/18, EPYC 7763,
+  run 44983585958): link-row stage 32 -> 4 ms, parse stage 531 -> 554 ms. Reverted (`df5a154`).
+- `9643656` (names spelled out lazily) against `0e71b47`: +35.5 / +40.0 / +29.2 ms (17/18, Xeon 8370C,
+  run 44983001687); serial sessions setup 5.2 ms on Linux; every phase idles under 5 thread-ms.
+- **F6** = source of `9643656` (F5 + probe tokens + lazy names; D1 removed): pushed to `pipeline` with
+  [60m] for the paired 20M/60M run against F5, plus a fresh-seed run; local 60M comparison follows.

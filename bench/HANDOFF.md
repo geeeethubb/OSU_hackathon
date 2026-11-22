@@ -6,18 +6,16 @@ from about 13:00 the effort shifts to validating one reliable final candidate.
 
 ## Where it stands (2026-11-22, shopping-sessions-5)
 
-- **Official, current dataset: `9735a63d039ee9ee843e0204f1d988bd5c822f41` = 1.2745 s** (receipt
-  BB-32BE0EA7). F4 `bad5c1b` (index mode, outside the republished rules) scores 5.6629 s there; the
-  0.4648 s of the old dataset is not a comparable baseline. `bench/BEST_SHA` names `9735a63`.
-- **Goal now:** an accepted official score below 0.6018 s (stretch 0.20 s). Official/CI ratio for
-  `9735a63` on EPYC 7763 runners: 1,274.5 / about 2,090 = 0.61 (one point; the old data's 0.66 + 80 ms
-  would have predicted 1.46 s). Below 0.6018 s needs roughly CI 900-990 ms on an EPYC 7763 runner.
-- **Chain since `9735a63`, in CI against it directly:** `dffab6f` +848 / +919 / +893 ms (18/18, EPYC
-  7763, run 44979567715): containers 2,074-2,169 -> 1,212-1,252 ms. By the ratio about 0.74-0.76 s
-  official. Not yet a candidate: fresh seeds and 60M pending.
-- The republished rules: IDs are opaque variable-width strings; one in eight distinct user, event and
-  click IDs is a byte and 32 lowercase hex digits; per-seed keyed bijection. The engine never reads an ID
-  as a number of the generator (index mode is off unless `SS_STRUCT=1`, kept only for comparison).
+- **Accepted official best: F5 `32b8fffd658af203da5e5809c9d3ce9eaede94ee` = 0.7698 s** (receipt
+  BB-4A6C474E; rank 11 as relayed; board top 0.5528 s as relayed). `bench/BEST_SHA` names F5. Earlier on
+  this dataset: `9735a63` 1.2745 s (BB-32BE0EA7); F4 `bad5c1b` 5.6629 s (index mode, outside the rules).
+- **Goal:** below 0.6018 s official (stretch 0.20 s). Only official scores count; CI ratios are not forecasts.
+- **F6 (being validated):** F5 + prepared link-table probes in the forward rings (`951373b`) + long user
+  IDs spelled out by the output writers (`9643656`), with direct click emission removed (`0e71b47`) and
+  the link-pool step reverted (`df5a154`). Steps measured in CI against their parents: probe tokens
+  +20 to +39 ms (12/12 seed runs, EPYC 9V74/9V45), names +35.5 / +40.0 / +29.2 ms (17/18, Xeon 8370C).
+- 60M: the CI reference is OOM-killed at 14 GiB; complete comparisons run on the laptop (31 GiB): F5 and
+  the later heads MATCH new 60M seed 2 (reference exit 0, 140 s).
 
 ## Performance model on the current data (reset 03:00-03:27 UTC; MEASURED unless marked)
 
@@ -63,6 +61,21 @@ Container time on CI (2 cores x 2 threads; seed 2, EPYC 7763, `dffab6f`): 1,219 
 | D2 | Forward survivors from the dedup table instead of re-reading the partition lists | the second read of each event record | larger table slots | same winners | the re-read hits L2/L3 right after the first pass; bounded small | REJECTED on paper |
 | D3 | Link rows parsed inside the main task pool (no barrier before the event parse) | idle time of the link-row stage (30 ms wall at 4 threads for 66 ms of one-thread work) | handing the pairs to the builder when the last link task ends | same pairs, same build | about 10-15 ms | LATER, small |
 | E | Dedup inside person partitions (route every row by person at parse time) | the forward (19% of thread time) | a global by-event-ID check for copies that name another person (1 in 64 duplicated events) | a copy in another person partition cannot be seen locally; any global check is the event-ID shuffle again | no saving once the check is counted | REJECTED on paper |
+
+## Audit experiments (2026-11-22 04:00 UTC audit of `32b8fff`), outcomes
+
+| Audit item | What was done | Measured | Decision |
+|---|---|---|---|
+| 1A classification reuse at the short-to-long handoff | long-row kernel for every row (laptop) | 4% slower on mixed rows, 12% on short rows; reuse of the 64-byte masks bounded at about 10 instructions on a quarter of rows | REJECTED / bounded |
+| 1B/1C small batches or an opaque-ID assembly loop | generated code of the hot loop inspected: about 250 instructions per view/cart row, about 10 spilled-pointer reloads | assembly could cut 20-25% of decode (decode is about 30% of process time) | NEXT, after PGO |
+| 2A prepared probe token | `951373b` | +20 to +39 ms, 12/12 seed runs | KEPT |
+| 2A ring size 8 / 32 vs 16 | laptop screen | 8 worse; 32 better at 4 threads, not at 8 | no change |
+| 2B worker-private user-to-person cache | reuse distance from the data | a user recurs only after hundreds of thousands of survivors | REJECTED on reuse |
+| 3 direct click emission (D1) | `f1121d0` | -9 ms (3/18); same image +7 ms faster without it | REJECTED, removed |
+| 4 partition sizes | event 11/12, person 11/12 bits (10 is the floor of the key layout) | every variant slower or inconclusive | defaults stay |
+| (lead) serial sections | phase/idle timers; long-ID names spelled out lazily (`9643656`) | sessions setup 31 -> 5 ms; +29 to +40 ms in CI | KEPT |
+| (lead) link rows in the parse pool | `b236711` | -2.7 / +3.3 / -6.9 ms (7/18): the work moved, nothing idled | REVERTED |
+| (lead) PGO of the scored build | `pgo.yml` makes a profile in the pinned image | in progress | |
 
 ## How the engine works now (general path, the default)
 
