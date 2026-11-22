@@ -83,6 +83,10 @@ pub struct ScratchB {
     /// The same two for the long event IDs of a partition.
     long_table: Vec<LongSlot>,
     long_lost: Vec<u64>,
+    /// Per 64 buckets of keys, two words of one bit per bucket: some
+    /// record's key falls in it, and two or more records' keys do
+    /// (`may_repeat_bits`); side by side, so that a record reads one line.
+    seen: Vec<[u64; 2]>,
     /// Diagnostics (`SS_TIMING`): nanoseconds this worker spent choosing
     /// winners and forwarding survivors.
     pub measure: bool,
@@ -251,7 +255,35 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
     }
     // Every record has at least two words.
     let most_records = words / 2;
-    let bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    let started = scratch.measure.then(std::time::Instant::now);
+    // Most event IDs have one copy. A first pass marks, per bucket of keys,
+    // whether some record's key falls in it and whether two or more do; only
+    // the records of the buckets with two or more (all copies of a repeated
+    // ID among them) then go through the winner table, which can be sized
+    // for them. Every other record is its event's only copy, so it wins.
+    let filter_bits = may_repeat_bits(most_records);
+    let mut bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    if let Some(filter_bits) = filter_bits {
+        scratch.seen.clear();
+        scratch.seen.resize(1usize << (filter_bits - 6), [0; 2]);
+        let seen = &mut scratch.seen[..];
+        let mut repeats = 0usize;
+        for_each_record(lists, |word0, _, _| {
+            let bucket = ((word0 >> 32) as u32).wrapping_mul(0x9E37_79B1) >> (32 - filter_bits);
+            let (word, bit) = ((bucket >> 6) as usize, 1u64 << (bucket & 63));
+            // SAFETY: `word` is below `seen.len()`: the bucket has `filter_bits` bits.
+            unsafe {
+                let cell = seen.get_unchecked_mut(word);
+                let before = cell[0] & bit;
+                cell[1] |= before;
+                cell[0] |= bit;
+                repeats += usize::from(before != 0);
+            }
+        });
+        // A bucket with k >= 2 records counted k - 1 repeats: at most twice
+        // as many records go to the table as there were repeats.
+        bits = ((repeats * 2).max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    }
     let capacity = 1usize << bits;
     scratch.table.clear();
     scratch.table.resize(capacity, Slot::default());
@@ -259,13 +291,21 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
     scratch.lost.resize(most_records / 64 + 1, 0);
     let table = &mut scratch.table[..];
     let lost = &mut scratch.lost[..];
+    let seen = &scratch.seen[..];
 
     // Step 2 of the rules: per event ID keep the copy with the smallest
     // ingest_ts (the first seen among equal ones, which are identical).
-    let started = scratch.measure.then(std::time::Instant::now);
     let mut sequence = 0u32;
     for_each_record(lists, |word0, word1, _| {
         let key = (word0 >> 32) as u32;
+        if let Some(filter_bits) = filter_bits {
+            let bucket = key.wrapping_mul(0x9E37_79B1) >> (32 - filter_bits);
+            // SAFETY: as in the first pass.
+            if unsafe { seen.get_unchecked((bucket >> 6) as usize)[1] } & (1u64 << (bucket & 63)) == 0 {
+                sequence += 1;
+                return;
+            }
+        }
         let ingest = ((word1 >> 1) & INGEST_MASK) as u32;
         let mut at = (key.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize;
         loop {
@@ -324,6 +364,19 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
     }
+}
+
+/// The bits of the buckets of keys `dedup_coded`'s first pass counts in,
+/// for a partition of at most `records` records: about eight buckets per
+/// record, so that few records share a bucket with another key (about one in
+/// eight) and the bits of a 20,000-record partition take 64 KB. `None` with
+/// `SS_BITWIN=0`: every record goes through the winner table.
+fn may_repeat_bits(records: usize) -> Option<u32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("SS_BITWIN").as_deref() != Ok("0")) {
+        return None;
+    }
+    Some((records.max(64) * 8).next_power_of_two().trailing_zeros().clamp(12, 24))
 }
 
 /// Writes one surviving event waiting in a ring (record words, then what
