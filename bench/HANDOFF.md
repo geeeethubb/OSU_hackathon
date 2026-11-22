@@ -4,118 +4,79 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Best verified implementation
+## Where it stands (2026-11-22, shopping-sessions-5)
 
-- **Official best: 0.4663 s**, candidate F3, `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (receipt
-  BB-9900D7A0). Before it: 0.5231 s F `1033956062d3cd948462c664d822f2636bcf1153`, 0.6389 s
-  `2dae9298...`, 0.66 s `4567e953...`, 0.71 s `2b2cccd1...`. Board best when last checked: 0.2778 s.
-  Official scores are relayed by the user's submission watch; nothing here submits.
-- `bench/BEST_SHA` = F3: every CI run pairs HEAD against the officially scored commit. F3 must stay
-  recoverable: it is the commit named in the PR until a successor is confirmed (fresh seeds and 60M).
-- F3 = F + event loop and store in assembly, merged vector checks, constants in registers, purchases
-  finished in the assembly; edge chains processed while partitions run; place restructured, odd-ID
-  events merged by time; new link builder; stale output files removed. In CI against F: +42.5 / +38.9 /
-  +42.2 ms (18/18), fresh seeds +27 / +31 / +29 ms (18/18), 60M +84.8 ms, peak memory 1.69 GiB.
-- Calibration of official scores against one runner (seven points, EPYC 7763): slope about 0.65,
-  intercept 65 to 100 ms; F3's own step carried over at more than one to one. Data, not a model.
+- **Official, current dataset: `9735a63d039ee9ee843e0204f1d988bd5c822f41` = 1.2745 s** (receipt
+  BB-32BE0EA7). F4 `bad5c1b` (index mode, outside the republished rules) scores 5.6629 s there; the
+  0.4648 s of the old dataset is not a comparable baseline. `bench/BEST_SHA` names `9735a63`.
+- **Goal now:** an accepted official score below 0.6018 s (stretch 0.20 s). Official/CI ratio for
+  `9735a63` on EPYC 7763 runners: 1,274.5 / about 2,090 = 0.61 (one point; the old data's 0.66 + 80 ms
+  would have predicted 1.46 s). Below 0.6018 s needs roughly CI 900-990 ms on an EPYC 7763 runner.
+- **Chain since `9735a63`, in CI against it directly:** `dffab6f` +848 / +919 / +893 ms (18/18, EPYC
+  7763, run 44979567715): containers 2,074-2,169 -> 1,212-1,252 ms. By the ratio about 0.74-0.76 s
+  official. Not yet a candidate: fresh seeds and 60M pending.
+- The republished rules: IDs are opaque variable-width strings; one in eight distinct user, event and
+  click IDs is a byte and 32 lowercase hex digits; per-seed keyed bijection. The engine never reads an ID
+  as a number of the generator (index mode is off unless `SS_STRUCT=1`, kept only for comparison).
 
-## What the measurements say about the bottleneck (details: LEDGER 23:30 and 23:58)
+## Performance model on the current data (reset 03:00-03:27 UTC; MEASURED unless marked)
 
-- F on a 2-core x 2-thread Xeon 6975P-C runner: container 670 ms, process 608 ms: event+click parse
-  435 (event parse 1,435 CPU-ms, click 202), index pass 156 (place 128, session kernel 226, rest 179
-  CPU-ms), link stage 10, whale tail 12.5, output 1. The process is compute-bound and parallel.
-- Event parse: the kernel is 86% of it, the lists' memory traffic 9%, input page faults ~3%, the variety
-  of row formats 3-5%. 4.45% of rows (purchases, declines) take ~30% of kernel time.
-- With both hardware threads of a core busy, a core is throughput-bound (the second thread adds only
-  23-32%): only fewer uops or fewer stalls make a row cheaper; latency hiding inside a thread does not.
-- Index pass (time-stamp counters): place 22-24%, batch finish (rows, attribution, cells, output)
-  37-39%, one-slot path 14-17%, tight loop 9-10%, assists 6-7%, run ends 6-7%.
-- No single change identified removes half of the time. A 40-50% cut would need the per-row parse cost
-  and the index pass each roughly halved; that is the direction of the registry below.
-- Unknown: the scorer's CPU model (an n2 Xeon: Cascade Lake or Ice Lake), its run-to-run variation, its
-  container overhead. From `2dae9298` to F, CI pairs added 183-236 ms and the official score moved 116 ms.
+Container time on CI (2 cores x 2 threads; seed 2, EPYC 7763, `dffab6f`): 1,219 ms; in-process 1,124 ms.
 
-## Experiment registry (hypotheses, not candidates)
+| stage, 4 threads | wall ms | thread-ms | share of thread time |
+|---|---:|---:|---:|
+| startup + link rows | 33 | ~120 | 3% |
+| event parse | 534 (both kinds) | 1,815 | 40% |
+| click parse | (same stage) | 316 | 7% |
+| dedup winners | 336 (stage) | 295 | 7% |
+| dedup forward (link lookup, scatter by person) | | 833 | 19% |
+| click map (link lookup, scatter by person) | | 178 | 4% |
+| sessions (group, sessionize, attribute, emit) | 221 | ~880 | 20% |
+| link build (side thread, off the critical path) | | 140 | |
 
-| ID | Architectural difference | Correctness argument | Measured / bounded benefit | Added costs | Decision |
-|---|---|---|---|---|---|
-| G | Purchases and declined rows finished inside the assembly instead of leaving for slower parsers that re-read them | the assembly takes exactly the rows the general parser accepts, with identical values; differential tests both ways | (a) purchases: +4 to +9 ms, `SS_RARE=0` 3.5-6.3 ms slower (16/18): in F3. (b)(1) declined rows without the re-read: +2.6 / -0.3 / -3.2, nothing. (b)(2) invalid-ts rows inside: building | a purchase path in the assembly | (a) KEPT, (b)(1) neutral, (b)(2) in progress |
-| H | Slot scan four slots per step, purchases and invalid winners included | per-slot semantics tested against the one-at-a-time code | `SS_WIDE=1` same image: +11.9 / -0.2 / -8.1 and -1.1 / -3.3 / -0.0 ms | AVX2 classification | NOT DEMONSTRATED; stays off |
-| I | Batch finish (attribution, cells, rows) restructured to remove work | rules for credited/assists/organic unchanged | 37-39% of the partition pass (about 200 CPU-ms); split not measured | unknown | PARKED (agent stopped for budget) |
-| J | Clicks grouped per partition inside the index pass; no click-index phase | same clicks per user, same order | **-31.5 / -27.3 / -29.3 ms** (0/18): the phase went from 23.8 to 0.4 ms but the partition pass grew 130 CPU-ms (neighbouring partitions wait on the range they share) | waiting | KILLED by measurement |
-| K | Edge chains joined and processed while partitions still run | same joins and layout check; restart drops everything | +6.3 / +16.4 / +15.0 ms (17/18); tail after the last partition 12.7 -> 0.3 ms | a mutex per partition | KEPT, in F3 |
-| M2 | Two rows per pass sharing the ID and timestamp vector work (the other form of M) | every row through today's checks, grouped in pairs; a declined second row falls back to the one-row path for both | bound 10-15% of event parse; killed on paper unless a pair saves 12% of the straight line's instructions | gathering the second row's fields | COUNT FIRST, parser agent |
-| T | Lookup tables without one allocation per product | same table and map contents; readers try the table first | bound: the 5.3 ms table wait at startup (about 9 ms with eight threads) | none | IN CI (`60758b0`) |
-| L | 8-byte records | needs at least 80 bits without truncation; truncating user numbers would make the layout check unsound | lists are 9% of event parse | | KILLED on paper (bit budget); 12-byte variant bounded at ~3%, not now |
-| M | Two rows interleaved per loop iteration | | none: with both hardware threads busy the core is already throughput-bound | | KILLED by measurement |
-| N | Eight rows per vector lane (transposed) for timestamp and ID arithmetic | same decode, vertical | arithmetic ~90 of 197 straight-line instructions; transposition eats much of it; estimate under 15% | large rewrite | PAPER SCREEN by the parser agent after G; build only above 15% |
-| O | EVEX-256 kernel (AVX-512 F/BW/VL/VNNI) with runtime dispatch; AVX2 fallback | same acceptance set | unknown; the scorer's n2 Xeons have these instructions | second kernel; the scorer's exact CPU cannot be tested | PAPER SCREEN (uop count) by the parser agent |
-| P | Decode after dedup (offsets instead of records) | | measured earlier: at most 2-4% of parse before the random re-read of 1.6 GB | | KILLED; nothing has changed since |
-| Q | Index pass overlapped with the parse | any file holds copies of any event: no partition is final before the last row | | | KILLED on paper |
-| R | Scorer calibration through official submissions (identical binary again; F + jump padding) | both builds pass every CI check | padding costs 1-5 ms on an unaffected AMD runner; the scorer's CPU is unknown | two submissions | NOT PURSUED: the user ruled out calibration submissions; the one-runner calibration above replaces R1 |
+- **Event parse split (Linux, same runner; `SS_DIAG=2` scan only, `SS_DIAG=7` decode without store):**
+  one thread 187 scan / +856 decode / +149 store = 1,192 ms (16% / 72% / 12%); four threads 293 / +1,173
+  / +349 = 1,815 thread-ms (16% / 65% / 19%). Decoding fields is the cost, not reading bytes.
+- **Inside decode (laptop, Ryzen AI 9 365, Windows):** user-table lookups for long user IDs are 10% of
+  decode-without-store (1,481 -> 1,332 thread-ms at 4 threads with `SS_DIAG_USERS=1`, which fakes them);
+  general-kernel steps one thread: structure +61, bounds +49, ID codes ~0, timestamps +194, type/user/
+  price +371, store +259 ms. Linux figure for the lookups: run pending (`3462185`, diag envs).
+- **Shared coordination left:** the user table (reads lock-free since `6d9ec1f`; inserts lock a region,
+  about 183K distinct long user IDs at 20M); one atomic per task. Contention measured before `6d9ec1f`:
+  event-parse CPU -20% at 4 threads when the shard locks went (laptop), +56-62 ms in CI.
+- **Scaling, CI (2 cores x 2 threads):** in-process 2,855 / 1,501 / 1,124 ms at 1 / 2 / 4 threads
+  (1.90x, 2.54x); the hyperthread step adds 1.34x, and per-thread CPU rises 28-60% (forward most).
+  **Laptop (10 cores / 20 threads, 4 Zen 5 + 6 Zen 5c, 1 MiB L2 per core, 24 MiB L3):** 2,694 / 1,440 /
+  856 / 555 ms at 1 / 2 / 4 / 8 threads (4.86x at 8). The scorer (4 cores x 2 threads, n2 Xeon) has
+  not been measured; nothing here is an 8-thread measurement of it.
+- **Sessions phases (laptop, one thread, 265 of 334 ms):** grouping 79, sessionize 46, attribution 87,
+  emit 32, rows and purchases 19. No dominant block.
 
-Bounded incremental stream on F, one step at a time: the parser's kernel steps, the sessions agent's
-scan steps, links and click kernels (small), memory reuse of consumed list blocks (small).
+## Architecture search on this data (hypotheses; the decision rule is end-to-end paired CI)
 
-## Architecture pass from the rules (lead, 2026-11-22 01:30 UTC; own review passes, not independent agents)
+| ID | Design | Removes | Adds | Exactness | Bound / evidence | Status |
+|---|---|---|---|---|---|---|
+| A | No global interning where identity is not needed: event IDs deduplicated by value inside their hash partition; click IDs kept per parse worker (only their order matters); user IDs (identity needed for links and names) in a table read without locks | all event- and click-ID map traffic; user shard locks | 2 more words per long-event record; per-worker click-ID lists | equality of event IDs by full 128-bit value inside the partition their value picks; click ties compared by value; user table write-once slots under region locks, never two slots for one ID | MEASURED: `e2aed79` stack +413-442 ms, `a2cf9f0` +70, `6d9ec1f` +56-62 | DONE, in the chain |
+| B | Partition ownership instead of shared maps | | | | the engine already routes by hash to one owner per partition (dedup by event-ID partition, sessions by person partition, per-worker lists in between); the one shared structure in the hot loop is the user table (lock-free reads) | nothing left beyond C |
+| C | Resolve user identity after dedup, not in the parse loop: long user IDs ride in the record as values; forward and click map look them up (prefetched) together with the link table | the parse's user-table lookups (laptop: 10% of decode) | 2 words per long-user record (about 1 in 8 rows), a lookup per survivor in forward (prefetched ring), inserts of never-linked long users at forward time | the same table, the same write-once protocol; only where the lookup happens moves | ceiling = the parse's lookup cost minus the forward's; Linux figure pending; reject below +15 ms paired | PROTOTYPE 1 if the Linux figure is above about 100 thread-ms |
+| D1 | Clicks parsed straight into person partitions (the link table is ready long before the click tasks, which run after the event tasks) | the raw click lists (write and read, about 120 MB) and the click-map pass (178 thread-ms) | link lookups inside the click loop (a small prefetch ring), a wait if links are not ready | the same link table and the same forward_click record; the order of clicks never matters | ceiling about 180 thread-ms minus the lookups moved, about 20-30 ms wall | PROTOTYPE 2 |
+| D2 | Forward survivors from the dedup table instead of re-reading the partition lists | the second read of each event record | larger table slots | same winners | the re-read hits L2/L3 right after the first pass; bounded small | REJECTED on paper |
+| D3 | Link rows parsed inside the main task pool (no barrier before the event parse) | idle time of the link-row stage (30 ms wall at 4 threads for 66 ms of one-thread work) | handing the pairs to the builder when the last link task ends | same pairs, same build | about 10-15 ms | LATER, small |
+| E | Dedup inside person partitions (route every row by person at parse time) | the forward (19% of thread time) | a global by-event-ID check for copies that name another person (1 in 64 duplicated events) | a copy in another person partition cannot be seen locally; any global check is the event-ID shuffle again | no saving once the check is counted | REJECTED on paper |
 
-What the outputs require (traced back from rules.md):
-- A person's sessions depend on ALL of that person's surviving events (an intermediate event can merge
-  two sessions), so no session is final before every event file is read: rows are shuffled across files
-  (MEASURED). Barrier 1: all event copies read. Dedup needs every copy's event_id and ingest_ts; the other
-  fields matter only for the winning copy, which is known only after all copies are seen.
-- Persons need all link lines (transitive, name = byte-wise smallest ID incl. link-only IDs). Barrier 2:
-  all links read before persons are final (links are 1% of the input and are read first).
-- Credit and assists need the person's final sessions and all of their valid clicks. Barrier 3: all
-  click files read. Click dedup is unnecessary for exact output (copies are identical: same ts, same
-  click_id, same campaign).
-- user_daily needs per (person, start day): sessions, events, revenue, and per-category revenue sums for
-  top_category (ties byte-wise, `unknown` competes): not mergeable as a single top value.
-- campaign_daily needs per (campaign, day): credited sessions, purchasing sessions, revenue, and distinct
-  assisting campaigns per session aggregated by day: sums, mergeable across persons in any order.
+## How the engine works now (general path, the default)
 
-Essential versus implementation choice: scanning every byte (malformed lines) ESSENTIAL; event_id and
-ingest for every copy ESSENTIAL; decoding user/ts/type/product/price for losing copies CHOICE (bounded:
-deferral measured at 2-4% of parse before the random re-read of 1.6 GB: REJECTED); grouping by person
-ESSENTIAL; a global sort CHOICE (the engine places by dense index instead, a checked data property);
-waiting for all rows before sessions ESSENTIAL (barrier 1); click dedup CHOICE (skipped); materializing
-every output row before writing CHOICE (the engine streams).
-
-Designs considered this round, ranked by plausible saving x confidence / effort:
-| ID | Design (family) | Removes / moves | Bound on CI container time | Decision |
-|---|---|---|---|---|
-| E1 | Measure on the scorer's class of CPU (Skylake-family / Ice Lake Xeon): stage profile, padded jumps | nothing; tests whether the scorer's front end penalizes the assembly loop | unknown | DONE: 20 runners drew EPYC 7763/9V74/9V45 and Xeon 6975P-C/8573C only; the scorer's CPU class is not reproducible here. Padded jumps stay untested (needs an authorized official run) |
-| D | Click index built while the event parse still runs (memory-bound grouping beside uop-bound parsing on SMT siblings; B: scheduling) | the 20 ms barrier phase after the parse; its work moves to idle issue slots of busy cores | <= 20 ms | REJECTED (measured): +5.0 / +1.8 / +2.7 and +2.4 / +0.8 ms, below the criterion; with both hardware threads busy there are no idle issue slots, the work moved and cost the same |
-| I2 | Attribution restructured (merge walk per person, leaner assists) (A) | measured split: all attribution 68 ms of container time (Xeon 6973P-C), assists alone 28 ms (EPYC 9V74), credited cells 2.5 ms; the per-click loop already about 28 instructions per click | about 10-15 ms in total, spread over parts of 3-8 ms each | BOUNDED SMALL: no single removable block |
-| E3 | Allocator: blocks of 1 MiB or more in 2 MiB-aligned mappings of their own (all huge pages) | 76 MB of a 621 MB peak in 4 KiB pages: their faults and exit teardown (about 90 ms per GiB at exit against 7 for huge pages) | about 8-12 ms | IN CI (`ea7d6ac`, with 60M) |
-| X | EVEX / AVX-512 event kernel, runtime dispatch (parser) | mainly the head (64-byte k-mask compares instead of two 32-byte passes): about 15 of 216 instructions; the IDs and timestamps already fill their vectors | about 7% of the kernel on capable CPUs; 512-bit multiplies risk lower clocks on Cascade Lake | REJECTED on count (lead's reading of the assembly) |
-| L, P, Q, M2, J | 8-byte records; decode after dedup; overlap of the index pass with the parse; two rows per pass; on-demand click grouping | see registry | | REJECTED (impossible / bounded / measured slower) |
-
-## How the engine works now (index mode, the default)
-
-1. Startup: Parquet files left in the output folders are removed; manifest; event files mapped; the
-   generator's two ID scramble keys found from the first 64 KiB of the largest events file and the
-   layout checked on those samples. Lookup tables load on a side thread while links are parsed.
-2. Parse stage, all threads: event rows -> 16-byte records appended to per-thread lists by index
-   partition (2^14 event indexes each), the common row through one piece of assembly; click rows ->
-   per-user-range lists through a table-driven kernel. Beside it, one thread resolves links. Then, all
-   threads: the click index, while two helper threads let go of the input mappings.
-3. Index pass, all threads, partition by partition: `place` puts each record in the slot of its index
-   (smallest ingest wins: the dedup; the slot word carries the partition's tag), a scan reads the slots
-   in order, persons whose IDs are one simple link component are sessionized in batches of 32 while
-   their slots are read, everything else goes to the general path. First and last runs are joined
-   across partitions afterwards ("chains"; the whales end up here). Each thread writes its user_daily
-   row groups as they fill.
-4. General-path remainder, the campaign table, exit.
-
-What the fast path assumes and checks: IDs are scrambled dense numbers (keys found on samples, every
-row checked; rows that do not fit go to the general path); user indexes never decrease along the
-event-index order (checked on every surviving event; a violation restarts on the general path).
-
-Switches (each keeps the previous behaviour for same-image comparisons): `SS_STRUCT=0`, `SS_KERNEL=plain`,
-`SS_CLICK_KERNEL=lean|general`, `SS_BATCH=0|n`, `SS_PLACE=0..3`, `SS_ASSISTS=0|1|2`, `SS_WIDE=1`,
-`SS_STREAM=0`, `SS_RELEASE=0`, `SS_EXIT=drop`, `SS_INDEX_SHIFT`, `SS_VERIFY=1`, `SS_TIMING=1`,
-`SS_DIAG=1|7|8` (diagnostics, stop after the parse).
+1. Startup: stale Parquet files removed; manifest; files mapped; link rows parsed by all threads into
+   pairs of user codes (a user ID is its exact text code: prefix and up to 8 base-37 characters, or an
+   index from the user table for anything else). Lookup tables load on a side thread.
+2. Parse, all threads: event rows -> records in per-worker lists by event-ID hash partition (long event
+   IDs as their 128-bit value in lists of their own); regular rows through the lean kernel, rows with a
+   long ID through `event_lean_long`, the rest through the general kernel and parser. Click rows -> raw
+   per-worker lists. Beside it, one thread builds the link table.
+3. Dedup, all threads, partition by partition: smallest ingest wins (event ID by code, or by value for
+   long ones); survivors forwarded by person (link lookup) into person partitions; clicks mapped the same.
+4. Sessions, all threads, partition by partition: group by person, sessionize, attribute, emit
+   user_daily rows (each thread its own file); campaign table; exit.
 
 ## Final candidate procedure (from about 13:00 UTC on 2026-11-22)
 
