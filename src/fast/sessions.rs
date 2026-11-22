@@ -1373,19 +1373,25 @@ impl Person {
     /// The person's next `count` events at once (1 to 4): what `count` calls
     /// of `add` do, with their timestamps in the first `count` 64-bit lanes
     /// of `ts` in the order they come. The other lanes may hold anything.
-    /// `false`, with nothing changed, when the events are not in time order
-    /// or the batch's sessions have no room for four more; the caller then
-    /// goes on one event at a time.
+    /// Returns one bit per event that begins a session (bit 0 for the
+    /// first), or `None`, with nothing changed, when the events are not in
+    /// time order or the batch's sessions have no room for four more; the
+    /// caller then goes on one event at a time.
     ///
     /// # Safety
     /// Needs AVX2.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    pub unsafe fn add_first(&mut self, sessions: &mut [[u64; 2]], ts: std::arch::x86_64::__m256i, count: usize) -> bool {
+    pub unsafe fn add_first(
+        &mut self,
+        sessions: &mut [[u64; 2]],
+        ts: std::arch::x86_64::__m256i,
+        count: usize,
+    ) -> Option<usize> {
         use std::arch::x86_64::*;
         debug_assert!((1..=4).contains(&count));
         if self.open + 5 > sessions.len() {
-            return false;
+            return None;
         }
         // The lanes that are events.
         let taken = (1usize << count) - 1;
@@ -1396,7 +1402,7 @@ impl Person {
         );
         let earlier = _mm256_cmpgt_epi64(before, ts);
         if _mm256_movemask_pd(_mm256_castsi256_pd(earlier)) as usize & taken != 0 {
-            return false;
+            return None;
         }
         let long = _mm256_cmpgt_epi64(_mm256_sub_epi64(ts, before), _mm256_set1_epi64x(i64::from(GAP)));
         let cuts = _mm256_movemask_pd(_mm256_castsi256_pd(long)) as usize & taken;
@@ -1418,7 +1424,16 @@ impl Person {
         let mut stamps = [0u64; 4];
         _mm256_storeu_si256(stamps.as_mut_ptr() as *mut __m256i, ts);
         self.latest = stamps[count - 1] as u32;
-        true
+        Some(cuts)
+    }
+
+    /// A purchase among the events `add_first` has just taken: `word` is
+    /// `price | category << 32`, and `later` has a bit for each of the
+    /// events after the purchase's own that began a session (the bits
+    /// `add_first` returned, shifted down past the purchase's event).
+    #[inline(always)]
+    pub fn purchase_behind(&self, purchases: &mut Vec<[u64; 2]>, word: u64, later: usize) {
+        purchases.push([(self.open - later.count_ones() as usize) as u64, word]);
     }
 
     /// The event just given is a purchase: `word` is `price | category << 32`
@@ -3196,9 +3211,14 @@ mod tests {
             batched.set_batch_persons(rng.pick(&[1, 2, 7, BATCH_PERSONS, BATCH_PERSONS_MOST, usize::MAX]));
             let (mut out_batched, mut out_single) = (new_out(), new_out());
             let mut serial = 0;
-            for number in 0..rng.range(1, 150) {
+            // One round in eight has more persons than a batch can ever
+            // hold, all of them small: the batch has to be finished for
+            // their number alone, at whatever number it was set to.
+            let crowd = rng.one_in(8);
+            let persons = if crowd { rng.range(2 * BATCH_PERSONS_MOST as u64, 3 * BATCH_PERSONS_MOST as u64) } else { rng.range(1, 150) };
+            for number in 0..persons {
                 // A person: events in time order with purchases, and clicks.
-                let wanted = rng.pick(&[1, 1, 2, 3, 5, 8, 20, 70, 300, 1500]);
+                let wanted = if crowd { rng.pick(&[1, 1, 2, 3]) } else { rng.pick(&[1, 1, 2, 3, 5, 8, 20, 70, 300, 1500]) };
                 let mut stream: Vec<(u32, Option<u64>)> = Vec::new();
                 let steps: &[u32] = rng.pick(&[
                     &[GAP + 1, GAP + 1, GAP + 2, 1, 60_000][..],
@@ -3226,7 +3246,7 @@ mod tests {
                 let purchases: Vec<[u64; 2]> =
                     stream.iter().filter_map(|&(ts, word)| word.map(|word| [u64::from(ts), word])).collect();
                 single.one_person_in_order(&mut out_single, &world.exotic, name, &events, &purchases, &clicks);
-                match rng.below(10) {
+                match if crowd { 9 } else { rng.below(10) } {
                     // Done whole, between the persons of the batch.
                     0 => batched.one_person_in_order(&mut out_batched, &world.exotic, name, &events, &purchases, &clicks),
                     // Begun in the batch with an event out of place, taken out again.
@@ -3245,7 +3265,7 @@ mod tests {
                     }
                     _ => assert!(give_to_batch(&mut batched, &mut out_batched, &world.exotic, name, &stream, &clicks)),
                 }
-                if rng.one_in(40) {
+                if !crowd && rng.one_in(40) {
                     batched.finish_batch(&mut out_batched, &world.exotic);
                     batched.flush(&mut out_batched);
                 }
@@ -3364,17 +3384,25 @@ mod tests {
                 let limit = room.min(sessions.len());
                 let took = unsafe { one.add_first(&mut sessions[..limit], lanes, count) };
                 let in_order = events[0] >= u64::from(other.latest) && events.windows(2).all(|pair| pair[0] <= pair[1]);
-                assert_eq!(took, in_order && other.open + 5 <= limit, "round {round}");
-                if !took {
+                assert_eq!(took.is_some(), in_order && other.open + 5 <= limit, "round {round}");
+                let Some(cuts) = took else {
                     refused += 1;
                     assert_eq!((one.open, one.word, one.latest), (other.open, other.word, other.latest), "round {round}");
                     break;
-                }
+                };
                 taken += 1;
                 let sessions = plain.batch_scratch().0;
-                for &value in events {
+                for (lane, &value) in events.iter().enumerate() {
+                    let open = other.open;
                     assert!(other.add(sessions, value as u32));
+                    assert_eq!(cuts >> lane & 1, other.open - open, "round {round}");
+                    // A purchase with this event belongs to the session open after it.
+                    let (mut behind, mut direct) = (Vec::new(), Vec::new());
+                    one.purchase_behind(&mut behind, 7, cuts >> (lane + 1));
+                    other.purchase(&mut direct, 7);
+                    assert_eq!(behind, direct, "round {round}");
                 }
+                assert_eq!(cuts >> count, 0, "round {round}");
                 assert_eq!((one.open, one.word, one.latest), (other.open, other.word, other.latest), "round {round}");
                 assert_eq!(wide.batch_scratch().0[..=one.open], plain.batch_scratch().0[..=other.open], "round {round}");
             }

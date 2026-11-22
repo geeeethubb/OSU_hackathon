@@ -19,9 +19,25 @@
 //!   along the index order. `Runner` checks that inside a partition and
 //!   `chains` across partitions; a violation makes the engine start over on
 //!   the general path.
-//! - Time order inside a run is not relied on: the kernel orders the events.
+//! - Time order inside a run is used, not relied on. A run read straight
+//!   from the slots hands its main person's events to the session kernel's
+//!   batch one at a time (or four slots at a time) as they are read, and the
+//!   first event that is earlier than the one before it takes the whole run
+//!   back out: it is read again as records and goes through `process_run`,
+//!   where the kernel orders the events itself.
 //! - A run that reaches a partition's edge may continue in the next one, so
 //!   first and last runs are set aside and joined afterwards (`chains`).
+//!
+//! How a partition is read (`Runner::partition`): `place` puts every record
+//! in the slot of its index, marked with the partition's tag, so that what
+//! an earlier partition left in a slot is never taken for a record. The scan
+//! then walks the slots once. Inside a run that is read straight from the
+//! slots it stays in a tight loop for as long as the next slots hold the
+//! main person's events; every other slot (the first event of a run, an
+//! event of another ID, a record without a generated user ID, the runs that
+//! are gathered as records) is taken on its own through the full decisions.
+//! Rows and campaign cells come from the kernel's batch, a few dozen persons
+//! at a time.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,20 +66,35 @@ pub type Record = [u64; 3];
 mod wide {
     use std::arch::x86_64::*;
 
-    use super::TS_MASK;
+    use super::{NUMBERED, RECORD_BITS, VALID};
 
-    /// The four slots at `slots`: one bit per slot (bit 0 for the first)
-    /// that does NOT hold a valid event of a generated user ID that the
-    /// partition placed (`event` is such a slot's word 0 apart from the
-    /// timestamp), of user index `user` under an alias that has its bit in
-    /// `main`, and without a purchase; and the four timestamps in the
-    /// 64-bit lanes in the order of the slots, each one meaningful where
-    /// its bit is clear.
+    /// What the scan makes of four slots at once.
+    pub struct Four {
+        /// The timestamps of the four slots in the 64-bit lanes, in the
+        /// order of the slots; meaningful for the slots that are events.
+        pub ts: __m256i,
+        /// One bit per slot (bit 0 for the first) that holds a record of
+        /// this partition whose winner is valid: every other slot is passed
+        /// over.
+        pub kept: u32,
+        /// Of the kept slots, the ones that are NOT an event of the main
+        /// person: not a generated user ID, another user, or an alias that
+        /// is not the main person's. They are taken one slot at a time.
+        pub stop: u32,
+        /// Of the kept slots that are events of the main person, the ones
+        /// that are purchases.
+        pub bought: u32,
+    }
+
+    /// Reads the four slots at `slots`. `event` is word 0 of a slot that
+    /// holds a valid event of a generated user ID placed by this partition,
+    /// apart from its timestamp; the main person's events are the ones of
+    /// user index `user` under an alias that has its bit in `main`.
     ///
     /// # Safety
     /// Needs AVX2, and four slots readable at `slots`.
     #[inline(always)]
-    pub unsafe fn four_events(slots: *const [u64; 2], event: u64, user: u64, main: u64) -> (__m256i, u32) {
+    pub unsafe fn four_slots(slots: *const [u64; 2], event: u64, user: u64, main: u64) -> Four {
         let first = _mm256_loadu_si256(slots as *const __m256i);
         let second = _mm256_loadu_si256(slots.add(2) as *const __m256i);
         // Slots 0 and 2, and slots 1 and 3: then word 0 and word 1 of the
@@ -72,23 +103,60 @@ mod wide {
         let odd = _mm256_permute2x128_si256::<0x31>(first, second);
         let word0 = _mm256_unpacklo_epi64(even, odd);
         let word1 = _mm256_unpackhi_epi64(even, odd);
-        // Such an event leaves only its timestamp here: tag, the bit for a
-        // generated ID and the valid bit cancel out.
+        let zero = _mm256_setzero_si256();
+        // An event of this partition leaves only its timestamp here: tag,
+        // the bit for a generated ID and the valid bit cancel out.
         let own = _mm256_xor_si256(word0, _mm256_set1_epi64x(event as i64));
-        // And here nothing from bit 28 up (the user index, and an alias
-        // below 64) and nothing at bit 0 (no purchase).
+        // Kept: the partition's tag, and the valid bit.
+        let kept = _mm256_cmpeq_epi64(_mm256_and_si256(own, _mm256_set1_epi64x((!RECORD_BITS | VALID) as i64)), zero);
+        let kept = _mm256_movemask_pd(_mm256_castsi256_pd(kept)) as u32;
+        // The main person's: a generated ID, nothing from bit 28 up in word
+        // 1 against the user (its index, and an alias below 64), and the
+        // alias's bit in `main`.
         let whose = _mm256_xor_si256(word1, _mm256_set1_epi64x((user << 31) as i64));
-        let other = _mm256_or_si256(
-            _mm256_and_si256(own, _mm256_set1_epi64x(!(TS_MASK << 1) as i64)),
-            _mm256_and_si256(whose, _mm256_set1_epi64x((!0u64 << 28 | 1) as i64)),
-        );
-        // The alias's bit of `main`, at bit 0.
         let alias = _mm256_and_si256(_mm256_srli_epi64::<22>(word1), _mm256_set1_epi64x(63));
         let named = _mm256_srlv_epi64(_mm256_set1_epi64x(main as i64), alias);
-        let unnamed = _mm256_andnot_si256(named, _mm256_set1_epi64x(1));
-        let right = _mm256_cmpeq_epi64(_mm256_or_si256(other, unnamed), _mm256_setzero_si256());
-        let wrong = !_mm256_movemask_pd(_mm256_castsi256_pd(right)) as u32 & 0b1111;
-        (_mm256_srli_epi64::<1>(own), wrong)
+        let other = _mm256_or_si256(
+            _mm256_or_si256(
+                _mm256_and_si256(own, _mm256_set1_epi64x(NUMBERED as i64)),
+                _mm256_and_si256(whose, _mm256_set1_epi64x((!0u64 << 28) as i64)),
+            ),
+            _mm256_andnot_si256(named, _mm256_set1_epi64x(1)),
+        );
+        let ours = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(other, zero))) as u32;
+        // The purchase bit, moved to the top of its lane.
+        let bought = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(word1))) as u32;
+        Four { ts: _mm256_srli_epi64::<1>(own), kept, stop: kept & !ours, bought: kept & ours & bought }
+    }
+
+    /// Per set of lanes (bit `lane` of the index): the 32-bit halves that
+    /// bring those lanes to the front, in order.
+    pub const TOGETHER: [[u32; 8]; 16] = {
+        let mut table = [[0u32; 8]; 16];
+        let mut lanes = 0;
+        while lanes < 16 {
+            let (mut lane, mut found) = (0, 0);
+            while lane < 4 {
+                if lanes >> lane & 1 == 1 {
+                    table[lanes][2 * found] = 2 * lane as u32;
+                    table[lanes][2 * found + 1] = 2 * lane as u32 + 1;
+                    found += 1;
+                }
+                lane += 1;
+            }
+            lanes += 1;
+        }
+        table
+    };
+
+    /// The lanes of `ts` that have their bit in `lanes`, brought to the
+    /// front in order.
+    ///
+    /// # Safety
+    /// Needs AVX2.
+    #[inline(always)]
+    pub unsafe fn together(ts: __m256i, lanes: u32) -> __m256i {
+        _mm256_permutevar8x32_epi32(ts, _mm256_loadu_si256(TOGETHER[lanes as usize].as_ptr() as *const __m256i))
     }
 }
 
@@ -780,21 +848,43 @@ impl Runner {
                     ours.then_some((ts, word1 & 1))
                 };
                 if BATCHED {
+                    #[cfg(target_arch = "x86_64")]
+                    let (sessions, purchases) = self.kernel.batch_scratch();
+                    #[cfg(not(target_arch = "x86_64"))]
                     let sessions = self.kernel.batch_scratch().0;
                     #[cfg(target_arch = "x86_64")]
                     while four_at_a_time && slot + 4 <= slots.len() {
-                        // Four slots at a time: the ones before the first
-                        // that is not such an event without a purchase are
-                        // taken together, the last ones of a run included.
+                        // Four slots at a time, up to the first that has to
+                        // be taken on its own: the main person's events
+                        // before it go to the batch together, purchases
+                        // with them, and what the partition did not place
+                        // or what lost its event to an invalid winner is
+                        // passed over.
                         // SAFETY: the four slots are there; AVX2 is what the build targets.
-                        let (ts, wrong) = unsafe { wide::four_events(slots.as_ptr().add(slot), event, current, main) };
-                        let events = (wrong.trailing_zeros() as usize).min(4);
-                        // SAFETY: AVX2, as above.
-                        if events == 0 || !unsafe { person.add_first(sessions, ts, events) } {
-                            break;
+                        let four = unsafe { wide::four_slots(slots.as_ptr().add(slot), event, current, main) };
+                        let taken = (four.stop | 1 << 4).trailing_zeros() as usize;
+                        let before = (1u32 << taken) - 1;
+                        let events = four.kept & before;
+                        if events != 0 {
+                            // SAFETY: AVX2, as above.
+                            let cuts = unsafe {
+                                person.add_first(sessions, wide::together(four.ts, events), events.count_ones() as usize)
+                            };
+                            let Some(cuts) = cuts else {
+                                break;
+                            };
+                            let mut bought_at = four.bought & before;
+                            while bought_at != 0 {
+                                let lane = bought_at.trailing_zeros();
+                                bought_at &= bought_at - 1;
+                                // Where the purchase's event stands among the
+                                // events taken, and the sessions begun after it.
+                                let place = (events & ((1 << lane) - 1)).count_ones();
+                                person.purchase_behind(purchases, bought[slot + lane as usize], cuts >> (place + 1));
+                            }
                         }
-                        slot += events;
-                        if events < 4 {
+                        slot += taken;
+                        if taken < 4 {
                             break;
                         }
                     }
@@ -1323,16 +1413,16 @@ mod tests {
         }
     }
 
-    /// The four-slot test of the scan against the decisions it takes for one
-    /// slot: every way a slot can fail to be the main person's next plain
+    /// The four-slot reading of the scan against the decisions it takes for
+    /// one slot: every way a slot can fail to be the main person's next
     /// event, in every lane.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn four_slots_match_one_at_a_time() {
         use std::arch::x86_64::{__m256i, _mm256_storeu_si256};
         let mut rng = Rng(5);
-        let mut seen = [0u32; 16];
-        for round in 0..200_000 {
+        let mut seen = [[0u32; 16]; 3];
+        for round in 0..300_000 {
             let tag = 1 + rng.below(TAG_MAX);
             let event = tag << TAG_SHIFT | NUMBERED | VALID;
             let user = rng.below(1 << 30);
@@ -1342,7 +1432,8 @@ mod tests {
                 _ => rng.next() | 1 << rng.below(64),
             };
             let mut slots = [[0u64; 2]; 4];
-            let mut expected = ([0u64; 4], 0u32);
+            // Timestamps of the events, and the three sets of bits.
+            let mut expected = ([0u64; 4], 0u32, 0u32, 0u32);
             for (lane, slot) in slots.iter_mut().enumerate() {
                 let ts = match rng.below(4) {
                     0 => 0,
@@ -1354,51 +1445,62 @@ mod tests {
                 while (main >> alias) & 1 == 0 {
                     alias = (alias + 1) % 64;
                 }
-                let (mut word0, mut number, mut purchase) = (event | ts << 1, user << 9 | alias, 0);
-                let mut ours = true;
-                // One slot in six is something else, in one of eight ways.
-                if rng.below(6) == 0 {
-                    ours = false;
-                    match rng.below(8) {
+                let (mut word0, mut number) = (event | ts << 1, user << 9 | alias);
+                // One slot in four is something else, in one of seven ways,
+                // and anything may be a purchase.
+                if rng.below(4) == 0 {
+                    match rng.below(7) {
                         0 => word0 ^= VALID,
                         1 => word0 ^= NUMBERED,
                         2 => word0 = (word0 & RECORD_BITS) | (1 + (tag + rng.below(TAG_MAX - 1)) % TAG_MAX) << TAG_SHIFT,
                         3 => word0 &= RECORD_BITS,
                         4 => number = (user ^ 1 << rng.below(30)) << 9 | alias,
                         5 => number = user << 9 | (64 + rng.below(448)),
-                        6 => purchase = 1,
-                        _ => match (0..64).find(|&bit| (main >> bit) & 1 == 0) {
-                            Some(bit) => number = user << 9 | bit,
-                            None => ours = true,
-                        },
+                        _ => {
+                            if let Some(bit) = (0..64).find(|&bit| (main >> bit) & 1 == 0) {
+                                number = user << 9 | bit;
+                            }
+                        }
                     }
                 }
+                let purchase = u64::from(rng.below(5) == 0);
                 *slot = [word0, number << 22 | rng.below(1 << 21) << 1 | purchase];
                 // The decisions of the scan for one slot.
                 let [word0, word1] = *slot;
-                let placed = word0 >> TAG_SHIFT == tag && word0 & VALID != 0 && word0 & NUMBERED != 0;
-                let alias = (word1 >> 22) & (ALIASES - 1);
-                let named = word1 >> 31 == user && alias < 64 && (main >> alias) & 1 != 0;
-                assert_eq!(placed && named && word1 & 1 == 0, ours, "round {round}");
-                if ours {
-                    expected.0[lane] = (word0 >> 1) & TS_MASK;
-                } else {
-                    expected.1 |= 1 << lane;
+                if word0 >> TAG_SHIFT != tag || word0 & VALID == 0 {
+                    continue;
                 }
+                expected.1 |= 1 << lane;
+                let alias = (word1 >> 22) & (ALIASES - 1);
+                if word0 & NUMBERED == 0 || word1 >> 31 != user || alias >= 64 || (main >> alias) & 1 == 0 {
+                    expected.2 |= 1 << lane;
+                    continue;
+                }
+                expected.0[lane] = (word0 >> 1) & TS_MASK;
+                expected.3 |= (word1 as u32 & 1) << lane;
             }
             // SAFETY: four slots; the tests run where the build targets AVX2.
-            let (lanes, wrong) = unsafe { wide::four_events(slots.as_ptr(), event, user, main) };
+            let four = unsafe { wide::four_slots(slots.as_ptr(), event, user, main) };
             let mut stamps = [0u64; 4];
             // SAFETY: four words to write to.
-            unsafe { _mm256_storeu_si256(stamps.as_mut_ptr() as *mut __m256i, lanes) };
+            unsafe { _mm256_storeu_si256(stamps.as_mut_ptr() as *mut __m256i, four.ts) };
+            let events = four.kept & !four.stop;
             for lane in 0..4 {
-                if wrong >> lane & 1 == 1 {
+                if events >> lane & 1 == 0 {
                     stamps[lane] = 0;
                 }
             }
-            assert_eq!((stamps, wrong), expected, "round {round}");
-            seen[wrong as usize] += 1;
+            assert_eq!((stamps, four.kept, four.stop, four.bought), expected, "round {round}");
+            // The events brought together, in order.
+            let mut front = [0u64; 4];
+            // SAFETY: AVX2 as above; four words to write to.
+            unsafe { _mm256_storeu_si256(front.as_mut_ptr() as *mut __m256i, wide::together(four.ts, events)) };
+            let in_order: Vec<u64> = (0..4).filter(|&lane| events >> lane & 1 == 1).map(|lane| stamps[lane]).collect();
+            assert_eq!(front[..in_order.len()], in_order[..], "round {round}");
+            seen[0][four.kept as usize] += 1;
+            seen[1][four.stop as usize] += 1;
+            seen[2][four.bought as usize] += 1;
         }
-        assert!(seen.iter().all(|&count| count > 50), "{seen:?}");
+        assert!(seen.iter().flatten().all(|&count| count > 20), "{seen:?}");
     }
 }
