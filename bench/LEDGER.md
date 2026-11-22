@@ -1171,3 +1171,20 @@ base was `b890895` and the comparison was against candidate E.
   ms against 138 for the two apart: no interleaving penalty left. Rows with a long ID are 24% of rows and
   41% of event-parse time: the next target (a long-row path in the assembly: 128-byte head, hex values,
   the user table probed after a prefetch, the long-event store; ts, ingest, type and tail reused).
+
+### 05:10 UTC: F7 (assembly + PGO) weaker than its parts on Intel; isolating
+
+- **F7 `af75107`** (general-path assembly + PGO profile of its own source) against F6: +11.1 / +2.4 / +13.8
+  ms (14/18, **Xeon Platinum 8573C**, run 44986307321); same image `SS_KERNEL=plain` 59.6 / 45.7 / 53.4 ms
+  slower (1/18). Stages: parse 716 -> 645 ms, but dedup 330 -> 386 ms: forward 763 -> 905 and click map
+  203 -> 292 thread-ms, in the variant run of the same image too (so not the kernel that runs).
+- The same pass-B rise in `50ed2ee` (assembly + F6's profile) on a **Xeon 6975P-C** (click map 171 ->
+  293, run 44985656154); **none on EPYC 7763** in any PGO build (`dbaac1c` PGO alone: 175-178;
+  `af75107`/`0978393`: 173). Laptop builds without PGO: no difference (six interleaved pairs).
+- Hypotheses: Intel front-end sensitivity to code placement (PGO and the new code move loops), or PGO
+  itself on Intel. Replicate pairs launched to sample Intel runners: PGO alone (`67e4892`, F6 code +
+  profile) and the current code without PGO (`a33259f`) against F6 (runs 44987313196, -315179, -318036,
+  -319462, -255379).
+- **Hashed-name reuse (`0978393`) against `af75107`: +4.4 / +12.1 / +16.1 ms (17/18, EPYC 7763, run
+  44986525475)**: forward 706 -> 680 thread-ms. Click map with the probe ring (`dfd16d0`): in the no-PGO
+  pair. **Nothing with PGO goes to the submission watch until the Intel question is settled.**
