@@ -1,14 +1,14 @@
 //! Thread-local bump arenas and append-only partition lists built from
 //! fixed-size blocks, so partitioning never copies or reallocates.
 //!
-//! A block is `[next block pointer, words used, data...]`. Records are
-//! written with `reserve`, which never splits a record across blocks, so
-//! every block holds whole records.
+//! A block is `[next block pointer, words used, the list's first block,
+//! data...]`. Records are written with `reserve`, which never splits a
+//! record across blocks, so every block holds whole records.
 
 /// Words per arena chunk (16 MB).
 const CHUNK_WORDS: usize = 1 << 21;
 /// Words of header at the start of every block.
-const HEADER_WORDS: usize = 2;
+const HEADER_WORDS: usize = 3;
 
 pub struct Arena {
     /// Chunks from the global allocator (where huge pages are not available).
@@ -154,15 +154,16 @@ impl Default for Arena {
 ///
 /// `repr(C)`: the event parser's assembly stores through `cursor` and compares
 /// against `end` directly, so the order of the fields is part of the contract
-/// (four words; the cursor first, the block's end second).
+/// (two words; the cursor first, the block's end second). Two words, so that
+/// a worker's thousand writers take 16 KB of the L1 cache rather than 32: the
+/// block being filled is the `block_words` before `end`, and each block's
+/// header carries the list's first block.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PartWriter {
     cursor: *mut u64,
+    /// The end of the block being filled, null before the first record.
     end: *mut u64,
-    /// The block being filled, null before the first record.
-    block: *mut u64,
-    head: *mut u64,
 }
 
 // SAFETY: a writer is used by one thread; it only holds pointers into that thread's arena.
@@ -170,29 +171,26 @@ unsafe impl Send for PartWriter {}
 unsafe impl Sync for PartWriter {}
 
 impl PartWriter {
-    pub const EMPTY: PartWriter = PartWriter {
-        cursor: std::ptr::null_mut(),
-        end: std::ptr::null_mut(),
-        block: std::ptr::null_mut(),
-        head: std::ptr::null_mut(),
-    };
+    pub const EMPTY: PartWriter = PartWriter { cursor: std::ptr::null_mut(), end: std::ptr::null_mut() };
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, block_words: usize) {
         let block = arena.alloc(block_words);
-        // SAFETY: `block` has `block_words > HEADER_WORDS` writable words;
-        // `self.block`, when set, is a live block this writer owns.
+        // SAFETY: `block` has `block_words > HEADER_WORDS` writable words; a
+        // writer's blocks all have `block_words` words, so when `end` is set
+        // the block being filled starts `block_words` before it.
         unsafe {
             *block = 0;
             *block.add(1) = 0;
-            if self.block.is_null() {
-                self.head = block;
+            if self.end.is_null() {
+                *block.add(2) = block as u64;
             } else {
-                *self.block = block as u64;
-                *self.block.add(1) = self.cursor.offset_from(self.block.add(HEADER_WORDS)) as u64;
+                let current = self.end.sub(block_words);
+                *current = block as u64;
+                *current.add(1) = self.cursor.offset_from(current.add(HEADER_WORDS)) as u64;
+                *block.add(2) = *current.add(2);
             }
-            self.block = block;
             self.cursor = block.add(HEADER_WORDS);
             self.end = block.add(block_words);
         }
@@ -210,15 +208,18 @@ impl PartWriter {
         at
     }
 
-    /// Seals the list. The writer must not be used afterwards.
-    pub fn finish(&mut self) -> PartList {
-        if !self.block.is_null() {
-            // SAFETY: `block` is the live block being filled.
-            unsafe {
-                *self.block.add(1) = self.cursor.offset_from(self.block.add(HEADER_WORDS)) as u64;
-            }
+    /// Seals the list; `block_words` is what `reserve` was given. The writer
+    /// must not be used afterwards.
+    pub fn finish(&mut self, block_words: usize) -> PartList {
+        if self.end.is_null() {
+            return PartList { head: std::ptr::null() };
         }
-        PartList { head: self.head }
+        // SAFETY: the block being filled starts `block_words` before `end`.
+        unsafe {
+            let current = self.end.sub(block_words);
+            *current.add(1) = self.cursor.offset_from(current.add(HEADER_WORDS)) as u64;
+            PartList { head: *current.add(2) as *const u64 }
+        }
     }
 }
 
