@@ -13,8 +13,9 @@ name: CI
 
 on:
   push:
-    # pgo-profile* branches only make a PGO profile (pgo.yml).
-    branches-ignore: ['pgo-profile*']
+    # pgo-profile* branches only make a PGO profile (pgo.yml); perf-probe*
+    # branches only run the counter probe (perf.yml).
+    branches-ignore: ['pgo-profile*', 'perf-probe*']
   pull_request:
   workflow_dispatch:
     inputs:
