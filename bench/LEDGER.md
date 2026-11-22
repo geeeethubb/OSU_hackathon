@@ -207,7 +207,8 @@ known so far is 1.38 s for `e4eef020`).
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | **0.4663 s** | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:55 UTC |
+| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | **0.4648 s** | BB-9044646E | relayed by the user 2026-11-22 about 01:40 UTC |
+| `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | 0.4663 s | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:55 UTC |
 | `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | 0.5231 s | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
 | `2dae9298f4e1e0a5259eec54c400501b00fae26f` | 0.6389 s (shown earlier as 0.64 s) | not relayed | relayed by the user 2026-11-21 |
 | `9cb9ad6e3cd0d75f160cecae8005d1c6cb8a7c4e` (candidate C) | 0.64 s | not relayed | same |
@@ -938,3 +939,18 @@ base was `b890895` and the comparison was against candidate E.
 - **Architecture rethink started** as a workflow (spec from the rules backward; three designs from
   different families made blind to the current engine, then compared with it; three adversarial reviews
   each; a ranking that picks at most two bounded prototypes). Results follow in the next entry.
+
+### 01:45 UTC
+
+- **Official: candidate F4 scored 0.4648 s** (`bad5c1b1bc3178508db7de5d7459197741497236`, receipt
+  BB-9044646E), 1.5 ms below F3's 0.4663 s. In CI the step was +4 to +20 ms depending on the runner.
+  `bench/BEST_SHA` now names F4. Calibration note: a 1.5 ms official change is inside any plausible
+  run-to-run variation of the scorer; this step tells us nothing about the slope.
+- **Attribution measured end to end** (diagnostic `SS_DIAG_ATTR=1` on branch `exp-ci-attr`, same image,
+  run 44969828387, EPYC 9V74, seeds 2 and 3): skipping attribution for persons with clicks saves
+  **67.4 / 63.8 ms of container time, 12/12 pairs** (containers 668 -> 603 and 672 -> 608 ms). Index pass
+  191.5 -> 130.7 and 194.2 -> 131.9 ms; session kernel 294 -> 84 CPU-ms; partitions 654 -> 424 CPU-ms.
+  So attribution (reach of each click, credited click per session, distinct assisting campaigns,
+  campaign cells, assists flush) costs about 230 CPU-ms, about 35% of the index pass and about 10% of
+  the container time on that runner: the largest single block outside the event parser. Its output is
+  wrong by design under the switch; the diagnostic never enters a candidate.
