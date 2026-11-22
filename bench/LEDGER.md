@@ -1660,3 +1660,71 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   exact tree: all MATCH (incl. SS_HOLD=0, 180/180 small and mutated sets, 60M). Its case is small: about
   +2.7 ms on Granite and Emerald Rapids (two batches, 206/306 pairs), neutral on Ice Lake and AMD, noise
   at 60M. F12 stays the first fallback and is the more broadly measured of the two.
+- **Ice Lake, second 8370C** (e1, run 45010384076): F12 against F11 +11.1 / +13.8 / +9.1 ms (18/18); hold
+  against F12 +4.8 / +4.5 / +10.2 (15/18); F12 A/A 9/18. Ice Lake totals: **F12 against F11 36/36 pairs,
+  median +13.0 ms (about 1.2%)**; hold against F12 46/72 over four 8370C runs, median +4.6 ms (A/A 37/72),
+  29/36 and +5.6 ms over the two clean three-image runs. Hold is positive on Ice Lake too, about 0.3-0.5%.
+- **F13's exact commit `8f817a87d2d90e196dcface1a342f9a019c477cc` against F6** (run 45010511030): 20M on a
+  Xeon 6975P-C +287.9 / +291.4 / +286.6 ms (18/18; F13 about 841 ms, F6 about 1,129 ms); **60M on a Xeon
+  8573C +989.1 ms (6/6; 3,245.6 against 4,232.1 ms), F13's 19/19 runs MATCH `/reference`, peak 2.14 GiB**;
+  36/36, 43/43, dev MATCH. **F13 passes its gate; `pipeline` fast-forwarded to it (10:19 UTC); PR #1 names
+  it, F12 `e89b50c` first fallback, F11 `8f39109` second.** Not submitted.
+
+### 10:25 UTC: link-row tasks of 256 KB (measured at the stage, parked)
+
+- `LINK_CHUNK` 1 MB -> 256 KB (exp-linkchunk, on F13): the link stage is on the critical path and its
+  last tasks left threads idle (idle 7.2 thread-ms of 26 ms at 4 threads on an 8573C). Exact everywhere
+  locally (incl. 60M). Laptop links_parse median 19.2 against 20.6 ms at 8 threads (5 runs each), 25.1
+  against 25.3 at 4. About 1.4 ms at 8 threads: too small to show end to end. **Not promoted alone.**
+
+### 10:31 UTC: F13 against F11 on Intel
+
+- e1, native whole images, probe b9da6d5 (13 Intel draws; F13's image hash equals hold `1718c6e`'s):
+  **F13 faster in 221/234 pairs, median +9.1 ms (about 1.15%)**; F11 A/A 118/234, +0.2 ms. Xeon 6975P-C x11
+  186/198 (+8.5 ms, every run at least 15/18); Xeon 8573C 18/18 (+21.1 ms, 2.0%); **Xeon 8370C (Ice Lake)
+  17/18 (+15.4 ms, 1.4%; its A/A noisy, so roughly +10 to +20)**. Consistent with F12's and hold's steps.
+
+### 10:53 UTC: survivors looked up in hash order: rejected
+
+- **`064d508` (SS_SORTED, on F13)**: a partition's survivors gathered with mix(user), counting-sorted into
+  2048 buckets by the hash's top bits and looked up in that order (the same ring), so the bitmap and rank
+  words are visited in ascending address order. Exact everywhere locally (incl. 60M). Laptop neutral
+  (forward 338 against 329 ms). **e1, 18 Intel draws: against F13 45/324 pairs, median -7.6 ms; Xeon 8573C
+  6/126, -29.4 ms (cpu_dedup_forward 684 -> 803 ms, +17.5%); 6975P-C 39/198, -3.3 ms; the same image with
+  SS_SORTED=0 against it: 8573C forward +12%, 6975P-C neutral. REJECTED.** Reading: on Granite Rapids the
+  ring of 16 already overlaps the bitmap misses; on Emerald Rapids the gather and scatter (2 x 32 bytes per
+  survivor) cost more than the ordered lookups save.
+
+### 11:13 UTC: winners filtered by a bitset: a win on both vendors; F14 in its gate
+
+- **`245e9bd` (SS_BITWIN, on F13)**: a first pass marks, per bucket of keys (eight buckets per record, the
+  once and twice bits of 64 buckets side by side: 64 KB for a 20,000-record partition), which buckets get
+  two or more records; only those records (every copy of a repeated ID among them, about one in eight) go
+  through the winner table, sized for at most twice the repeats; the rest are sole copies and win. The
+  same losers. Exact everywhere locally (60M, the large-revenue and many-values sets at 1, 4 and 8
+  threads, SS_BITWIN=0). Laptop neutral (winners 190 against 188 ms).
+- **e1, 12 Intel draws (8 6975P-C, 3 8573C, 1 6973P-C), against F13: 191/216 pairs, median +6.7 ms
+  (about 0.85%)**; 8573C 51/54, +9.8 ms; 6975P-C 129/144, +6.2 ms (every run positive on every seed);
+  same image against SS_BITWIN=0: 201/216, +6.1 ms; dedup stage wall 246.4 -> 240.0 ms (lower in
+  213/216), cpu_dedup_forward -2.3% too. F13 A/A 107/216. No Ice Lake in 120 filtered draws.
+  **CI run 45014790892 (EPYC 7763): +5.0 / +6.6 / +11.1 ms (16/18); same image with SS_BITWIN=0 -1.0 /
+  -10.4 / -8.1 (default faster); dedup stage 274-282 against 283-293 ms.**
+- **F14 = `df11202`** (scratch-f14) = F13 `8f817a8` + `245e9bd`; build inputs = `245e9bd`. In flight: the
+  local gate, CI fresh seeds 211 / 223 / 227 (exp-bitwin-b) and 60M (exp-bitwin-c) against F13.
+- **Ice Lake (e1, two Xeon 8370C, run 45016242167)**: bitwin against F13 +11.6 / +6.5 / +5.6 and +10.9 / +5.0 /
+  +11.5 ms: **30/36 pairs, median +8.6 ms (about 0.8%)**; same image against SS_BITWIN=0 27/36, +8.4 ms; F13
+  A/A 22/36, +1.6 ms; dedup stage 301.5 -> 294.1 ms (lower in 34/36).
+- **CI, against F13**: fresh seeds 211 / 223 / 227 (never used before; run 45016215767, EPYC 9V45) +5.0 /
+  +14.8 / +5.0 ms (12/18); run 45016223488 (EPYC 7763) +9.4 / +9.4 / +6.5 ms (16/18), its 60M part (EPYC
+  9V74) -20.2 ms (2/6) inside that runner's A/A noise (median abs 21.9 ms, max 91.1; "no measurable
+  difference"), bitwin's 19/19 runs MATCH `/reference`, peak 2.14 GiB.
+- **F14's local gate on its exact tree (`df11202`)**: unit tests, 36/36, 43/43, dev and dev_new, new 20M and
+  old 20M seeds 2 and 3, every mutated set with and without SS_VERIFY, the switches (index mode, both
+  kernels, SS_FAST=0, SS_PENDING=1, SS_DEFER=0, SS_RECYCLE=0, SS_RELEASE=0, SS_HOLD=0, SS_BITWIN=0), dev_new
+  at 1, 3 and 4 threads, new 60M; ten engine modes over fixtures and dev; 180/180 small and mutated sets:
+  **all MATCH**.
+
+### 11:24 UTC: F14 for its exact-commit gate
+
+- **F14 = this commit** (branch scratch-f14; `pipeline` moves to it only if this commit's own CI run against
+  F6 with [60m] passes): F13 `8f817a8` + `245e9bd`; build inputs = `245e9bd`.

@@ -4,9 +4,20 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 10:08 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 11:24 UTC, shopping-sessions-5)
 
-- **Candidate F13 = this commit** = F12 + the general path's credited sessions and assists kept in
+- **Candidate F14 = this commit** = F13 + pass B's winners filtered by a bitset of buckets of keys
+  (`SS_BITWIN`: only records whose key may repeat go through the winner table); build inputs =
+  `245e9bd`. F13 `8f817a8` is the first fallback, F12 `e89b50c` the second.
+  Bitwin against F13: Intel 191/216 pairs (+6.7 ms, about 0.85%; e1, 12 draws), Ice Lake 30/36 (+8.6 ms),
+  AMD CI +5.0 / +6.6 / +11.1 ms (16/18) and +9.4 / +9.4 / +6.5 (16/18), fresh seeds 211 / 223 / 227 +5.0 /
+  +14.8 / +5.0 (12/18), 60M noise with 19/19 MATCH; local gate all MATCH (LEDGER 11:13 and after).
+- Rejected since 10:08: survivors looked up in hash order; parked: link-row tasks of 256 KB (stage-level
+  gain only).
+
+## Checkpoint 2026-11-22 10:08 UTC (superseded above)
+
+- **F13 `8f817a8` (then the candidate, now the first fallback)** = F12 + the general path's credited sessions and assists kept in
   compact per-cell counts (`SS_HOLD`; index mode's mechanism); build inputs = `1718c6e`. F12 `e89b50c`
   is the first fallback (the stronger-measured one), F11 `8f39109` the second.
   Hold against F12: Intel 206/306 pairs over two batches (about +2.7 ms, 0.35%, on Granite and Emerald
