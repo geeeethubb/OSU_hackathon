@@ -804,3 +804,36 @@ base was `b890895` and the comparison was against candidate E.
   disturbed (A/A pairs up to +-264 ms); repeated as run 44966494904.
 - **Candidate F3 (this push):** F2 + fixes + K + G(a). Unit tests 53/53, fixtures 36/36 and 43/43,
   dev, 20M seeds 2 and 3 MATCH locally. Its CI run pairs it against F with the 60M check.
+
+### 00:50 UTC
+
+- **Calibration, measured (branch `exp-calib`, run 44967358977).** The seven officially scored commits
+  timed on one runner (AMD EPYC 7763, 2 cores x 2 threads), 20M seed 2, six shuffled rounds of fresh
+  containers after one warm-up each:
+  | commit | CI container median (min) ms | official |
+  |---|---:|---:|
+  | `e4eef020` | 2,015.2 (2,007.0) | 1.38 s |
+  | `23b285da` | 1,141.6 (1,139.2) | 0.84 s |
+  | `2b2cccd1` | 936.9 (931.9) | 0.71 s |
+  | `4567e953` | 896.3 (891.8) | 0.66 s |
+  | `2dae9298` | 820.0 (809.3) | 0.6389 s |
+  | `9cb9ad6e` | 864.5 (831.6) | 0.64 s |
+  | `10339560` (F) | 678.0 (673.3) | 0.5231 s |
+  Least squares: official ms = 102 + 0.64 x CI ms with all seven points; 66 + 0.68 x CI ms without the
+  oldest (high-leverage) one. Residuals within +-15 ms, the size of the old two-decimal rounding.
+  **What this supports:** on that runner type, about two thirds of a CI millisecond shows up officially,
+  and a part of 65 to 100 ms of the official time does not move with our CI time (the scorer's own
+  container handling, timing method, or work of ours that is the same in every commit: not separable
+  here). **What it implies, as arithmetic only:** 0.278 s would need about 270 to 310 ms of CI container
+  time on this runner type, against about 640 ms for F3: roughly 55% less container time, or about 60%
+  less process time (the CI time includes 55 to 75 ms of a no-op container). Seven points and one runner
+  type: a calibration, not a law.
+- **Candidate F3 `8dde2af12e542b0df94ba6d0be3da4f8660f896d` against F** (run 44967278499, EPYC 9V74):
+  **+42.5 / +38.9 / +42.2 ms, 18/18 pairs**, A/A medians -0.0 / -6.6 / +0.6; all runs MATCH. 60M (EPYC
+  9V45): 1,323.3 -> 1,240.0 ms, +84.8 ms, 5/6 pairs, MATCH; peak memory 1.69 GiB (F2: 1.86 GiB).
+  By the calibration above, about 20 to 30 official ms, if it carries over. Fresh seeds 41 / 43 / 47 are
+  running (run 44968021383).
+- **F2 code `c8676bf`, fresh seeds 29 / 31 / 37** (run 44966494904, EPYC 7763, A/A within 14 ms):
+  +18.2 / +19.1 / +29.5 ms, 18/18 pairs. F2 is confirmed and named in the PR until F3 is.
+- **In CI:** declined event rows straight to the general kernel (`1b73234`, G(b) step 1, against F3,
+  variant `SS_RARE=a`).
