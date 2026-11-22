@@ -160,6 +160,7 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
     let lost = &mut scratch.long_lost;
     lost.clear();
     lost.resize(most_records / 64 + 1, 0);
+    let started = scratch.measure.then(std::time::Instant::now);
     let mut sequence = 0u32;
     for_each_long_record(lists, |first, value, _, word1, _| {
         let ingest = (word1 >> 1) & INGEST_MASK;
@@ -194,7 +195,13 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
         }
         sequence += 1;
     });
+    let between = scratch.measure.then(std::time::Instant::now);
     let lost = &scratch.long_lost;
+    // As in `dedup_coded`: survivors wait in a small ring while their
+    // person-table slot loads.
+    let mut ring = [[0u64; 3]; AHEAD];
+    let mut waiting = 0usize;
+    let mut slot = 0usize;
     let mut sequence = 0u32;
     for_each_long_record(lists, |_, _, word0, word1, purchase| {
         let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
@@ -202,8 +209,26 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
         if (word0 & 1) & !is_lost == 0 {
             return;
         }
-        forward(links, out, word0, word1, purchase);
+        links.prefetch(word1 >> 22);
+        if waiting == AHEAD {
+            let [old0, old1, old_purchase] = ring[slot];
+            forward(links, out, old0, old1, old_purchase);
+        } else {
+            waiting += 1;
+        }
+        ring[slot] = [word0, word1, purchase];
+        slot = (slot + 1) % AHEAD;
     });
+    // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
+    let first = if waiting == AHEAD { slot } else { 0 };
+    for offset in 0..waiting {
+        let [word0, word1, purchase] = ring[(first + offset) % AHEAD];
+        forward(links, out, word0, word1, purchase);
+    }
+    if let (Some(started), Some(between)) = (started, between) {
+        scratch.winners_nanos += (between - started).as_nanos() as u64;
+        scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+    }
 }
 
 /// Dedup the coded event IDs of one partition and forward the survivors.
