@@ -4,31 +4,31 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 05:05 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 05:20 UTC, shopping-sessions-5)
 
 - **Accepted official best: F6 `2676ee043442f0c33357a6f07f3548ae6ead3a4e` = 0.7493 s** (BB-86EAB76C;
-  board as relayed 05:00: #1 0.5084 s, #2 0.5469 s, us #19). `bench/BEST_SHA` = F6; `pipeline` = F6.
+  board as relayed 05:00: #1 0.5084 s, #2 0.5469 s, us #19). `bench/BEST_SHA` = F6.
   Validated: 20M seeds 2/3/5 +46-49 ms vs F5 (18/18), fresh seeds 59/61/67 +63-67 ms (18/18), 60M
   3,445 vs 3,649 ms with `/reference` 19/19 MATCH, peak 2.57 GiB; locally 60M MATCH.
 - Earlier on this dataset: F5 `32b8fff` 0.7698 s (BB-4A6C474E), `9735a63` 1.2745 s (BB-32BE0EA7);
   F4 (index mode, outside the rules) 5.6629 s. Old-dataset scores are not comparable.
-- **Chain after F6 (local `master` of this checkout, not on `pipeline`):** `ce34ce4`+`dbaac1c` PGO
-  profile of F6 (+16/+25 ms vs F6 on EPYC 7763, run 44984655347); `50ed2ee` general-path assembly event
-  kernel (same image, compiled kernel 39-60 ms slower in three runs, but those images were PGO builds
-  whose profile was trained with the assembly running: the compiled kernel had no counts there);
-  `af75107` profile regenerated on that source (= F7); `0978393` mixed name reused from the probe
-  (+4/+12/+16 ms vs F7, 17/18, EPYC 7763); `dfd16d0` click map with the probe ring (unmeasured alone).
-- **Open question blocking F7:** on Intel runners (Xeon 8573C, 6975P-C) the PGO+assembly images
-  have a slower pass B (click map 171-203 -> 292-293, forward 763 -> 905 thread-ms, in the
-  same-image variant too); not on EPYC 7763. Replicates running: F6+PGO (`67e4892`, branches
-  exp-ci-pgo-r1/r2) and the new code without PGO (`a33259f` with variant SS_KERNEL=plain, branches
-  exp-ci-nopgo, -r1, -r2), each against F6. The no-PGO variant is the clean compiled-vs-assembly
-  comparison. Decision rule: a successor must win on Intel runners, not only on EPYC.
+- **F7 candidate = `7bb3836` + this ledger commit** (on `pipeline` from 05:20): F6 + general-path
+  assembly event kernel + mixed name reused from the probe + click map with the probe ring, **no PGO**.
+  Same build inputs as `a33259f`, which beat F6 on every runner sampled: Xeon 8573C +61-68 ms (18/18),
+  EPYC 7763 +41-46 (17/18), EPYC 9V45 +15-30 (17/18) (LEDGER 05:20). Local gate passed incl. 60M MATCH.
+  CI on the pushed commit ([60m]) and a fresh-seed dispatch pending; PR #1 names it only once they pass.
+- **PGO is rejected for the scored build:** on Intel it slows pass B (click map 195 -> 287 thread-ms)
+  and loses 13-19 ms; neutral on EPYC 9V74. The earlier "assembly loses on Intel" reading came from PGO
+  images whose profile had no counts for the compiled kernel; without PGO the compiled kernel loses
+  45-56 ms on the 8573C (1/54 pairs across three CPUs).
 - **Laptop timing:** shared with the session osu-hackathon-e1. All CPU-heavy laptop work goes through
   `ss_work/tools/timed.sh` (lock directory `ss_work/bench.lock`); CI ranks, the laptop only screens.
-- Next after the Intel question: one structural parse bet (long-ID rows: 24% of rows, 41% of event
-  parse, about 105 vs 49 ns a row; see LEDGER 04:50) chosen by a design review; the e1 session's
-  hardware-counter probe (CI branch perf-probe-f7) informs it.
+- **Next:** e1's sampling probe of F7 (`bench/experiments/cost_model_probe.md` on e1's branch
+  perf-probe-f7; no runner exposes hardware counters): on Intel, 39% of the short-row assembly loop waits
+  on the row's own bytes (about 9% of all CPU; under 2% on AMD), and 26-29% of `event_lean_long` waits
+  on the user-table slot whose prefetch is issued in the same row. Bounded, exact experiment: input
+  lead-ahead prefetch in the row loops (same-image variant, Intel runners), then the long-row probe
+  moved rows ahead.
 
 ## Performance model on the current data (reset 03:00-03:27 UTC; MEASURED unless marked)
 

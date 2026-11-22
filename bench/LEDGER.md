@@ -1188,3 +1188,33 @@ base was `b890895` and the comparison was against candidate E.
 - **Hashed-name reuse (`0978393`) against `af75107`: +4.4 / +12.1 / +16.1 ms (17/18, EPYC 7763, run
   44986525475)**: forward 706 -> 680 thread-ms. Click map with the probe ring (`dfd16d0`): in the no-PGO
   pair. **Nothing with PGO goes to the submission watch until the Intel question is settled.**
+
+### 05:20 UTC: the Intel pass-B rise is PGO; PGO dropped; F7 rebuilt without it passes the local gate
+
+Five replicate runs, each against F6 (seeds 2 / 3 / 5, six AB/BA pairs per seed; A-B > 0 = candidate faster).
+Build for both sides: rustc 1.100.0 in `rust:1.100.0-slim-bookworm`, `-C target-cpu=x86-64-v3 -C
+target-feature=+crt-static`.
+
+| Candidate | Runner CPU | Run | A-B per seed | Pairs won |
+|---|---|---|---|---|
+| PGO alone (`67e4892` = F6 source + profile of F6) | Xeon Platinum 8573C | 44987313196 | -15.8 / -12.8 / -19.3 ms | 3/18 |
+| PGO alone | EPYC 9V74 | 44987315179 | +8.9 / -8.0 / -17.8 ms | 6/18 |
+| New code without PGO (`a33259f`) | Xeon Platinum 8573C | 44987255379 | **+68.0 / +64.4 / +61.3 ms** | **18/18** |
+| New code without PGO | EPYC 7763 | 44987319462 | +41.4 / +46.0 / +43.3 ms | 17/18 |
+| New code without PGO | EPYC 9V45 | 44987318036 | +15.3 / +24.5 / +30.4 ms | 17/18 |
+
+- **PGO is what slows pass B on Intel**: PGO alone on the 8573C, click map 195 -> 287 and forward 727 -> 753
+  thread-ms (seed 2); the new code without PGO on the same CPU model, click map 197 -> 175, forward 731 ->
+  726, event parse 2,374 -> 2,165 thread-ms. **PGO REJECTED for the scored build** (`7bb3836` removes it;
+  `Dockerfile` and `.dockerignore` are F6's again; `pgo.yml` stays for later profiles, never scored).
+- **Compiled against assembly kernel, both without PGO** (same image; the variant `SS_KERNEL=plain` runs
+  the compiled kernel of the same binary): the compiled kernel is slower by 54.8 / 56.2 / 44.6 ms (Xeon
+  8573C), 24.0 / 25.2 / 30.6 (EPYC 7763), 21.0 / 18.1 / 16.7 (EPYC 9V45); 1 of 54 pairs favours it. The
+  assembly kernel stays; the compiled kernel remains the fallback and the ablation.
+- **F7 = `7bb3836`** = F6 + general-path assembly event kernel + mixed name reused from the probe +
+  click map with the probe ring, no PGO; the same build inputs as `a33259f` (`git diff a33259f -- src
+  Cargo.toml Cargo.lock Dockerfile .dockerignore` is empty). Local gate on the exact tree: 57 unit tests;
+  36/36 + 43/43 fixtures; dev_new, new 20M, old 20M MATCH; seeds 11/12/13 at 1,000 and 30,000 events and
+  the mutated long-ID 200K set MATCH with `SS_VERIFY=1` and without; dev_new and new 20M with
+  `SS_VERIFY=1` MATCH; dev_new with `SS_KERNEL=plain`, `SS_STRUCT=1`, `SS_FAST=0` MATCH; **new 60M MATCH
+  against the complete local reference**. CI on `pipeline` with [60m], and fresh seeds, next.
