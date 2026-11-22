@@ -91,6 +91,15 @@ struct Profile {
 }
 
 #[inline(always)]
+/// Diagnostic only (`SS_DIAG_ATTR=1`): sessions of persons with clicks are
+/// not attributed at all (their campaign cells are left out), so a paired
+/// run against the normal path measures what attribution costs end to end.
+/// The output is then wrong by design; never set it in a scored run.
+fn skip_attribution() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("SS_DIAG_ATTR").is_some_and(|value| value == "1"))
+}
+
 fn time_stamp() -> u64 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: reading the time stamp counter has no preconditions.
@@ -1448,7 +1457,8 @@ fn finish_batch(
     // Attribution, for the persons with clicks: each one's sessions and rows
     // are laid out the way one person's are, and its sessions go to the
     // cells of the campaigns they are credited to.
-    for &person in &batch.clicked[..batch.clicked_count] {
+    let clicked = if skip_attribution() { 0 } else { batch.clicked_count };
+    for &person in &batch.clicked[..clicked] {
         let person = person as usize;
         let (from, to) = (batch.first_session[person] as usize, batch.first_session[person + 1] as usize);
         let count = to - from;
@@ -2067,7 +2077,7 @@ fn finish_person(
     }
     work.profile.lap(5);
 
-    let has_clicks = !clicks.is_empty();
+    let has_clicks = !clicks.is_empty() && !skip_attribution();
     if has_clicks {
         if sessions <= 64 {
             attribute_narrow(params, tuning, work, click_exotic, sessions, rows, clicks);
