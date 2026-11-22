@@ -994,7 +994,7 @@ base was `b890895` and the comparison was against candidate E.
 - **Attribution split, MEASURED** (same-image variants of `SS_DIAG_ATTR`, branch `exp-ci-attr2`, seed 2):
   | skipped | runner | container | partitions CPU-ms | kernel CPU-ms |
   |---|---|---|---|---|
-  | all attribution | Xeon 6973P-C | -67.8 ms (12/12... 6/6) | 553 -> 374 | 231 -> 67 |
+  | all attribution | Xeon 6973P-C | -67.8 ms (6/6) | 553 -> 374 | 231 -> 67 |
   | assists only | EPYC 9V74 | -27.9 ms (5/6) | 515 -> 432 | 232 -> 168 (flush 20 -> 0) |
   | credited-cell writes only | Xeon 6975P-C | -2.5 ms (5/6) | 539 -> 511 | 229 -> 213 |
   Assists (distinct assisting campaigns per session, per person-day entries, flush) about 83 CPU-ms,
