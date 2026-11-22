@@ -87,6 +87,59 @@ pub struct ParseOut {
     pub deferred: [Deferred; DEFER],
     pub deferred_head: usize,
     pub deferred_count: usize,
+    /// The same ring for click rows with a long user ID (`defer_click`).
+    pub deferred_clicks: [DeferredClick; DEFER],
+    pub deferred_clicks_head: usize,
+    pub deferred_clicks_count: usize,
+}
+
+/// A valid click row whose user ID is long and hexadecimal, read but not
+/// yet stored: as `Deferred` for events, its user's code is looked up when
+/// it leaves the ring.
+#[derive(Clone, Copy, Default)]
+pub struct DeferredClick {
+    pub user_value: u128,
+    pub code_and_campaign: u64,
+    /// Milliseconds since `window_start - 7 days`.
+    pub ts: u64,
+    pub user_first: u8,
+}
+
+/// Puts a click into the worker's ring; the oldest click, once the ring is
+/// full, gets its user's code and is stored. A person's clicks are put in
+/// order by their time and then by their click IDs' bytes, never by their
+/// place in a worker's list (whose order across chunks depends on the
+/// threads anyway), so the order within it does not matter.
+#[inline(always)]
+pub fn defer_click(ctx: &Ctx, out: &mut ParseOut, click: DeferredClick) {
+    let at = out.deferred_clicks_head;
+    if out.deferred_clicks_count == DEFER {
+        let oldest = out.deferred_clicks[at];
+        store_deferred_click(ctx, out, &oldest);
+    } else {
+        out.deferred_clicks_count += 1;
+    }
+    out.deferred_clicks[at] = click;
+    out.deferred_clicks_head = (at + 1) % DEFER;
+}
+
+/// Stores a deferred click as `emit_click` would have.
+#[inline(always)]
+fn store_deferred_click(ctx: &Ctx, out: &mut ParseOut, click: &DeferredClick) {
+    let user = ctx.user_ids.hex_code(click.user_first, click.user_value);
+    emit_code_click(out, user, click.code_and_campaign, click.ts);
+}
+
+/// Stores every click still in the worker's ring, oldest first.
+pub fn flush_deferred_clicks(ctx: &Ctx, out: &mut ParseOut) {
+    let count = out.deferred_clicks_count;
+    let first = (out.deferred_clicks_head + DEFER - count) % DEFER;
+    for offset in 0..count {
+        let click = out.deferred_clicks[(first + offset) % DEFER];
+        store_deferred_click(ctx, out, &click);
+    }
+    out.deferred_clicks_count = 0;
+    out.deferred_clicks_head = 0;
 }
 
 /// Rows a worker's lookups of long user IDs trail its parse by.
@@ -176,6 +229,9 @@ impl ParseOut {
             deferred: [Deferred::default(); DEFER],
             deferred_head: 0,
             deferred_count: 0,
+            deferred_clicks: [DeferredClick::default(); DEFER],
+            deferred_clicks_head: 0,
+            deferred_clicks_count: 0,
         }
     }
 }
@@ -1242,6 +1298,7 @@ pub fn parse_clicks_chunk_with(
             emit_click(out, &click);
         }
     });
+    flush_deferred_clicks(ctx, out);
 }
 
 pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out: &mut ParseOut) {
