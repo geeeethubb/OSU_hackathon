@@ -83,6 +83,25 @@ Switches (each keeps the previous behaviour for same-image comparisons): `SS_STR
 `SS_STREAM=0`, `SS_RELEASE=0`, `SS_EXIT=drop`, `SS_INDEX_SHIFT`, `SS_VERIFY=1`, `SS_TIMING=1`,
 `SS_DIAG=1|7|8` (diagnostics, stop after the parse).
 
+## Final candidate procedure (from about 13:00 UTC on 2026-11-22)
+
+1. Freeze: no new experiments merged after 14:30 UTC. The candidate is whatever head of `pipeline` has
+   passed the gate below; if none has since the last official score, the officially scored commit
+   stays the named one. Never name a commit whose CI run is still pending.
+2. Gate, all on the combined tree, not on its steps: `cargo test --release`; 36 + 43 fixtures; dev
+   MATCH; 20M seeds 2 and 3 MATCH locally; CI run with `[60m]`: 18/18 or at least 15/18 pairs faster
+   than `bench/BEST_SHA` on three seeds with A/A medians inside +-10 ms, one fresh-seed dispatch run
+   (three seeds never used for tuning) also positive on every seed, 60M MATCH with container time and
+   peak memory no worse than the baseline's; the local switch sweep (`scratchpad/lead/extended3.sh`)
+   all MATCH.
+3. Hand-off text for the submission watch: full 40-character SHA read from `git rev-parse` and checked
+   with `git cat-file -e`; baseline SHA; what changed; the CI run links; raw paired medians and A/A;
+   fresh seeds; 60M; known limitations (CPU dependence, anything measured on one runner type only).
+4. After the official result is relayed: record it in the ledger's official table, move
+   `bench/BEST_SHA` only if it is the new best, update the PR's "Commit to submit".
+5. Leave the repository in a state where the named commit builds from the root Dockerfile with no
+   uncommitted change needed.
+
 ## Working rules that cost time when forgotten
 
 - Windows laptop: no Docker/WSL; containers are timed only in GitHub Actions (push to any branch runs
