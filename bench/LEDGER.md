@@ -1218,3 +1218,66 @@ target-feature=+crt-static`.
   the mutated long-ID 200K set MATCH with `SS_VERIFY=1` and without; dev_new and new 20M with
   `SS_VERIFY=1` MATCH; dev_new with `SS_KERNEL=plain`, `SS_STRUCT=1`, `SS_FAST=0` MATCH; **new 60M MATCH
   against the complete local reference**. CI on `pipeline` with [60m], and fresh seeds, next.
+
+### 05:30 UTC: F7 `fe76c21` validated and named in PR #1 (not submitted)
+
+- Push run 44988697139 (EPYC 9V74): +56.1 / +26.2 / +38.1 ms against F6, 17/18; 36/36, 43/43, MATCH.
+- Fresh seeds 71 / 73 / 79 (run 44988705502, EPYC 7763): **+59.7 / +42.4 / +45.2 ms, 18/18**.
+- 60M (same run 44988697139, EPYC 7763): 3,360 against F6's 3,541 ms, **+170.8 ms, 6/6**; `/reference`
+  exit 0 and 25/25 runs MATCH; peak 2.55 GiB.
+
+### 06:00 UTC: Intel's input stall found and removed; long-user lookups deferred (F8 = `284f1ca`)
+
+Where the time went on Intel (e1 session, cpu-clock sampling of F7 on Xeon 6973P-C and 8573C; no
+runner exposes hardware counters): 39% of the short-row assembly loop sat on the row's own bytes (its
+first loads and the newline look-ahead), about 9% of all CPU; under 2% at the same spots on AMD. The
+mapped input is 4 KB pages from the page cache; Intel's L2 streamer stops at every 4 KB boundary.
+
+- **Input lead (`907111d`)**: every row of the assembly loop, every declined row and every click row asks
+  for the two lines 2 KB ahead (`prefetcht0`; `SS_LEAD` sets the distance, 0 = none). A hint: the output
+  cannot change. **DEMONSTRATED on Intel, neutral on AMD:**
+
+  | Runner | Run | Same image, default against SS_LEAD=0 | Against F7 |
+  |---|---|---|---|
+  | Xeon 6975P-C (container) | 44990110363 | **+174.7 / +183.7 / +173.6 ms, 18/18** | +179.5 / +183.6 / +173.8, 18/18 |
+  | Xeon Platinum 8573C (container) | 44990116851 | **+111.5 / +106.3 / +106.2 ms, 18/18** | +114.8 / +116.8 / +109.5, 18/18 |
+  | Xeon 8370C, Ice Lake (native, e1) | 44990212917 | +60.0 / +63.5 / +64.3 ms, 18/18 (-5.2 to -5.4%) | |
+  | Xeon 8370C, Ice Lake (native, e1) | 44990225475 | +59.8 / +61.7 / +67.7 ms, 18/18 | |
+  | Xeon 6973P-C (native, e1) | 44990230836 | +162.6 / +165.6 / +172.9 ms, 18/18 | |
+  | EPYC 7763 (container) | 44989104877 | -0.9 / -2.7 / +2.9 ms | -3.4 / +1.8 / +4.6 |
+  | EPYC 7763 (container) | 44989119938 | +4.1 / -6.2 / -1.1 ms | -2.3 / +3.2 / -1.2 |
+  | EPYC 9V74 (container) | 44989113105 | +29.8 / +1.5 / +2.7 ms | +9.9 / -26.4 / -5.3 (noisy runner) |
+  | EPYC 9V74 (container) | 44990123690 | +1.1 / +2.4 / -5.7 ms | -5.7 / -9.7 / -17.9 (noisy runner) |
+
+  (Every number: the default's saving, positive = the lead faster.) AMD: within the A/A spread. Event parse on the
+  8573C: 2,121 -> 1,706 thread-ms; on the 6975P-C 1,958 -> 1,295. 4096 against 2048: no better on Intel
+  (e1: +4.2 / +4.7 / -0.8 ... +12.8 for 2048) nor on AMD (7763 -9.8 / -4.8 / +8.8; 9V45 +1.1 / +6.0 / +1.3);
+  1024: +4.3 / +3.3 / +2.0 on a 7763. **2048 kept.** Laptop (AMD Zen 5): 2048 costs about 2.8%; not a target.
+- **Long-user lookups deferred (`284f1ca`)**: a valid row with a long user ID waits in a ring of 8 per
+  worker; its user-table slot (prefetched while the row is read) is looked up and the row stored when it
+  leaves the ring; every chunk ends with the ring empty. Dedup compares records by content (smallest
+  ingest_ts wins; equal copies are identical), so the order within a worker's lists does not matter; the
+  design review's three exactness verifiers found no counterexample. Same image, SS_DEFER=0 against
+  the default: **EPYC 9V74 -6.8 / -17.6 / -15.4 ms (17/18), EPYC 7763 -9.7 / -6.4 / -9.9 ms (16/18)** in
+  favour of the ring (runs 44989633264, 44989638836). F7 + lead + ring against F7 on AMD: +13 to +23 ms
+  (52/54 pairs; push run 44989631461 and the two variant runs). **Intel (e1, native, same pairs): Xeon
+  6975P-C +8.9 / +16.2 / +10.2 ms (18/18, run 44990712011) and +11.3 / +14.4 / +10.3 (16/18, run
+  44990722735); Xeon 8573C +5.2 / +8.9 / +4.1 (14/18, run 44990716350).** DEMONSTRATED on both vendors.
+- **Dropped:** record scans of pass B asking for the next block (`168b8fc`): same image on an EPYC 7763
+  the scan was 2.6 / 8.8 / 1.5 ms slower (run 44990015068), and e1's Intel profile of `907111d` shows no
+  list-scan stall in pass B or C (list loads under 3% of pass B, 0.4% of pass C). REJECTED.
+- **F8 = `284f1ca`** (F7 + lead + ring). Local: unit tests, 36/36 + 43/43, small seeds and the mutated
+  long-ID set with and without SS_VERIFY, dev_new at 8 and 3 threads, new and old 20M, new 60M against
+  the complete local reference: all MATCH, ring on and off. **CI gate against F7 (branch `exp-f8`, the
+  same code with BEST_SHA = F7): seeds 2 / 3 / 5 +21.2 / +19.1 / +15.0 ms (17/18, EPYC 9V74, run
+  44990663454; 36/36, 43/43, MATCH); fresh seeds 83 / 89 / 97 +1.3 / +9.0 / +13.4 ms (13/18, EPYC 7763,
+  run 44990671232); 60M 2,778 against F7's 2,923 ms, +137.9 ms (6/6), `/reference` 25/25 MATCH, peak
+  2.54 GiB.** On Intel its parts: the lead +106 to +184 ms in containers and +63 to +68 ms natively on
+  Ice Lake on F8's own code, the ring +5 to +16 ms natively. F8 is the new candidate.
+- **Staged person lookup again (`3dfb62a`, b336354 ported onto F8)**, aimed at the pass-B link-bitmap load
+  (24.7% of pass B on the 8573C). e1, native, default against SS_STAGED=0: Xeon 6975P-C +14.3 / +13.1 /
+  +13.5 ms (18/18); Xeon 8573C +5.0 / -1.6 / +4.8 (10/18); **Xeon 8370C (Ice Lake) -1.1 / -8.1 / -9.6 ms
+  (3/18, run 44991136473)**. Slower on the class closest to the scorer: **REJECTED.** The same Ice Lake
+  run read the lead on F8's code again: +67.8 / +64.5 / +62.8 ms, 18/18.
+- In flight: the link rows' input lead (`8937270`, on F8), and a long-ID path for click rows (rows with a
+  long ID are 23.3% of click rows and about 5.7% of CPU on the 8573C).

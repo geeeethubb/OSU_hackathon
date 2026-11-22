@@ -4,7 +4,20 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 05:20 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 06:00 UTC, shopping-sessions-5)
+
+- **Candidate F8 = `284f1ca` + its ledger commit (head of `pipeline`)**: F7 + input lead 2 KB ahead in the
+  row loops (`SS_LEAD`) + long-user lookups trailing the parse in a ring of 8 (`SS_DEFER`). Gate passed
+  against F7 (LEDGER 06:00): +15 to +21 ms on seeds 2/3/5 and +1 to +13 on fresh seeds on AMD, 60M
+  +137.9 ms with 25/25 MATCH and 2.54 GiB; on Intel the lead alone is +106 to +184 ms (containers,
+  Xeon 6975P-C and 8573C) and +60 to +68 ms (native, Ice Lake 8370C), the ring +5 to +16 ms.
+- Rejected since 05:20: the staged person lookup (slower on Ice Lake and AMD), the pass-B scan prefetch
+  (slower on AMD, no stall to remove on Intel). In flight: the link rows' lead (`8937270`) and a long-ID
+  path for click rows (rows with a long ID: 23% of clicks, about 5.7% of CPU on the 8573C).
+- The e1 session's Intel measurements: cpu-clock annotates and native AB/BA pairs on Intel draws (its
+  branches perf-probe-*; record in its `bench/experiments/cost_model_probe.md`).
+
+## Checkpoint 2026-11-22 05:20 UTC (superseded above)
 
 - **Accepted official best: F6 `2676ee043442f0c33357a6f07f3548ae6ead3a4e` = 0.7493 s** (BB-86EAB76C;
   board as relayed 05:00: #1 0.5084 s, #2 0.5469 s, us #19). `bench/BEST_SHA` = F6.
