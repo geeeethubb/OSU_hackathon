@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::Instant;
 
 use self::arena::{PartList, PartWriter};
-use self::codes::Interner;
+use self::codes::{Exotic, Interner};
 use self::io::Mapped;
 use self::parse::ParseOut;
 use self::dedup::{PassBOut, ScratchB};
@@ -443,9 +443,12 @@ enum Attempt {
 /// Runs the optimized engine. `Ok(false)` means nothing was written and the
 /// caller must use the reference pipeline for this input.
 pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> {
-    // Index mode is tried first unless `SS_STRUCT=0`; it only engages when
-    // the data has the generator's keys and layout.
-    let indexed = !std::env::var_os("SS_STRUCT").is_some_and(|value| value == "0");
+    // The general path, which treats every ID as an opaque string, is the
+    // engine. Index mode read generated IDs as the generator's numbers; the
+    // rules now say IDs must be treated as opaque variable-width strings, and
+    // current generated data no longer fits it. It stays reachable for
+    // experiments on old data only, with `SS_STRUCT=1`.
+    let indexed = std::env::var_os("SS_STRUCT").is_some_and(|value| value == "1");
     let mut attempt = run_once(data, output, threads, indexed)?;
     if matches!(attempt, Attempt::NotIndexed) {
         attempt = run_once(data, output, threads, false)?;
@@ -751,7 +754,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     timing.stage("dedup");
 
     let click_exotic = ctx.click_ids.snapshot();
-    let user_exotic = ctx.user_ids.snapshot();
+    let user_exotic = ctx.user_ids.snapshot_with(true);
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
     // Each thread's user_daily file, written while the rows are produced.
     let sinks = UserSink::slots(&ctx, output, threads, &user_exotic);
@@ -1008,9 +1011,9 @@ fn pattern_characters(code: u64) -> (u64, usize) {
 
 /// The user ID behind a name code, for `GroupWriter::runs`.
 #[inline]
-fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a [Box<[u8]>]) -> Text<'a> {
+fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a Exotic) -> Text<'a> {
     if code >= codes::EXOTIC_BASE {
-        return Text::Long(&exotic[(code - codes::EXOTIC_BASE) as usize]);
+        return Text::Long(exotic.text((code - codes::EXOTIC_BASE) as usize));
     }
     let (characters, count) = pattern_characters(code);
     slot[0] = b'u';
@@ -1053,7 +1056,7 @@ struct UserSink<'a> {
     ctx: &'a Ctx,
     folder: std::path::PathBuf,
     thread: usize,
-    user_exotic: &'a [Box<[u8]>],
+    user_exotic: &'a Exotic,
     gzip: &'a [&'a str],
     /// `false` with `SS_STREAM=0`.
     streaming: bool,
@@ -1074,7 +1077,7 @@ struct UserSink<'a> {
 
 impl<'a> UserSink<'a> {
     /// One sink per thread.
-    fn slots(ctx: &'a Ctx, output: &Path, threads: usize, user_exotic: &'a [Box<[u8]>]) -> Slots<Self> {
+    fn slots(ctx: &'a Ctx, output: &Path, threads: usize, user_exotic: &'a Exotic) -> Slots<Self> {
         let streaming = !std::env::var_os("SS_STREAM").is_some_and(|value| value == "0");
         let mut thread = 0;
         Slots::new(threads, || {
@@ -1250,7 +1253,7 @@ fn write_tables(
     threads: usize,
     workers: &[PassCOut],
     sinks: &mut [UserSink],
-    user_exotic: &[Box<[u8]>],
+    user_exotic: &Exotic,
 ) -> std::io::Result<()> {
     let timing = Timing::new();
     let started = Instant::now();
@@ -1312,7 +1315,7 @@ fn write_tables_at_end(
     output: &Path,
     threads: usize,
     workers: &[PassCOut],
-    user_exotic: &[Box<[u8]>],
+    user_exotic: &Exotic,
     stats: &OutputStats,
 ) -> std::io::Result<()> {
     let mut pieces: Vec<(&PassCOut, usize, usize)> = Vec::new();
@@ -1408,7 +1411,7 @@ fn write_user_daily(
     rows: &PassCOut,
     start: usize,
     end: usize,
-    user_exotic: &[Box<[u8]>],
+    user_exotic: &Exotic,
 ) -> std::io::Result<bool> {
     let top_category = &rows.top_category[start..end];
     // Days with purchases go last in their row group: the other rows then
@@ -1593,7 +1596,7 @@ mod tests {
             let (characters, count) = pattern_characters(code);
             assert_eq!(&characters.to_le_bytes()[..count], &expected[1..], "code {code}");
             let mut slot = [0xEEu8; parquet::SHORT_TEXT];
-            match user_name(code, &mut slot, &[]) {
+            match user_name(code, &mut slot, &Exotic::default()) {
                 Text::Short(length) => assert_eq!(&slot[..length], &expected[..]),
                 Text::Long(_) => panic!("a pattern code is short"),
             }
@@ -1613,7 +1616,7 @@ mod tests {
         for id in ids {
             let code = codes::pattern_code(id, b'u').unwrap();
             let mut slot = [0u8; parquet::SHORT_TEXT];
-            match user_name(code, &mut slot, &[]) {
+            match user_name(code, &mut slot, &Exotic::default()) {
                 Text::Short(length) => assert_eq!(&slot[..length], id),
                 Text::Long(_) => panic!("a pattern code is short"),
             }
@@ -1626,10 +1629,10 @@ mod tests {
             state ^= state << 17;
             check(state % codes::EXOTIC_BASE);
         }
-        let exotic: Vec<Box<[u8]>> = vec![(&b"U1"[..]).into(), (&b" a long exotic user id "[..]).into()];
+        let exotic = Exotic::from_list(&[&b"U1"[..], &b" a long exotic user id "[..]]);
         let mut slot = [0u8; parquet::SHORT_TEXT];
         match user_name(codes::EXOTIC_BASE + 1, &mut slot, &exotic) {
-            Text::Long(bytes) => assert_eq!(bytes, &exotic[1][..]),
+            Text::Long(bytes) => assert_eq!(bytes, exotic.text(1)),
             Text::Short(_) => panic!("an exotic code is long"),
         }
     }

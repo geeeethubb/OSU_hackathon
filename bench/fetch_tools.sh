@@ -15,10 +15,11 @@ set -euo pipefail
 
 DIR=${1:?usage: fetch_tools.sh DIR}
 BASE=${SS_FILES_URL:-https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files}
-# The archives as first fetched for this harness (2026-11-21). A different hash
+# The archives as republished on the track page on 2026-11-22 (about 01:30 UTC;
+# the first ones, of 2026-11-21, were 13724cad... and 7eb8e1f0...). A different hash
 # means the organizers republished: read the track page before trusting old numbers.
-KNOWN_GENERATOR=13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e
-KNOWN_ANSWER=7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9
+KNOWN_GENERATOR=78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a
+KNOWN_ANSWER=c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20
 
 mkdir -p "$DIR"
 if [ -x "$DIR/generate" ] && [ -s "$DIR/dev-answer/user_daily.csv" ] && [ -s "$DIR/dev-answer/campaign_daily.csv" ]; then

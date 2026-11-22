@@ -39,7 +39,7 @@
 use std::cmp::Ordering;
 
 use super::arena::PartList;
-use super::codes::{id_cmp, unmix, CODE_MASK};
+use super::codes::{id_cmp, unmix, Exotic, CODE_MASK};
 use super::Ctx;
 use crate::util::{DAY_MS, SESSION_GAP_MS, WEEK_MS};
 
@@ -914,7 +914,7 @@ impl ScratchC {
     pub fn one_person(
         &mut self,
         out: &mut PassCOut,
-        click_exotic: &[Box<[u8]>],
+        click_exotic: &Exotic,
         name: u64,
         events: &mut [u32],
         count: usize,
@@ -935,7 +935,7 @@ impl ScratchC {
     pub fn one_person_in_order(
         &mut self,
         out: &mut PassCOut,
-        click_exotic: &[Box<[u8]>],
+        click_exotic: &Exotic,
         name: u64,
         events: &[u32],
         purchases: &[[u64; 2]],
@@ -952,7 +952,7 @@ impl ScratchC {
     /// `one_person_in_order` gives for the same events; they reach `out`
     /// when the batch is full or at `finish_batch`.
     #[inline(always)]
-    pub fn begin_person(&mut self, out: &mut PassCOut, click_exotic: &[Box<[u8]>], ts: u32) -> Person {
+    pub fn begin_person(&mut self, out: &mut PassCOut, click_exotic: &Exotic, ts: u32) -> Person {
         if self.batch_is_full() {
             self.finish_batch(out, click_exotic);
         }
@@ -987,7 +987,7 @@ impl ScratchC {
         &mut self,
         sessions: Sessions,
         out: &mut PassCOut,
-        click_exotic: &[Box<[u8]>],
+        click_exotic: &Exotic,
         name: u64,
         purchases: &[[u64; 2]],
         clicks: &[[u64; 2]],
@@ -1051,7 +1051,7 @@ impl ScratchC {
     /// Rows and cells of the persons in the batch. Must be called before
     /// `flush` and before any use of the scratch for something else than
     /// whole persons; the assists stay pending until `flush`.
-    pub fn finish_batch(&mut self, out: &mut PassCOut, click_exotic: &[Box<[u8]>]) {
+    pub fn finish_batch(&mut self, out: &mut PassCOut, click_exotic: &Exotic) {
         if self.batch.persons != 0 {
             finish_batch(&self.params, self.tuning, &mut self.work, &mut self.batch, out, click_exotic);
         }
@@ -1391,7 +1391,7 @@ fn finish_batch(
     work: &mut Work,
     batch: &mut Batch,
     out: &mut PassCOut,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
 ) {
     let (sessions, persons) = (batch.sessions, batch.persons);
     batch.entries[sessions] = [0, (persons as u64) << OWNER_SHIFT | batch.events];
@@ -1800,7 +1800,7 @@ fn reach_by_count(starts: &[u32], blocks: usize, floor: u32, ts: u32) -> (usize,
 /// the only one there the carried click it hides is older still, out of
 /// reach like itself, so the sweep's own reach test gives the same answer.
 #[inline(always)]
-fn offer(best: &mut [u64], clicks: &[[u64; 2]], click_exotic: &[Box<[u8]>], at: usize, from: usize) {
+fn offer(best: &mut [u64], clicks: &[[u64; 2]], click_exotic: &Exotic, at: usize, from: usize) {
     let click = clicks[at];
     let candidate = (click[0] + 1) << 32 | at as u64;
     let current = best[from];
@@ -1849,7 +1849,7 @@ fn attribute_narrow(
     params: &Params,
     tuning: Tuning,
     work: &mut Work,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     sessions: usize,
     rows: usize,
     clicks: &[[u64; 2]],
@@ -1918,7 +1918,7 @@ fn attribute_narrow(
 fn attribute_wide(
     params: &Params,
     work: &mut Work,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     sessions: usize,
     rows: usize,
     clicks: &[[u64; 2]],
@@ -1976,7 +1976,7 @@ fn person(
     tuning: Tuning,
     work: &mut Work,
     out: &mut PassCOut,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     name: u64,
     events: &mut [u32],
     count: usize,
@@ -2005,7 +2005,7 @@ fn person_in_order(
     tuning: Tuning,
     work: &mut Work,
     out: &mut PassCOut,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     name: u64,
     events: &[u32],
     purchases: &[[u64; 2]],
@@ -2027,7 +2027,7 @@ fn finish_person(
     tuning: Tuning,
     work: &mut Work,
     out: &mut PassCOut,
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     name: u64,
     sessions: usize,
     purchases: &[[u64; 2]],
@@ -2132,7 +2132,7 @@ pub fn sessions_partition(
     part: usize,
     event_lists: &[PartList],
     click_lists: &[PartList],
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     out: &mut PassCOut,
     scratch: &mut ScratchC,
 ) {
@@ -2145,7 +2145,7 @@ fn partition_core(
     part: usize,
     event_lists: &[PartList],
     click_lists: &[PartList],
-    click_exotic: &[Box<[u8]>],
+    click_exotic: &Exotic,
     out: &mut PassCOut,
     scratch: &mut ScratchC,
 ) {
@@ -2305,7 +2305,7 @@ mod tests {
         category_names: Vec<Box<[u8]>>,
         /// Campaigns including `organic`, the last one.
         campaigns: usize,
-        exotic: Vec<Box<[u8]>>,
+        exotic: Exotic,
     }
 
     impl World {
@@ -2319,7 +2319,7 @@ mod tests {
                 day_count: ((window_start + i64::from(length) - 1).div_euclid(DAY_MS) - first_day + 1) as usize,
                 category_names: boxed(categories),
                 campaigns,
-                exotic: boxed(exotic),
+                exotic: Exotic::from_list(exotic),
             }
         }
     }
@@ -2599,7 +2599,7 @@ mod tests {
     fn give_to_batch(
         scratch: &mut ScratchC,
         out: &mut PassCOut,
-        exotic: &[Box<[u8]>],
+        exotic: &Exotic,
         name: u64,
         stream: &[(u32, Option<u64>)],
         clicks: &[[u64; 2]],

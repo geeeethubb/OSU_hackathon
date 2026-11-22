@@ -33,7 +33,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
-use super::codes::{id_cmp, mix, unmix, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE, P37};
+use super::codes::{id_cmp, mix, unmix, Exotic, Interner, CODE_BITS, CODE_MASK, EXOTIC_BASE, P37};
 use super::keys::{Keys, MASK as NUMBER_MASK};
 use crate::reference::FastHasher;
 
@@ -598,7 +598,7 @@ struct Forest<'a> {
     /// The bits of a node that say which ID it holds: occupied, spill, hash.
     key_mask: u64,
     /// Exotic IDs by index, to compare them by their bytes.
-    exotic: &'a [Box<[u8]>],
+    exotic: &'a Exotic,
     /// An ID found no room within `MAX_SPILL` lines of its home line; the
     /// forest is of no use from then on.
     overflowed: bool,
@@ -611,7 +611,7 @@ struct Forest<'a> {
 }
 
 impl<'a> Forest<'a> {
-    fn new(line_bits: u32, exotic: &'a [Box<[u8]>]) -> Self {
+    fn new(line_bits: u32, exotic: &'a Exotic) -> Self {
         debug_assert!((MIN_LINE_BITS..=MAX_LINE_BITS).contains(&line_bits));
         // Lines after the last home line take what spills out of it.
         let slot_count = ((1usize << line_bits) + MAX_SPILL + 1) * LINE_SLOTS;
@@ -863,7 +863,7 @@ fn build_within(
 /// found no room in it.
 fn build_in_forest(
     pairs: &[Vec<(u64, u64)>],
-    exotic: &[Box<[u8]>],
+    exotic: &Exotic,
     group: &impl Fn(u64) -> Option<u64>,
     line_bits: u32,
 ) -> Option<Table> {
@@ -1474,7 +1474,7 @@ fn find(parent: &mut [u32], mut at: u32) -> u32 {
 /// any input.
 fn build_general(
     pairs: &[Vec<(u64, u64)>],
-    exotic: &[Box<[u8]>],
+    exotic: &Exotic,
     group: &impl Fn(u64) -> Option<u64>,
 ) -> Table {
     let pair_count: usize = pairs.iter().map(Vec::len).sum();
@@ -2323,9 +2323,9 @@ mod tests {
         // them cannot fit one of half the usual size.
         let code = |number: usize| pattern_code(format!("u{number}").as_bytes(), b'u').unwrap();
         let list: Vec<(u64, u64)> = (0..2500).map(|at| (code(2 * at), code(2 * at + 1))).collect();
-        assert!(build_in_forest(&[list.clone()], &[], &|_| Some(0), MIN_LINE_BITS).is_none());
-        assert!(build_in_forest(&[list.clone()], &[], &|_| Some(0), 9).is_none());
-        let table = build_in_forest(&[list], &[], &|_| Some(0), 10).expect("room for 5000 IDs in 8192 slots");
+        assert!(build_in_forest(&[list.clone()], &Exotic::default(), &|_| Some(0), MIN_LINE_BITS).is_none());
+        assert!(build_in_forest(&[list.clone()], &Exotic::default(), &|_| Some(0), 9).is_none());
+        let table = build_in_forest(&[list], &Exotic::default(), &|_| Some(0), 10).expect("room for 5000 IDs in 8192 slots");
         for at in 0..2500 {
             assert_eq!(table.lookup(code(2 * at)), (code(2 * at), false));
             assert_eq!(table.lookup(code(2 * at + 1)), (code(2 * at), false));

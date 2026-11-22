@@ -1,14 +1,22 @@
-//! Compact, exact integer codes for IDs.
+//! Compact, exact integer codes for IDs, which are opaque strings.
 //!
-//! An ID shaped like the generator's (`prefix` + 1 to 8 characters of
-//! `[0-9a-z]`) maps to a number below 37^8 by reading it as a left-aligned
-//! base-37 string, so numeric order equals byte-wise order. Every other ID
-//! (upper case, spaces, long, non-ASCII) is "exotic" and gets `37^8 + index`
-//! from an interner. Both together fit 42 bits and are exact: equal codes
-//! mean equal IDs.
+//! An ID of a prefix and 1 to 8 characters of `[0-9a-z]` maps to a number
+//! below 37^8 by reading it as a left-aligned base-37 string, so numeric
+//! order equals byte-wise order. Every other ID is "exotic" and gets
+//! `37^8 + index` from an interner. Both together fit 42 bits and are exact:
+//! equal codes mean equal IDs. The codes encode the text of an ID and nothing
+//! else; no ID is read as a number of whoever made it.
+//!
+//! Exotic IDs of one shape are common (one in eight distinct IDs of current
+//! generated data): one character and 32 lowercase hexadecimal digits. Those
+//! are interned by their 128-bit value in a table split in 256 shards with a
+//! lock each, so that the parse threads do not wait on one another and no ID
+//! needs a heap block of its own; every other exotic ID goes to one map.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub const P37: [u64; 9] =
@@ -66,35 +74,237 @@ pub fn decode_pattern(code: u64, prefix: u8, out: &mut Vec<u8>) {
     }
 }
 
-#[derive(Default)]
-struct InternerInner {
-    index: HashMap<Box<[u8]>, u32>,
-    list: Vec<Box<[u8]>>,
+/// Lowercase hexadecimal digits: their value, 0xFF for any other byte.
+const fn hex_values() -> [u8; 256] {
+    let mut table = [0xFFu8; 256];
+    let mut at = 0;
+    while at < 10 {
+        table[b'0' as usize + at] = at as u8;
+        at += 1;
+    }
+    at = 0;
+    while at < 6 {
+        table[b'a' as usize + at] = 10 + at as u8;
+        at += 1;
+    }
+    table
+}
+static HEX_VALUE: [u8; 256] = hex_values();
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// The value of an ID of one character and 32 lowercase hexadecimal digits.
+#[inline]
+fn hex_id(id: &[u8]) -> Option<u128> {
+    if id.len() != 33 {
+        return None;
+    }
+    let half = |digits: &[u8]| -> Option<u64> {
+        let mut value = 0u64;
+        let mut bad = 0u8;
+        for &byte in digits {
+            let digit = HEX_VALUE[byte as usize];
+            bad |= digit;
+            value = value << 4 | u64::from(digit & 15);
+        }
+        // A digit is at most 15, so any 0xFF shows in the high bits.
+        (bad < 16).then_some(value)
+    };
+    let high = half(&id[1..17])?;
+    let low = half(&id[17..33])?;
+    Some(u128::from(high) << 64 | u128::from(low))
 }
 
-/// Exotic IDs of one kind (events, users or clicks). Rare in generated data.
+/// The keys are outputs of a keyed bijection or otherwise arbitrary: one
+/// multiply spreads them over the buckets.
 #[derive(Default)]
+struct HexHasher(u64);
+
+impl Hasher for HexHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, value: u128) {
+        let folded = (value as u64) ^ ((value >> 64) as u64).rotate_left(29);
+        self.0 = (self.0 ^ folded).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type HexShard = HashMap<(u8, u128), u32, BuildHasherDefault<HexHasher>>;
+const HEX_SHARDS: usize = 256;
+
+/// Exotic IDs of one kind (events, users or clicks).
 pub struct Interner {
-    inner: Mutex<InternerInner>,
+    /// The next exotic index, for both maps.
+    next: AtomicU32,
+    generic: Mutex<HashMap<Box<[u8]>, u32>>,
+    hex: Box<[Mutex<HexShard>]>,
+}
+
+impl Default for Interner {
+    fn default() -> Self {
+        Interner {
+            next: AtomicU32::new(0),
+            generic: Mutex::new(HashMap::new()),
+            hex: (0..HEX_SHARDS).map(|_| Mutex::new(HexShard::default())).collect(),
+        }
+    }
 }
 
 impl Interner {
-    #[cold]
+    /// The code of an exotic ID.
     #[inline(never)]
     pub fn code(&self, id: &[u8]) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(&at) = inner.index.get(id) {
+        match hex_id(id) {
+            Some(value) => EXOTIC_BASE + u64::from(self.hex_index(id[0], value)),
+            None => self.generic_code(id),
+        }
+    }
+
+    #[inline]
+    fn hex_index(&self, first: u8, value: u128) -> u32 {
+        let mut shard = self.hex[(value >> 120) as usize].lock().unwrap();
+        if let Some(&at) = shard.get(&(first, value)) {
+            return at;
+        }
+        let at = self.next.fetch_add(1, AtomicOrdering::Relaxed);
+        shard.insert((first, value), at);
+        at
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn generic_code(&self, id: &[u8]) -> u64 {
+        let mut generic = self.generic.lock().unwrap();
+        if let Some(&at) = generic.get(id) {
             return EXOTIC_BASE + u64::from(at);
         }
-        let at = inner.list.len() as u32;
-        inner.index.insert(id.into(), at);
-        inner.list.push(id.into());
+        let at = self.next.fetch_add(1, AtomicOrdering::Relaxed);
+        generic.insert(id.into(), at);
         EXOTIC_BASE + u64::from(at)
     }
 
-    /// The exotic IDs interned so far, by index.
-    pub fn snapshot(&self) -> Vec<Box<[u8]>> {
-        self.inner.lock().unwrap().list.clone()
+    /// The exotic IDs interned so far, by index. `materialize`: every ID as
+    /// bytes (for output); otherwise hexadecimal IDs stay values, which is
+    /// enough to compare and print them.
+    pub fn snapshot_with(&self, materialize: bool) -> Exotic {
+        let count = self.next.load(AtomicOrdering::Acquire) as usize;
+        let mut entries = vec![Entry::Bytes { start: 0, end: 0 }; count];
+        let mut arena: Vec<u8> = Vec::new();
+        for (id, &at) in self.generic.lock().unwrap().iter() {
+            if (at as usize) < count {
+                let start = arena.len() as u32;
+                arena.extend_from_slice(id);
+                entries[at as usize] = Entry::Bytes { start, end: arena.len() as u32 };
+            }
+        }
+        for shard in self.hex.iter() {
+            for (&(first, value), &at) in shard.lock().unwrap().iter() {
+                if (at as usize) >= count {
+                    continue;
+                }
+                entries[at as usize] = if materialize {
+                    let start = arena.len() as u32;
+                    arena.push(first);
+                    push_hex(value, &mut arena);
+                    Entry::Bytes { start, end: arena.len() as u32 }
+                } else {
+                    Entry::Hex { first, value }
+                };
+            }
+        }
+        Exotic { entries, arena }
+    }
+
+    /// The exotic IDs interned so far, by index (hexadecimal ones as values).
+    pub fn snapshot(&self) -> Exotic {
+        self.snapshot_with(false)
+    }
+}
+
+#[inline]
+fn push_hex(value: u128, out: &mut Vec<u8>) {
+    for shift in (0..32).rev() {
+        out.push(HEX_DIGITS[((value >> (shift * 4)) & 15) as usize]);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Entry {
+    Bytes { start: u32, end: u32 },
+    Hex { first: u8, value: u128 },
+}
+
+/// The exotic IDs of one kind by index, as `Interner::snapshot` saw them.
+#[derive(Default)]
+pub struct Exotic {
+    entries: Vec<Entry>,
+    arena: Vec<u8>,
+}
+
+impl Exotic {
+    /// From IDs given as bytes, index by index (tests and small tables).
+    pub fn from_list<T: AsRef<[u8]>>(list: &[T]) -> Self {
+        let mut exotic = Exotic::default();
+        for id in list {
+            let start = exotic.arena.len() as u32;
+            exotic.arena.extend_from_slice(id.as_ref());
+            exotic.entries.push(Entry::Bytes { start, end: exotic.arena.len() as u32 });
+        }
+        exotic
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Appends the bytes of exotic ID `index`.
+    pub fn append(&self, index: usize, out: &mut Vec<u8>) {
+        match self.entries[index] {
+            Entry::Bytes { start, end } => out.extend_from_slice(&self.arena[start as usize..end as usize]),
+            Entry::Hex { first, value } => {
+                out.push(first);
+                push_hex(value, out);
+            }
+        }
+    }
+
+    /// The bytes of exotic ID `index`, when the snapshot holds them as bytes
+    /// (always, for a snapshot made with `materialize`).
+    pub fn text(&self, index: usize) -> &[u8] {
+        match self.entries[index] {
+            Entry::Bytes { start, end } => &self.arena[start as usize..end as usize],
+            Entry::Hex { .. } => panic!("exotic ID {index} was not materialized"),
+        }
+    }
+
+    /// Byte-wise order of two exotic IDs, when both are hexadecimal values of
+    /// the same first character (fixed width, digits below letters in ASCII:
+    /// the text order is the numeric order).
+    #[inline]
+    fn hex_order(&self, a: usize, b: usize) -> Option<Ordering> {
+        match (self.entries[a], self.entries[b]) {
+            (Entry::Hex { first: fa, value: va }, Entry::Hex { first: fb, value: vb }) if fa == fb => Some(va.cmp(&vb)),
+            _ => None,
+        }
     }
 }
 
@@ -108,17 +318,17 @@ pub fn id_code(id: &[u8], prefix: u8, interner: &Interner) -> u64 {
 }
 
 /// Appends the bytes of the ID behind `code`.
-pub fn id_bytes(code: u64, prefix: u8, exotic: &[Box<[u8]>], out: &mut Vec<u8>) {
+pub fn id_bytes(code: u64, prefix: u8, exotic: &Exotic, out: &mut Vec<u8>) {
     if code < EXOTIC_BASE {
         decode_pattern(code, prefix, out);
     } else {
-        out.extend_from_slice(&exotic[(code - EXOTIC_BASE) as usize]);
+        exotic.append((code - EXOTIC_BASE) as usize, out);
     }
 }
 
 /// Byte-wise order of the IDs behind two codes of the same kind.
 #[inline]
-pub fn id_cmp(a: u64, b: u64, prefix: u8, exotic: &[Box<[u8]>]) -> Ordering {
+pub fn id_cmp(a: u64, b: u64, prefix: u8, exotic: &Exotic) -> Ordering {
     if a < EXOTIC_BASE && b < EXOTIC_BASE {
         return a.cmp(&b);
     }
@@ -127,9 +337,14 @@ pub fn id_cmp(a: u64, b: u64, prefix: u8, exotic: &[Box<[u8]>]) -> Ordering {
 
 #[cold]
 #[inline(never)]
-fn id_cmp_slow(a: u64, b: u64, prefix: u8, exotic: &[Box<[u8]>]) -> Ordering {
-    let mut left = Vec::with_capacity(16);
-    let mut right = Vec::with_capacity(16);
+fn id_cmp_slow(a: u64, b: u64, prefix: u8, exotic: &Exotic) -> Ordering {
+    if a >= EXOTIC_BASE && b >= EXOTIC_BASE {
+        if let Some(order) = exotic.hex_order((a - EXOTIC_BASE) as usize, (b - EXOTIC_BASE) as usize) {
+            return order;
+        }
+    }
+    let mut left = Vec::with_capacity(40);
+    let mut right = Vec::with_capacity(40);
     id_bytes(a, prefix, exotic, &mut left);
     id_bytes(b, prefix, exotic, &mut right);
     left.cmp(&right)
@@ -188,6 +403,48 @@ mod tests {
         assert_eq!(codes.iter().map(|(_, id)| *id).collect::<Vec<_>>(), sorted_ids);
         for exotic in [&b"u"[..], b"U1", b"u1A", b" u1", b"u123456789", b"e1", b"u1 "] {
             assert_eq!(pattern_code(exotic, b'u'), None);
+        }
+    }
+
+    #[test]
+    fn hex_ids_intern_exactly_and_order_like_bytes() {
+        let interner = Interner::default();
+        let ids: Vec<Vec<u8>> = vec![
+            b"ue1f1e03abf0a711a0019d40e7ca04632".to_vec(),
+            b"u00000000000000000000000000000000".to_vec(),
+            b"uffffffffffffffffffffffffffffffff".to_vec(),
+            b"ue1f1e03abf0a711a0019d40e7ca04633".to_vec(),
+            b"ve1f1e03abf0a711a0019d40e7ca04632".to_vec(),
+            b"uE1F1E03ABF0A711A0019D40E7CA04632".to_vec(),
+            b"ue1f1e03abf0a711a0019d40e7ca0463".to_vec(),
+            b"ue1f1e03abf0a711a0019d40e7ca046321".to_vec(),
+            b"ug1f1e03abf0a711a0019d40e7ca04632".to_vec(),
+            b"u9efba8ez".to_vec(),
+            b"u".to_vec(),
+        ];
+        let codes: Vec<u64> = ids.iter().map(|id| id_code(id, b'u', &interner)).collect();
+        // Equal IDs, equal codes; different IDs, different codes.
+        for (a, id_a) in ids.iter().enumerate() {
+            assert_eq!(id_code(id_a, b'u', &interner), codes[a]);
+            for (b, id_b) in ids.iter().enumerate() {
+                assert_eq!(codes[a] == codes[b], id_a == id_b, "{a} {b}");
+            }
+        }
+        for materialize in [false, true] {
+            let exotic = interner.snapshot_with(materialize);
+            for (id, &code) in ids.iter().zip(&codes) {
+                let mut out = Vec::new();
+                id_bytes(code, b'u', &exotic, &mut out);
+                assert_eq!(&out, id);
+                if materialize && code >= EXOTIC_BASE {
+                    assert_eq!(exotic.text((code - EXOTIC_BASE) as usize), &id[..]);
+                }
+            }
+            for (a, id_a) in ids.iter().enumerate() {
+                for (b, id_b) in ids.iter().enumerate() {
+                    assert_eq!(id_cmp(codes[a], codes[b], b'u', &exotic), id_a.cmp(id_b), "{a} {b}");
+                }
+            }
         }
     }
 

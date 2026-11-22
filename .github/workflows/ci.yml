@@ -61,7 +61,7 @@ env:
   BENCH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   IMAGE: shopping-sessions:latest
   DIAG_IMAGE: ss-diag:latest
-  TOOLS_KEY: ss-tools-v1
+  TOOLS_KEY: ss-tools-v2
   PYTHONDONTWRITEBYTECODE: "1"
   # Harness self-test: behave as if this commit had no root Dockerfile.
   STANDIN: ${{ inputs.standin }}

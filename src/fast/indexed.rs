@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::arena::PartList;
-use super::codes::{unmix, CODE_MASK};
+use super::codes::{unmix, Exotic, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::{LinkTable, SIMPLE, SLOW};
@@ -479,7 +479,7 @@ pub struct Shared<'a> {
     pub links: &'a LinkTable,
     pub clicks: &'a ClickIndex,
     pub extras: &'a Extras,
-    pub click_exotic: &'a [Box<[u8]>],
+    pub click_exotic: &'a Exotic,
     /// Index partitions and worker threads, to size the output columns.
     pub parts: usize,
     pub threads: usize,
