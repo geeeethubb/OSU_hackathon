@@ -777,8 +777,8 @@ fn id_cmp_slow(a: u64, b: u64, prefix: u8, exotic: &Exotic) -> Ordering {
 // A bijection on 42-bit values whose high bits depend on every input bit:
 // multiply, fold the top half down, multiply. It cuts a code into a
 // (partition, local key) pair that can be put back together exactly.
-const MIX_A: u64 = (0x2D3_5A5D_9C4B & CODE_MASK) | 1;
-const MIX_B: u64 = (0x1B7_3E2F_A6D5 & CODE_MASK) | 1;
+pub const MIX_A: u64 = (0x2D3_5A5D_9C4B & CODE_MASK) | 1;
+pub const MIX_B: u64 = (0x1B7_3E2F_A6D5 & CODE_MASK) | 1;
 
 const fn inverse_mod_2_42(value: u64) -> u64 {
     // Newton's iteration doubles the number of correct low bits each round.

@@ -482,16 +482,19 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
 ) -> usize {
     use super::simd::{event_kernel, LeanFrame, KERNEL_GENERAL, KERNEL_LEAN, KERNEL_LEAN_PLAIN, MODE_ROW, MODE_STORE};
     let kernel = event_kernel();
-    // The kernel in assembly is for index mode.
-    let assembly = INDEXED && kernel == KERNEL_LEAN;
+    // The kernel in assembly: in index mode, and on the general path with
+    // IDs coded by their text (`SS_KERNEL=plain` keeps the compiled one).
+    let assembly = kernel == KERNEL_LEAN;
     // Its loop with the store inside, where the writers are as that takes them.
-    let run = assembly && MODE == MODE_STORE && LeanFrame::stores(ctx);
+    let run = INDEXED && assembly && MODE == MODE_STORE && LeanFrame::stores(ctx);
+    let run_codes = !INDEXED && assembly && MODE == MODE_STORE && LeanFrame::stores_codes(ctx);
     match kernel {
         KERNEL_GENERAL => events_rows_loop::<MODE, INDEXED, KERNEL_GENERAL>(ctx, buffer, position, end, out),
         // Checked rows go one by one through the loop that compares them.
         _ if MODE == MODE_ROW && assembly => {
             events_rows_loop::<MODE, INDEXED, KERNEL_LEAN>(ctx, buffer, position, end, out)
         }
+        _ if run_codes && ctx.diag == 0 => events_assembly_run_codes(ctx, buffer, position, end, out),
         _ if MODE == MODE_ROW => events_rows_loop::<MODE, INDEXED, KERNEL_LEAN_PLAIN>(ctx, buffer, position, end, out),
         // Index mode has no diagnostic modes of its own: SS_DIAG=2 and 7 pick them here.
         _ if INDEXED && MODE == MODE_STORE && ctx.diag == 2 => {
@@ -508,9 +511,65 @@ fn events_fast_loop<const MODE: u32, const INDEXED: bool>(
         // Timing only: the store into one block (elsewhere SS_DIAG=8 stores as usual).
         _ if run && ctx.diag == 8 => events_assembly_run::<8>(ctx, buffer, position, end, out),
         _ if run => events_assembly_run::<0>(ctx, buffer, position, end, out),
-        _ if assembly => events_assembly_loop::<MODE>(ctx, buffer, position, end, out),
+        _ if INDEXED && assembly => events_assembly_loop::<MODE>(ctx, buffer, position, end, out),
         _ => events_lean_loop::<MODE, INDEXED>(ctx, buffer, position, end, out),
     }
+}
+
+/// The kernel in assembly on the general path, rows stored: the loop over the
+/// rows and the store (into the event partitions, as `emit_raw` stores) are
+/// in the assembly, which comes back here only for a row that needs
+/// something else: a list that needs a new block, a purchase whose product
+/// or price it leaves to `event_lean_purchase`, or a row it declines (one
+/// with a long ID, among others), which goes through the compiled kernels.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn events_assembly_run_codes(ctx: &Ctx, buffer: &[u8], mut position: usize, end: usize, out: &mut ParseOut) -> usize {
+    use super::simd::{
+        event_lean_common, event_lean_purchase, event_lean_run_codes, lean_setup, LeanFrame, MODE_STORE, ROW_PAD,
+    };
+    let stop = end.min(buffer.len()).min(buffer.len().saturating_sub(ROW_PAD));
+    let (lean, _) = lean_setup(ctx);
+    let mut row = EventRow::default();
+    // The assembly reads up to 16 bytes before a row.
+    while position < stop.min(16) {
+        position = event_row_plain::<MODE_STORE, false>(ctx, buffer, position, out, &mut row);
+    }
+    if position < stop {
+        let mut frame = LeanFrame::codes(ctx);
+        let frame = &mut frame as *mut LeanFrame;
+        let base = buffer.as_ptr();
+        // SAFETY (all of this): a row that starts before `stop` has ROW_PAD
+        // readable bytes after it and, here, 16 before it; the tables and the
+        // frame are those of `ctx`, whose writers `LeanFrame::stores_codes`
+        // found fit (the caller asked), taken anew for every call.
+        let mut p = unsafe { base.add(position) };
+        let last = unsafe { base.add(stop) };
+        while p < last {
+            let (status, at) = unsafe { event_lean_run_codes(lean, p, last, frame, out.events.as_mut_ptr()) };
+            p = match status {
+                0 => at,
+                3 => unsafe {
+                    // The row's list needs a new block: `emit_raw` gets it one.
+                    event_lean_common::<MODE_STORE, false>((*frame).read(status), out, &mut row);
+                    (*frame).next
+                },
+                2 => unsafe {
+                    // A purchase, read up to its product and price.
+                    event_lean_purchase::<MODE_STORE, false>(ctx, &*frame, (*frame).read(status), out, &mut row);
+                    (*frame).next
+                },
+                _ => {
+                    // Declined: the compiled kernels, from the long-ID one on.
+                    let position = unsafe { at.offset_from(base) } as usize;
+                    unsafe { base.add(event_row_declined::<MODE_STORE, false>(ctx, buffer, position, out)) }
+                }
+            };
+        }
+        position = unsafe { p.offset_from(base) } as usize;
+    }
+    std::hint::black_box(row.event);
+    position
 }
 
 /// The lean kernel in assembly (index mode) when rows are stored: the loop
@@ -574,7 +633,7 @@ fn events_assembly_run<const KIND: u32>(
                 0 => at,
                 3 if KIND == 0 => unsafe {
                     // The row's list needs a new block: `emit_indexed` gets it one.
-                    event_lean_common::<MODE_STORE>((*frame).read(status), out, &mut row);
+                    event_lean_common::<MODE_STORE, true>((*frame).read(status), out, &mut row);
                     (*frame).next
                 },
                 3 => {
@@ -641,7 +700,7 @@ fn events_assembly_loop<const MODE: u32>(
             let read = unsafe { event_lean_asm(lean, p, frame) };
             if read.status == 0 {
                 unsafe {
-                    event_lean_common::<MODE>(read, out, &mut row);
+                    event_lean_common::<MODE, true>(read, out, &mut row);
                     p = (*frame).next;
                 }
                 continue;
@@ -700,9 +759,9 @@ fn event_row_rare<const MODE: u32>(
         // row, which ends right before `next`, inside the buffer.
         unsafe {
             if status == 2 {
-                super::simd::event_lean_purchase::<MODE>(ctx, &*frame, read, out, row);
+                super::simd::event_lean_purchase::<MODE, true>(ctx, &*frame, read, out, row);
             } else {
-                super::simd::event_lean_bought::<MODE>(&*frame, read, out, row);
+                super::simd::event_lean_bought::<MODE, true>(&*frame, read, out, row);
             }
             return (*frame).next.offset_from(buffer.as_ptr()) as usize;
         }
@@ -853,8 +912,9 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
     let limit = end.min(buffer.len());
     let safe = buffer.len().saturating_sub(ROW_PAD);
     let mut row = EventRow::default();
-    // The kernel in assembly, where it is asked for: index mode only.
-    let mut frame = (INDEXED && KERNEL == KERNEL_LEAN).then(|| LeanFrame::new(ctx));
+    // The kernel in assembly, where it is asked for: in index mode, and on
+    // the general path with IDs coded by their text.
+    let mut frame = (KERNEL == KERNEL_LEAN).then(|| if INDEXED { LeanFrame::new(ctx) } else { LeanFrame::codes(ctx) });
     while position < limit && position < safe {
         // SAFETY: at least ROW_PAD readable bytes follow `position`, and
         // where the assembly runs at least 16 come before it.
@@ -864,7 +924,7 @@ fn events_rows_loop<const MODE: u32, const INDEXED: bool, const KERNEL: u32>(
                 event_row_fast::<MODE, INDEXED>(ctx, p, out, &mut row)
             } else {
                 match frame.as_mut() {
-                    Some(frame) if position >= 16 => event_row_lean_asm::<MODE>(ctx, frame, p, out, &mut row),
+                    Some(frame) if position >= 16 => event_row_lean_asm::<MODE, INDEXED>(ctx, frame, p, out, &mut row),
                     _ => event_row_lean::<MODE, INDEXED>(ctx, p, out, &mut row),
                 }
             }

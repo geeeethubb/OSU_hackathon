@@ -775,6 +775,19 @@ pub struct LeanTables {
     /// known to be one): where its form's constants are in these tables.
     form_of_length: [u16; 129],
     forms: TimeForms,
+    /// The general path's kernel in assembly codes IDs by their text, as
+    /// `two_codes` does: bytes classed as digits (less `0`, at most 9) and
+    /// letters (less `a`, at most 25), their values (digit plus 1, letter
+    /// plus 11), then base 37 by pairs, fours and eights.
+    code_zero: [u8; 16],
+    code_nine: [u8; 16],
+    code_a: [u8; 16],
+    code_letters: [u8; 16],
+    code_one: [u8; 16],
+    code_eleven: [u8; 16],
+    code_pairs: [i16; 8],
+    code_fours: [i32; 4],
+    code_eights: [u64; 2],
 }
 
 /// A shuffle index that gives zero, a limit every byte is within, a ceiling
@@ -1020,6 +1033,15 @@ impl LeanTables {
                 gap: [0; 248],
                 day,
             },
+            code_zero: [b'0'; 16],
+            code_nine: [9; 16],
+            code_a: [b'a'; 16],
+            code_letters: [25; 16],
+            code_one: [1; 16],
+            code_eleven: [11; 16],
+            code_pairs: [0x0125; 8],
+            code_fours: [0x0001_0559; 4],
+            code_eights: [1_874_161; 2],
         }
     }
 }
@@ -2288,6 +2310,293 @@ macro_rules! lean_run {
     };
 }
 
+/// Both IDs by their text (the general path): the prefix (`e`, `u`) and 7
+/// or 8 characters of `[0-9a-z]` each, coded as `two_codes` codes them (the
+/// eight bytes after the prefix, base 37, a missing eighth character as 0).
+/// r9 and r10 become the event's and the user's code; xmm3 is cleared for
+/// the timestamps' step, as nothing about the IDs is left for it to test.
+/// The classing constants are in xmm9 to xmm15 (`lean_asm_codes!`).
+macro_rules! lean_codes {
+    () => {
+        concat!(
+            "vmovq xmm0, qword ptr [rdi + r9 + 1]\n",
+            "vpinsrq xmm0, xmm0, qword ptr [rdi + r10 + 1], 1\n",
+            // Each text is its prefix and 7 or 8 characters: rcx and r14
+            // become 0 or 1, how many more than 7.
+            "sub rcx, r9\n",
+            "sub r14, r10\n",
+            "sub rcx, 8\n",
+            "sub r14, 8\n",
+            "mov rax, rcx\n",
+            "or rax, r14\n",
+            "cmp rax, 1\n",
+            "ja 2f\n",
+            "cmp byte ptr [rdi + r9], 101\n",
+            "jne 2f\n",
+            "cmp byte ptr [rdi + r10], 117\n",
+            "jne 2f\n",
+            // Digits (xmm2) and letters (xmm4); values in xmm1.
+            "vpsubb xmm1, xmm0, xmm9\n",
+            "vpminub xmm2, xmm1, xmm10\n",
+            "vpcmpeqb xmm2, xmm2, xmm1\n",
+            "vpsubb xmm3, xmm0, xmm11\n",
+            "vpminub xmm4, xmm3, xmm12\n",
+            "vpcmpeqb xmm4, xmm4, xmm3\n",
+            "vpaddb xmm1, xmm1, xmm13\n",
+            "vpand xmm1, xmm1, xmm2\n",
+            "vpaddb xmm3, xmm3, xmm14\n",
+            "vpand xmm3, xmm3, xmm4\n",
+            "vpor xmm1, xmm1, xmm3\n",
+            "vpor xmm2, xmm2, xmm4\n",
+            "vpmovmskb eax, xmm2\n",
+            // The characters must be exactly 7 or 8 of each ID: bytes 0..7,
+            // and byte 7 for an ID of 8 (of the user's: bytes 8..15, 15).
+            "shl rcx, 7\n",
+            "shl r14, 15\n",
+            "lea r15, [rcx + r14 + 0x7F7F]\n",
+            "cmp eax, r15d\n",
+            "jne 2f\n",
+            // Base 37, most significant character first.
+            "vpmaddubsw xmm1, xmm1, xmm15\n",
+            "vpmaddwd xmm1, xmm1, xmmword ptr [rsi + {code_fours}]\n",
+            "vpmuludq xmm2, xmm1, xmmword ptr [rsi + {code_eights}]\n",
+            "vpsrlq xmm1, xmm1, 32\n",
+            "vpaddq xmm1, xmm1, xmm2\n",
+            "vmovq r9, xmm1\n",
+            "vpextrq r10, xmm1, 1\n",
+            "vpxor xmm3, xmm3, xmm3\n",
+        )
+    };
+}
+
+/// `codes::mix` of the event code (r9) into r8, and in r15 the writer of
+/// its event partition (`ParseOut::events`): the mixed code's bits from the
+/// frame's shift up. r9 is kept, for a row handed back.
+macro_rules! lean_mix_codes {
+    () => {
+        concat!(
+            "mov r8, r9\n",
+            "imul r8, qword ptr [rdx + {mix_a}]\n",
+            "shl r8, 22\n",
+            "shr r8, 22\n",
+            "mov r15, r8\n",
+            "shr r15, 21\n",
+            "xor r8, r15\n",
+            "imul r8, qword ptr [rdx + {mix_b}]\n",
+            "shl r8, 22\n",
+            "shr r8, 22\n",
+            "mov r15, qword ptr [rdx + {event_shift}]\n",
+            "shrx r15, r8, r15\n",
+            "shl r15, 5\n",
+            "add r15, qword ptr [rdx + {writers}]\n",
+        )
+    };
+}
+
+/// A `view` or `cart` of the general path into the list of its event
+/// partition: the two words `emit_raw` stores (the mixed code's low 32 bits
+/// above ts and valid; the user, the ingest seconds). A full block is the
+/// caller's (22), with r9 and r10 still the codes.
+macro_rules! lean_store_codes {
+    () => {
+        concat!(
+            lean_mix_codes!(),
+            "mov r11, qword ptr [r15]\n",
+            "lea r13, [r11 + 16]\n",
+            "cmp r13, qword ptr [r15 + 8]\n",
+            "ja 22f\n",
+            "mov qword ptr [r15], r13\n",
+            // ts and valid: both, or neither for an invalid row.
+            "shl r8, 32\n",
+            "lea rax, [rax + rax + 1]\n",
+            "and rax, r12\n",
+            "or rax, r8\n",
+            "mov qword ptr [r11], rax\n",
+            // The user (kept by a valid row only) at bit 22, the ingest seconds at bit 1.
+            "and r10, r12\n",
+            "shl r10, 22\n",
+            "lea r10, [r10 + rcx*2]\n",
+            "mov qword ptr [r11 + 8], r10\n",
+        )
+    };
+}
+
+/// A valid purchase of the general path into the list of its event
+/// partition: the three words `emit_raw` stores. A full block is the
+/// caller's (who reads price and category again).
+macro_rules! lean_bought_store_codes {
+    () => {
+        concat!(
+            lean_mix_codes!(),
+            "mov r11, qword ptr [r15]\n",
+            "lea r14, [r11 + 24]\n",
+            "cmp r14, qword ptr [r15 + 8]\n",
+            "ja 25f\n",
+            "mov qword ptr [r15], r14\n",
+            "shl r8, 32\n",
+            "lea rax, [rax + rax + 1]\n",
+            "or rax, r8\n",
+            "mov qword ptr [r11], rax\n",
+            "shl r10, 22\n",
+            "lea r10, [r10 + rcx*2 + 1]\n",
+            "mov qword ptr [r11 + 8], r10\n",
+            "mov qword ptr [r11 + 16], r13\n",
+            "jmp 27b\n",
+        )
+    };
+}
+
+/// `lean_run` for the general path: IDs by their text, records into the
+/// event partitions, and a row handed back with its two codes as they are.
+macro_rules! lean_run_codes {
+    ($store:ident, $bought:ident) => {
+        concat!(
+            "mov qword ptr [rdx + {saved}], rbx\n",
+            "9:\n",
+            lean_head!("lea rbx, [rdi + rax + 65]\n"),
+            lean_codes!(),
+            lean_ts!(),
+            lean_ingest!(),
+            lean_type!(),
+            lean_tail!("cmp r15, rbx\n", "", "", ""),
+            "jnz 2f\n",
+            "24:\n",
+            $store!(),
+            "27:\n",
+            "mov rdi, rbx\n",
+            "cmp rdi, qword ptr [rdx + {last}]\n",
+            "jb 9b\n",
+            "xor r15d, r15d\n",
+            "jmp 8f\n",
+            lean_offset!(),
+            lean_purchase!("cmp r15, rbx\n", "jmp 23f\n", $bought),
+            "22:\n",
+            "mov r15d, 3\n",
+            "23:\n",
+            "mov qword ptr [rdx + {next}], rbx\n",
+            "mov qword ptr [rdx + {read}], rax\n",
+            "mov qword ptr [rdx + {read} + 8], rcx\n",
+            "mov qword ptr [rdx + {read} + 16], r9\n",
+            "mov qword ptr [rdx + {read} + 24], r10\n",
+            "mov qword ptr [rdx + {read} + 32], r12\n",
+            "jmp 8f\n",
+            "2:\n",
+            "mov r15d, 1\n",
+            "8:\n",
+            "mov rbx, qword ptr [rdx + {saved}]\n",
+            // The compiler does not know the vector registers were used here.
+            "vzeroupper\n",
+        )
+    };
+}
+
+/// `lean_row` for the general path (the row-by-row checks).
+macro_rules! lean_row_codes {
+    () => {
+        concat!(
+            lean_head!("lea rax, [rdi + rax + 65]\nmov qword ptr [rdx + {next}], rax\n"),
+            lean_codes!(),
+            lean_ts!(),
+            lean_ingest!(),
+            lean_type!(),
+            lean_tail!("cmp r15, qword ptr [rdx + {next}]\n", "", "", ""),
+            "jz 8f\n",
+            "jmp 2f\n",
+            "24:\n",
+            "xor r15d, r15d\n",
+            "jmp 8f\n",
+            lean_offset!(),
+            lean_purchase!("cmp r15, qword ptr [rdx + {next}]\n", "jmp 8f\n", lean_bought_row),
+            "2:\n",
+            "mov r15d, 1\n",
+            "8:\n",
+        )
+    };
+}
+
+/// `lean_asm` for the general path: the same tables and frame, with the
+/// classing constants of `lean_codes` in xmm9 to xmm15 instead of those of
+/// generated IDs.
+macro_rules! lean_asm_codes {
+    ([$($template:expr,)*] $($operands:tt)*) => {
+        std::arch::asm!(
+            "vmovdqu ymm5, ymmword ptr [rsi + {comma}]",
+            "vmovdqu ymm6, ymmword ptr [rsi + {quote}]",
+            "vmovdqu ymm7, ymmword ptr [rsi + {newline}]",
+            "vmovdqu ymm8, ymmword ptr [rsi + {tens}]",
+            "vmovdqu xmm9, xmmword ptr [rsi + {code_zero}]",
+            "vmovdqu xmm10, xmmword ptr [rsi + {code_nine}]",
+            "vmovdqu xmm11, xmmword ptr [rsi + {code_a}]",
+            "vmovdqu xmm12, xmmword ptr [rsi + {code_letters}]",
+            "vmovdqu xmm13, xmmword ptr [rsi + {code_one}]",
+            "vmovdqu xmm14, xmmword ptr [rsi + {code_eleven}]",
+            "vmovdqu xmm15, xmmword ptr [rsi + {code_pairs}]",
+            $($template,)*
+            $($operands)*
+            out("ymm5") _, out("ymm6") _, out("ymm7") _, out("ymm8") _, out("ymm9") _, out("ymm10") _,
+            out("ymm11") _, out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            comma = const std::mem::offset_of!(LeanTables, comma),
+            quote = const std::mem::offset_of!(LeanTables, quote),
+            newline = const std::mem::offset_of!(LeanTables, newline),
+            ingest_close = const std::mem::offset_of!(LeanTables, ingest_close),
+            type_masks = const std::mem::offset_of!(LeanTables, type_masks),
+            type_texts = const std::mem::offset_of!(LeanTables, type_texts),
+            type_step = const std::mem::offset_of!(LeanTables, type_step),
+            purchase = const std::mem::offset_of!(LeanTables, purchase),
+            purchase_rest_mask = const std::mem::offset_of!(LeanTables, purchase_rest_mask),
+            purchase_rest = const std::mem::offset_of!(LeanTables, purchase_rest),
+            keep_last = const std::mem::offset_of!(LeanTables, keep_last),
+            digit_zero = const std::mem::offset_of!(LeanTables, digit_zero),
+            nines = const std::mem::offset_of!(LeanTables, nines),
+            hundreds = const std::mem::offset_of!(LeanTables, hundreds),
+            ten_thousands = const std::mem::offset_of!(LeanTables, ten_thousands),
+            categories = const std::mem::offset_of!(LeanFrame, categories),
+            rare = const std::mem::offset_of!(LeanFrame, rare),
+            category_count = const std::mem::offset_of!(LeanFrame, category_count),
+            late_bias = const std::mem::offset_of!(LeanTables, late_bias),
+            late_limit = const std::mem::offset_of!(LeanTables, late_limit),
+            tens = const std::mem::offset_of!(LeanTables, tens),
+            code_zero = const std::mem::offset_of!(LeanTables, code_zero),
+            code_nine = const std::mem::offset_of!(LeanTables, code_nine),
+            code_a = const std::mem::offset_of!(LeanTables, code_a),
+            code_letters = const std::mem::offset_of!(LeanTables, code_letters),
+            code_one = const std::mem::offset_of!(LeanTables, code_one),
+            code_eleven = const std::mem::offset_of!(LeanTables, code_eleven),
+            code_pairs = const std::mem::offset_of!(LeanTables, code_pairs),
+            code_fours = const std::mem::offset_of!(LeanTables, code_fours),
+            code_eights = const std::mem::offset_of!(LeanTables, code_eights),
+            offset_pattern = const std::mem::offset_of!(LeanTables, offset_pattern),
+            offset_limit = const std::mem::offset_of!(LeanTables, offset_limit),
+            offset_shuffle = const std::mem::offset_of!(LeanTables, offset_shuffle),
+            offset_ceilings = const std::mem::offset_of!(LeanTables, offset_ceilings),
+            offset_weights = const std::mem::offset_of!(LeanTables, offset_weights),
+            form_mid = const std::mem::offset_of!(LeanTables, form_of_length) + 128,
+            offset_form = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, offset),
+            plain_start = const std::mem::offset_of!(LeanTables, forms)
+                + std::mem::offset_of!(TimeForms, plain)
+                + std::mem::offset_of!(TimeForm, start),
+            day = const std::mem::offset_of!(LeanTables, forms) + std::mem::offset_of!(TimeForms, day),
+            f_pattern = const std::mem::offset_of!(TimeForm, pattern),
+            f_limit = const std::mem::offset_of!(TimeForm, limit),
+            f_shuffle = const std::mem::offset_of!(TimeForm, shuffle),
+            f_ceilings = const std::mem::offset_of!(TimeForm, ceilings),
+            f_first = const std::mem::offset_of!(TimeForm, first),
+            f_second = const std::mem::offset_of!(TimeForm, second),
+            f_year_mask = const std::mem::offset_of!(TimeForm, year_mask),
+            f_scale = const std::mem::offset_of!(TimeForm, scale),
+            f_start = const std::mem::offset_of!(TimeForm, start),
+            f_day = const FORM_DAY,
+            next = const std::mem::offset_of!(LeanFrame, next),
+            window_length = const std::mem::offset_of!(LeanFrame, window_length),
+            region = const std::mem::offset_of!(LeanFrame, region),
+            reach = const std::mem::offset_of!(LeanFrame, reach),
+            last_comma = const std::mem::offset_of!(LeanFrame, last_comma),
+            opened = const std::mem::offset_of!(LeanFrame, opened),
+            options(nostack),
+        )
+    };
+}
+
 /// One `asm!` of the kernel: its pieces (after the vector constants every
 /// row uses, which stay in registers), its operands, and the places in the
 /// tables and in the frame that every use of it names.
@@ -2419,6 +2728,11 @@ pub struct LeanFrame {
     bought: u64,
     /// `rare_rows()`.
     rare: u64,
+    // The general path (`LeanFrame::codes`): the shift that takes a mixed
+    // code to its event partition, and the two multipliers of `codes::mix`.
+    event_shift: u64,
+    mix_a: u64,
+    mix_b: u64,
 }
 
 /// Whether a `PartWriter` is what the loop in assembly takes it for: four
@@ -2488,7 +2802,49 @@ impl LeanFrame {
             category_count: ctx.category_by_product_number.len() as u64,
             bought: 0,
             rare: rare_rows(),
+            event_shift: 0,
+            mix_a: 0,
+            mix_b: 0,
         }
+    }
+
+    /// The frame of a chunk on the general path, for the kernel in assembly
+    /// that codes IDs by their text (`event_lean_run_codes`): records go to
+    /// the event partitions (`ParseOut::events`) as `emit_raw` writes them.
+    pub fn codes(ctx: &Ctx) -> Self {
+        Self {
+            next: std::ptr::null(),
+            window_length: (ctx.window_end - ctx.window_start) as u64,
+            inverse_b: 0,
+            inverse_a: 0,
+            event_key: 0,
+            user_key: 0,
+            index_limit: 0,
+            user_limit: 0,
+            region: std::ptr::null(),
+            reach: 0,
+            last_comma: 0,
+            opened: 0,
+            last: std::ptr::null(),
+            writers: std::ptr::null_mut(),
+            part_mask: 0,
+            low_mask: 0,
+            handed: [0; 5],
+            saved: 0,
+            categories: ctx.category_by_product_number.as_ptr(),
+            category_count: ctx.category_by_product_number.len() as u64,
+            bought: 0,
+            rare: rare_rows(),
+            event_shift: u64::from(ctx.event_shift()),
+            mix_a: super::codes::MIX_A,
+            mix_b: super::codes::MIX_B,
+        }
+    }
+
+    /// Whether `event_lean_run_codes` can store for this run: the general
+    /// path, and the writers as its store takes them.
+    pub fn stores_codes(ctx: &Ctx) -> bool {
+        ctx.keys.is_none() && writer_as_assumed()
     }
 
     /// Whether `event_lean_run` can store for this run: the writers are as
@@ -2625,6 +2981,74 @@ pub unsafe fn event_lean_run<const STORE: bool>(
     (status, at)
 }
 
+/// `event_lean_asm` for the general path: the row at `p` with IDs coded by
+/// their text (`LeanFrame::codes`); the `index` and `user_number` of the
+/// result are the event's and the user's codes.
+///
+/// # Safety
+/// As `event_lean_asm`, with `frame` from `LeanFrame::codes`.
+#[inline(always)]
+pub unsafe fn event_lean_asm_codes(lean: *const LeanTables, p: *const u8, frame: *mut LeanFrame) -> LeanRow {
+    let (status, ts, ingest_seconds, index, user_number, keep): (u64, u64, u64, u64, u64, u64);
+    lean_asm_codes!(
+        [lean_row_codes!(),]
+        in("rdi") p,
+        in("rsi") lean,
+        in("rdx") frame,
+        lateout("r15") status,
+        lateout("rax") ts,
+        lateout("rcx") ingest_seconds,
+        lateout("r9") index,
+        lateout("r10") user_number,
+        lateout("r12") keep,
+        out("r8") _, out("r11") _, out("r13") _, out("r14") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+        bought = const std::mem::offset_of!(LeanFrame, bought),
+    );
+    LeanRow { status, ts, ingest_seconds, index, user_number, keep }
+}
+
+/// `event_lean_run` for the general path: the rows from `p` on with IDs
+/// coded by their text, every `view` and `cart` (and valid purchase) stored
+/// into `writers`, the event partitions' writers (`ParseOut::events`, taken
+/// anew after every other use of the `ParseOut`). Statuses as there; a row
+/// handed back has its two codes in `index` and `user_number`.
+///
+/// # Safety
+/// As `event_lean_run`, with `LeanFrame::stores_codes(ctx)` and `frame`
+/// from `LeanFrame::codes`.
+#[inline(always)]
+pub unsafe fn event_lean_run_codes(
+    lean: *const LeanTables,
+    p: *const u8,
+    last: *const u8,
+    frame: *mut LeanFrame,
+    writers: *mut PartWriter,
+) -> (u64, *const u8) {
+    (*frame).last = last;
+    (*frame).writers = writers;
+    let status: u64;
+    let at: *const u8;
+    lean_asm_codes!(
+        [lean_run_codes!(lean_store_codes, lean_bought_store_codes),]
+        inout("rdi") p => at,
+        in("rsi") lean,
+        in("rdx") frame,
+        lateout("r15") status,
+        out("rax") _, out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+        out("r12") _, out("r13") _, out("r14") _,
+        out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+        last = const std::mem::offset_of!(LeanFrame, last),
+        writers = const std::mem::offset_of!(LeanFrame, writers),
+        read = const std::mem::offset_of!(LeanFrame, handed),
+        saved = const std::mem::offset_of!(LeanFrame, saved),
+        event_shift = const std::mem::offset_of!(LeanFrame, event_shift),
+        mix_a = const std::mem::offset_of!(LeanFrame, mix_a),
+        mix_b = const std::mem::offset_of!(LeanFrame, mix_b),
+    );
+    (status, at)
+}
+
 /// The end of a purchase `event_lean_asm` read (status 2): its price and its
 /// product's category, as `event_lean` reads them, and then the row is
 /// stored or handed back like any other.
@@ -2632,7 +3056,7 @@ pub unsafe fn event_lean_run<const STORE: bool>(
 /// # Safety
 /// `frame` is the one `event_lean_asm` just filled for this row.
 #[inline(always)]
-pub unsafe fn event_lean_purchase<const MODE: u32>(
+pub unsafe fn event_lean_purchase<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     frame: &LeanFrame,
     read: LeanRow,
@@ -2653,7 +3077,7 @@ pub unsafe fn event_lean_purchase<const MODE: u32>(
             None => valid = false,
         }
     }
-    event_lean_finish::<MODE, true>(
+    event_lean_finish::<MODE, INDEXED>(
         out,
         row,
         read.index,
@@ -2671,14 +3095,14 @@ pub unsafe fn event_lean_purchase<const MODE: u32>(
 /// # Safety
 /// `frame` is the one `event_lean_asm` just filled for this row.
 #[inline(always)]
-pub unsafe fn event_lean_bought<const MODE: u32>(
+pub unsafe fn event_lean_bought<const MODE: u32, const INDEXED: bool>(
     frame: &LeanFrame,
     read: LeanRow,
     out: &mut ParseOut,
     row: &mut EventRow,
 ) -> u32 {
     let purchase = Some((frame.bought as u32, (frame.bought >> 32) as u32));
-    event_lean_finish::<MODE, true>(
+    event_lean_finish::<MODE, INDEXED>(
         out,
         row,
         read.index,
@@ -2695,7 +3119,25 @@ pub unsafe fn event_lean_bought<const MODE: u32>(
 /// # Safety
 /// As `event_lean_finish`.
 #[inline(always)]
-pub unsafe fn event_lean_common<const MODE: u32>(read: LeanRow, out: &mut ParseOut, row: &mut EventRow) -> u32 {
+pub unsafe fn event_lean_common<const MODE: u32, const INDEXED: bool>(
+    read: LeanRow,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> u32 {
+    if MODE == MODE_STORE && !INDEXED {
+        // What `emit_raw` stores of the row, as `event_lean_finish` would.
+        let valid = read.keep & 1;
+        emit_raw(
+            out,
+            read.index,
+            read.ts & read.keep,
+            valid,
+            read.user_number & read.keep,
+            read.ingest_seconds,
+            None,
+        );
+        return ROW_DONE;
+    }
     if MODE == MODE_STORE {
         // What `event_lean_finish` stores, with the row's validity as the
         // mask it comes as: an invalid row keeps neither its time nor its
@@ -2713,7 +3155,7 @@ pub unsafe fn event_lean_common<const MODE: u32>(read: LeanRow, out: &mut ParseO
         );
         return ROW_DONE;
     }
-    event_lean_finish::<MODE, true>(
+    event_lean_finish::<MODE, INDEXED>(
         out,
         row,
         read.index,
@@ -2788,7 +3230,7 @@ pub unsafe fn event_row_lean<const MODE: u32, const INDEXED: bool>(
 /// # Safety
 /// As `event_row_lean`, and 16 bytes before `p` must be readable too.
 #[inline(always)]
-pub unsafe fn event_row_lean_asm<const MODE: u32>(
+pub unsafe fn event_row_lean_asm<const MODE: u32, const INDEXED: bool>(
     ctx: &Ctx,
     frame: &mut LeanFrame,
     p: *const u8,
@@ -2796,13 +3238,13 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
     row: &mut EventRow,
 ) -> (usize, u32) {
     let (lean, _window_length) = lean_setup(ctx);
-    let read = event_lean_asm(lean, p, frame);
+    let read = if INDEXED { event_lean_asm(lean, p, frame) } else { event_lean_asm_codes(lean, p, frame) };
     #[cfg(test)]
     if MODE == MODE_ROW {
         // The assembly must take exactly the rows `event_lean` takes that
         // end where the early look said, and read the same from them.
         let mut twin = EventRow::default();
-        let (length, guess, status) = event_lean::<MODE, true>(ctx, lean, _window_length, p, out, &mut twin);
+        let (length, guess, status) = event_lean::<MODE, INDEXED>(ctx, lean, _window_length, p, out, &mut twin);
         let taken = status == ROW_EMIT && length == guess;
         assert_eq!(read.status != 1, taken, "the assembly and the lean kernel take different rows");
         if taken {
@@ -2813,16 +3255,16 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
             assert!(read.status != 0 || twin.purchase.is_none(), "a purchase or not");
             let mut mine = EventRow::default();
             let finished = match read.status {
-                2 => event_lean_purchase::<MODE>(ctx, frame, read, out, &mut mine),
-                4 => event_lean_bought::<MODE>(frame, read, out, &mut mine),
-                _ => event_lean_common::<MODE>(read, out, &mut mine),
+                2 => event_lean_purchase::<MODE, INDEXED>(ctx, frame, read, out, &mut mine),
+                4 => event_lean_bought::<MODE, INDEXED>(frame, read, out, &mut mine),
+                _ => event_lean_common::<MODE, INDEXED>(read, out, &mut mine),
             };
             assert!(finished == ROW_EMIT && mine == twin, "the assembly reads {mine:?}, the lean kernel {twin:?}");
         }
     }
     if read.status == 0 {
         let length = frame.next.offset_from(p) as usize - 1;
-        return (length, event_lean_common::<MODE>(read, out, row));
+        return (length, event_lean_common::<MODE, INDEXED>(read, out, row));
     }
     #[cfg(test)]
     BOUGHT.with(|count| {
@@ -2831,13 +3273,13 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
     });
     if read.status == 2 {
         let length = frame.next.offset_from(p) as usize - 1;
-        return (length, event_lean_purchase::<MODE>(ctx, frame, read, out, row));
+        return (length, event_lean_purchase::<MODE, INDEXED>(ctx, frame, read, out, row));
     }
     if read.status == 4 {
         let length = frame.next.offset_from(p) as usize - 1;
-        return (length, event_lean_bought::<MODE>(frame, read, out, row));
+        return (length, event_lean_bought::<MODE, INDEXED>(frame, read, out, row));
     }
-    event_row_lean::<MODE, true>(ctx, p, out, row)
+    event_row_lean::<MODE, INDEXED>(ctx, p, out, row)
 }
 
 /// Whether the row at `p` has `purchase` as its fifth field (in a test: the
@@ -4162,7 +4604,7 @@ mod tests {
         /// Lines each kernel answered itself: general, lean, indexed general,
         /// indexed lean; then the click kernels: general, lean, shape-table,
         /// each without and with index mode.
-        answered: [usize; 10],
+        answered: [usize; 11],
         /// Click lines the lean kernels took themselves: lean, shape-table,
         /// each without and with index mode.
         lean_clicks: [usize; 4],
@@ -4170,6 +4612,9 @@ mod tests {
         frame: ClickFrame,
         /// The frame of the event kernel in assembly.
         lean_frame: LeanFrame,
+        /// The frame of the general path's event kernel in assembly (the
+        /// last of `answered`).
+        codes_frame: LeanFrame,
         /// Clicks whose user the indexed form turns into a number.
         numbered: usize,
         /// Generated IDs and good times, for the probes to build rows from.
@@ -4200,6 +4645,7 @@ mod tests {
             let out = ParseOut::new(&ctx);
             let frame = ClickFrame::new(&ctx);
             let lean_frame = LeanFrame::new(&ctx);
+            let codes_frame = LeanFrame::codes(&ctx);
             // Generated IDs of 8 characters.
             let event_id = (1_000..).map(|index| base36(scramble(index, keys.event_key))).find(|id| id.len() == 8);
             let user_id = (700..).map(|user| base36(scramble(user << 9 | 3, keys.user_key))).find(|id| id.len() == 8);
@@ -4212,10 +4658,11 @@ mod tests {
                 out,
                 buffer: Vec::new(),
                 lines: 0,
-                answered: [0; 10],
+                answered: [0; 11],
                 lean_clicks: [0; 4],
                 frame,
                 lean_frame,
+                codes_frame,
                 numbered: 0,
                 event_id: format!("e{}", event_id.unwrap()),
                 user_id: format!("u{}", user_id.unwrap()),
@@ -4245,7 +4692,7 @@ mod tests {
             let shown = String::from_utf8_lossy(line).into_owned();
             let slow = event_row_slow(&self.ctx, line);
             let slow_indexed = event_row_slow_indexed(&self.ctx, &self.keys, line);
-            for kernel in 0..4 {
+            for kernel in 0..5 {
                 let mut row = EventRow::default();
                 // SAFETY: `load` left ROW_PAD readable bytes after `p`.
                 let (length, status) = unsafe {
@@ -4253,15 +4700,18 @@ mod tests {
                         0 => event_row_fast::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
                         1 => event_row_lean::<MODE_ROW, false>(&self.ctx, p, &mut self.out, &mut row),
                         2 => event_row_fast::<MODE_ROW, true>(&self.ctx, p, &mut self.out, &mut row),
+                        // The general path's assembly, IDs by their text,
+                        // which checks itself against the lean kernel too.
+                        4 => event_row_lean_asm::<MODE_ROW, false>(&self.ctx, &mut self.codes_frame, p, &mut self.out, &mut row),
                         // With the assembly in front, which checks itself
                         // against the lean kernel on every row.
-                        _ => event_row_lean_asm::<MODE_ROW>(&self.ctx, &mut self.lean_frame, p, &mut self.out, &mut row),
+                        _ => event_row_lean_asm::<MODE_ROW, true>(&self.ctx, &mut self.lean_frame, p, &mut self.out, &mut row),
                     }
                 };
                 if status != ROW_LONG {
                     assert_eq!(length, line.len(), "kernel {kernel}: length of {shown:?}");
                 }
-                match (status, kernel < 2) {
+                match (status, kernel < 2 || kernel == 4) {
                     (ROW_EMIT, true) => assert_eq!(Some(row), slow, "kernel {kernel} on {shown:?}"),
                     (ROW_DROP, true) => assert_eq!(None, slow, "kernel {kernel} on {shown:?}"),
                     (ROW_EMIT, false) => {
@@ -4271,7 +4721,7 @@ mod tests {
                     (ROW_SLOW | ROW_LONG, _) | (ROW_GENERIC, false) => continue,
                     _ => panic!("kernel {kernel}: status {status} on {shown:?}"),
                 }
-                self.answered[kernel] += 1;
+                self.answered[if kernel == 4 { 10 } else { kernel }] += 1;
             }
         }
 
@@ -4884,6 +5334,9 @@ mod tests {
     /// is what the general parser makes of it (`Checker::event` sees to that).
     #[test]
     fn the_assembly_finishes_purchases() {
+        // `event_with` runs both kernels in assembly on every line: the one
+        // of index mode and the general path's; each counts what it does.
+        const KERNELS: usize = 2;
         for_each_window(|check| {
             let bought = || BOUGHT.with(|count| count.get());
             let ts = check.ts.clone();
@@ -4896,7 +5349,7 @@ mod tests {
                     let line = check.purchase(&ts, &product, &price);
                     assert!(line.len() >= 64 && line.len() <= 95);
                     check.event_with(&line, TAILS[0]);
-                    assert_eq!(bought(), (before.0 + 1, before.1), "not finished in assembly: {product} {price}");
+                    assert_eq!(bought(), (before.0 + KERNELS, before.1), "not finished in assembly: {product} {price}");
                 }
             }
             // Left to the caller: a product that is not `p` and a number, a
@@ -4906,7 +5359,7 @@ mod tests {
                 let before = bought();
                 let line = check.purchase(&ts, product, price);
                 check.event_with(&line, TAILS[0]);
-                assert_eq!(bought(), (before.0, before.1 + 1), "finished in assembly: {product} {price}");
+                assert_eq!(bought(), (before.0, before.1 + KERNELS), "finished in assembly: {product} {price}");
             }
             // No price: the row is not valid, and nobody finishes anything.
             for price in ["", "0", "000", "12x", "+5", "10000001", "123456789", " 5", "5 "] {
