@@ -75,15 +75,20 @@ jobs:
             grep -v '^#' "$W/stat_$label.csv" | grep -v '^$'
             for t in user_daily campaign_daily; do printf '%s files: ' $t; ls "$W/out/$t" | wc -l; done
           }
-          for threads in 1 4; do
-            cpus=$([ $threads = 1 ] && echo 0 || echo 0-3)
-            for round in 1 2; do
+          for threads in 4; do
+            cpus=0-3
+            for round in 1; do
               echo "=== cpu-clock profile, NCPU=$threads, taskset $cpus, round $round"
               rm -rf "$W/out" && mkdir -p "$W/out"
               env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=$threads SS_TIMING=1 \
                 "$PERF" record -F 9999 -e cpu-clock -o "$W/clock.data" -- taskset -c $cpus "$W/pipeline" 2> "$W/rec.txt" || true
               grep -E "stage=total|samples" "$W/rec.txt" | paste -sd' '
-              "$PERF" report -i "$W/clock.data" --stdio --no-children --sort dso,symbol --percent-limit 0.25 2>&1 | grep -v "^#" | grep -v "^$" | head -n 70
+              "$PERF" report -i "$W/clock.data" --stdio --no-children --sort dso,symbol --percent-limit 0.25 2>&1 | grep -v "^#" | grep -v "^$" | head -n 40
+              for sym in 'ss::fast::simd::event_lean_long::<0>' 'ss::fast::run_once::{closure#10}' 'ss::fast::parse::events_assembly_run_codes'; do
+                echo "=== annotate $sym: hottest instructions (percent of the function's samples)"
+                "$PERF" annotate -i "$W/clock.data" --stdio --no-source "$sym" 2>/dev/null \
+                  | grep -E '^ +[0-9]+\.[0-9]+ +:' | sort -t: -k1,1 -rn | head -n 45
+              done
             done
           done
           mkdir -p "$W/probe" && cp "$W"/stat_*.csv "$W"/err_*.txt "$W/probe/" 2>/dev/null || true
