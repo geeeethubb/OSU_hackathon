@@ -327,9 +327,17 @@ impl LinkTable {
     /// records later finds it in the cache. Changes no result.
     #[inline(always)]
     pub fn prefetch(&self, user: u64) {
-        let Some(indexed) = &self.indexed else {
-            return self.table.prefetch(user);
-        };
+        match &self.indexed {
+            None => self.table.prefetch(user),
+            Some(indexed) => self.prefetch_indexed(indexed, user),
+        }
+    }
+
+    /// `prefetch` after an index-mode build. Not inlined, and neither is
+    /// `lookup_indexed`: after any other build every lookup goes to the
+    /// table, and the loops that do them should carry nothing else.
+    #[inline(never)]
+    fn prefetch_indexed(&self, indexed: &Indexed, user: u64) {
         match user_number_of_code(&indexed.keys, user) {
             // The word of bits of the user; its entry, if any, is one more read.
             Some(number) => prefetch_line(indexed.words.as_ptr().wrapping_add((number >> (ALIAS_BITS + 6)) as usize)),
@@ -348,12 +356,20 @@ impl LinkTable {
     /// names itself and is simple.
     #[inline(always)]
     pub fn lookup(&self, user: u64) -> (u64, bool) {
-        if let Some(indexed) = &self.indexed {
-            if let Some(answer) = indexed.lookup(user) {
-                return answer;
-            }
+        match &self.indexed {
+            None => self.table.lookup(user),
+            Some(indexed) => self.lookup_indexed(indexed, user),
         }
-        self.table.lookup(user)
+    }
+
+    /// `lookup` after an index-mode build: the summaries answer for the IDs
+    /// of the users they can describe, the table for the rest.
+    #[inline(never)]
+    fn lookup_indexed(&self, indexed: &Indexed, user: u64) -> (u64, bool) {
+        match indexed.lookup(user) {
+            Some(answer) => answer,
+            None => self.table.lookup(user),
+        }
     }
 
     /// The codes of all members of complex components, in no particular
