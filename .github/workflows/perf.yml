@@ -1,0 +1,79 @@
+# Instruction-level cpu-clock profile of the scored build's event loop on Intel only (diagnostics).
+#
+# Root Dockerfile build, /pipeline copied out and run natively on 20M seed 2,
+# 4 threads on CPUs 0-3, warm page cache, two recorded rounds at 9,999 Hz.
+# Reported: per-function shares, and as an artifact the full annotate of
+# events_assembly_run_codes in Intel syntax (one file per round), so that the
+# samples can be grouped by the asm macros of src/fast/simd.rs. Jobs on a
+# non-Intel CPU stop at once.
+#
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Intel only
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "CPU: $model"
+          if lscpu | grep -q GenuineIntel; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "not Intel: nothing to do"; fi
+      - uses: actions/checkout@v4
+        if: steps.cpu.outputs.go == '1'
+      - name: Restore generator and dev answer
+        if: steps.cpu.outputs.go == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator, data, scored build
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data"
+          docker build -q -t ss-probe . >/dev/null
+          id=$(docker create ss-probe)
+          docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline"
+          docker rm "$id" >/dev/null
+          sha256sum "$RUNNER_TEMP/pipeline"
+          lscpu | grep -E "Model name|Thread|Core|L1d|L2|L3"
+      - name: perf
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1)
+          [ -x "$PERF" ] || PERF=$(command -v perf)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          W="$RUNNER_TEMP"
+          mkdir -p "$W/probe"
+          find "$W/data" -type f -exec cat {} + > /dev/null
+          for round in 1 2; do
+            rm -rf "$W/out" && mkdir -p "$W/out"
+            echo "=== round $round"
+            env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 SS_TIMING=1 \
+              "$PERF" record -F 9999 -e cpu-clock -o "$W/clock_$round.data" -- taskset -c 0-3 "$W/pipeline" 2> "$W/probe/rec_$round.txt" || true
+            grep -E "stage=|cpu_parse" "$W/probe/rec_$round.txt" | sed 's/SS_TIMING //' | paste -sd' '
+            "$PERF" report -i "$W/clock_$round.data" --stdio --no-children --sort symbol --percent-limit 0.5 2>&1 \
+              | grep -E "^ +[0-9]" | sed -E 's/ {2,}/ /g' | head -n 24 | tee "$W/probe/shares_$round.txt"
+            "$PERF" annotate -i "$W/clock_$round.data" --stdio --no-source -M intel ss::fast::parse::events_assembly_run_codes \
+              > "$W/probe/annotate_$round.txt" 2>/dev/null || true
+            wc -l "$W/probe/annotate_$round.txt"
+            grep -E '^ +[0-9]+\.[0-9]+ +:' "$W/probe/annotate_$round.txt" | sort -rn | head -n 15
+          done
+      - uses: actions/upload-artifact@v4
+        if: steps.cpu.outputs.go == '1'
+        with:
+          name: perf-asm
+          path: ${{ runner.temp }}/probe
