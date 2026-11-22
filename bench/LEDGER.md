@@ -726,3 +726,49 @@ base was `b890895` and the comparison was against candidate E.
   the default is faster): `SS_PLACE=1` -5.2 / +1.7; `SS_PLACE=2` +9.7 (two outliers) / -4.8 (6/6);
   `SS_PLACE=3` -21.9 / +15.4; `SS_BATCH=8` -6.6 / -3.4; `SS_BATCH=128` +1.3 / +2.5. No variant beats
   the default on both seeds: all rejected as defaults, the switches stay for later runners.
+
+### 23:58 UTC
+
+- **Where event-parse time goes, measured on hosted runners** (branch `exp-lab`, parser `64eecd8`,
+  20M seed 2, not containers, three rounds each; runs 44962662888 on an EPYC 9V74 and 44963256442 on an
+  EPYC 7763):
+  | Configuration (EPYC 9V74 unless marked) | summed event-parse CPU-ms | per row and thread |
+  |---|---:|---:|
+  | kernel only, no store (`SS_DIAG=7`), 1 thread | 541 to 543 | 26 ns |
+  | kernel plus real lists (`SS_DIAG=1`), 1 thread | 635 to 640 | 30.5 ns |
+  | kernel only, 2 threads on 2 cores | 539 to 545 | 26 ns |
+  | kernel only, 2 threads on 1 core (second hardware thread) | 815 to 890 | 39 to 43 ns |
+  | kernel only, 4 threads (2 cores x 2) | 815 to 825 | 39 ns |
+  | store into one block (`SS_DIAG=8`), 4 threads | 870 to 904 | 42 to 43 ns |
+  | real lists (`SS_DIAG=1`), 4 threads | 950 to 955 | 45.5 ns |
+  | real lists, input pages touched first | 918 to 964 | 44 to 46 ns |
+  | EPYC 7763, kernel only, 1 thread: original rows / no quotes / one ts form / both | 630 / 607 to 630 / 597 to 599 / 597 to 600 | 30 / 29 / 28.6 / 28.6 ns |
+  | EPYC 7763, compiler's kernel, 1 thread, original rows | 765 to 767 | 36.7 ns |
+  What this says: (1) the kernel itself is 86% of event-parse CPU; the store's instructions add 6 to
+  10% and the lists' memory traffic another 9%; input page faults about 3%. (2) Two threads on one core
+  give 1.23 to 1.32 times the throughput of one: with both hardware threads busy the core is
+  throughput-bound, so only fewer uops (or fewer stalls) make a row cheaper. Interleaving rows inside
+  one thread would only fill slots the second hardware thread already fills. (3) The variety of row
+  formats is not the cost: the same rows with no quotes and one timestamp form are 3 to 5% cheaper.
+  The four rewritten datasets gave identical tables in the pipeline (keys found in all four; the
+  `compare.py` call in the lab lacked a library, so the equality was checked by the run's exit and the
+  later MATCH checks of the same binary, not by a table diff in that job).
+- **Parser counter build** (`64eecd8` + counters, s2_20m): 95.55% of rows take the straight line
+  (about 197 instructions, about 12 ns on the laptop); 2.95% are purchases that leave the assembly for
+  a Rust path (about 90 ns each); 1.50% are declined and parsed again by two slower parsers (about 150
+  ns each, the general parser about 450 ns for 37,483 rows). **Those 4.45% of rows take about 30% of
+  kernel time.** Only two jumps on the straight line are shape decisions (offset form 9.3%, purchase or
+  unknown type 3.05%); mispredicts are not where the time goes.
+- **Index pass split** (sessions agent, time-stamp counters, tip `4f16ecb`, laptop): place 22 to 24%;
+  batch finish (rows, attribution, credited cells, output) 37 to 39%; one-slot path 14 to 17% (3.75M
+  slots cost more than the 16.2M of the tight loop: each is a mispredicted exit); tight loop 9 to 10%;
+  assists flush 6 to 7%; run ends 6 to 7%; `process_run` 1%.
+- **Results of this round, each alone against its parent** (EPYC 7763 unless marked): constants in
+  registers (`47d7ec5`) +2.0 / +3.6 / +4.3 ms, 11/18: not demonstrated (expected only on Intel); extras
+  merged by time (`9e8159d`) +7.9 / +2.5 / +3.8, 14/18: small win; per-partition assists table
+  (`SS_ASSISTS=1` / `=2`, same image, 9V45 and 6975P-C) -4.1 / -7.3 / -1.8 and +0.4 / -0.8 / +0.3: no
+  gain, stays off; links step 2 (`cfdf102`, Xeon 8370C) +5.1 / +0.4 / +2.0, 11/18: not demonstrated.
+- **Candidate F2 (this push):** F + the parser chain to `64eecd8` + the index-pass chain to `4f16ecb` +
+  links `cfdf102`. Unit tests 52/52, fixtures 36/36 and 43/43, dev, 20M seeds 2 and 3 MATCH locally.
+  Its CI run pairs it against F and carries the 60M check; the steps were measured one at a time, and
+  only this combined run counts for the combination.
