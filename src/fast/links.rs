@@ -107,7 +107,12 @@ impl Table {
     /// again.
     #[inline(always)]
     fn probe(&self, user: u64) -> [u64; 2] {
-        let hash = mix(user);
+        self.probe_from_hash(mix(user))
+    }
+
+    /// `probe` of the ID whose hash (`mix` of it) is `hash`.
+    #[inline(always)]
+    fn probe_from_hash(&self, hash: u64) -> [u64; 2] {
         let home = (hash >> self.rem_bits) as usize;
         // SAFETY: `bits` has a word for every home position.
         let word = unsafe { *self.bits.get_unchecked(home >> 6) };
@@ -379,6 +384,15 @@ impl LinkTable {
                 self.prefetch_indexed(indexed, user);
                 [0, 0]
             }
+        }
+    }
+
+    /// `probe(user)` when `hash` is `codes::mix(user)` already.
+    #[inline(always)]
+    pub fn probe_hashed(&self, user: u64, hash: u64) -> [u64; 2] {
+        match &self.indexed {
+            None => self.table.probe_from_hash(hash),
+            Some(_) => self.probe(user),
         }
     }
 

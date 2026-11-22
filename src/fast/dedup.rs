@@ -83,6 +83,12 @@ pub struct ScratchB {
     /// The same two for the long event IDs of a partition.
     long_table: Vec<LongSlot>,
     long_lost: Vec<u64>,
+    /// A partition's survivors (or a batch's clicks) with their user's hash,
+    /// as read and then by bucket of that hash (`sorted_lookups`), and the
+    /// buckets' counts and starts.
+    unsorted: Vec<[u64; 4]>,
+    sorted: Vec<[u64; 4]>,
+    buckets: Vec<u32>,
     /// Diagnostics (`SS_TIMING`): nanoseconds this worker spent choosing
     /// winners and forwarding survivors.
     pub measure: bool,
@@ -294,6 +300,30 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
 
     let between = scratch.measure.then(std::time::Instant::now);
 
+    if sorted_lookups() {
+        // The winner's own valid bit decides: an invalid winner drops the event.
+        let mut sequence = 0u32;
+        let unsorted = &mut scratch.unsorted;
+        unsorted.clear();
+        for_each_record(lists, |word0, word1, purchase| {
+            let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
+            sequence += 1;
+            if (word0 & 1) & !is_lost == 0 {
+                return;
+            }
+            unsorted.push([word0, word1, purchase, mix(word1 >> 22)]);
+        });
+        bucket_by_hash(&scratch.unsorted, &mut scratch.sorted, &mut scratch.buckets);
+        forward_sorted(links, out, &scratch.sorted, |out, mixed, [word0, word1, purchase, _]| {
+            forward_mixed(out, mixed, word0, word1 & 1, purchase)
+        });
+        if let (Some(started), Some(between)) = (started, between) {
+            scratch.winners_nanos += (between - started).as_nanos() as u64;
+            scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+        }
+        return;
+    }
+
     // The winner's own valid bit decides: an invalid winner drops the event.
     // Survivors wait in a small ring while their person-table slot loads.
     let mut ring = [[0u64; 5]; AHEAD];
@@ -323,6 +353,78 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
     if let (Some(started), Some(between)) = (started, between) {
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+    }
+}
+
+/// Whether pass B sorts a partition's survivors (and a batch's clicks) by
+/// the hash of their user before it looks them up: yes unless `SS_SORTED=0`.
+fn sorted_lookups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SS_SORTED").as_deref() != Ok("0"))
+}
+
+/// Buckets by the top bits of a user's hash (`codes::mix`, `CODE_BITS` bits).
+const HASH_BUCKET_BITS: u32 = 11;
+
+/// `sorted` = `unsorted` (records whose fourth word is their user's hash)
+/// by bucket of that hash, each bucket in the order read. A lookup's link
+/// table position is the top bits of the same hash, so the lookups of the
+/// sorted records go through the link table's bitmap and rank words in the
+/// order of their addresses, which the processor's own prefetching follows,
+/// where in the order read each one is a jump to a random line of them.
+fn bucket_by_hash(unsorted: &[[u64; 4]], sorted: &mut Vec<[u64; 4]>, buckets: &mut Vec<u32>) {
+    let shift = super::codes::CODE_BITS - HASH_BUCKET_BITS;
+    buckets.clear();
+    buckets.resize((1 << HASH_BUCKET_BITS) + 1, 0);
+    for record in unsorted {
+        buckets[(record[3] >> shift) as usize + 1] += 1;
+    }
+    for bucket in 1..buckets.len() {
+        buckets[bucket] += buckets[bucket - 1];
+    }
+    sorted.clear();
+    sorted.resize(unsorted.len(), [0; 4]);
+    for record in unsorted {
+        let bucket = (record[3] >> shift) as usize;
+        // SAFETY: the counts above put every record below `unsorted.len()`.
+        unsafe {
+            let at = buckets.get_unchecked_mut(bucket);
+            *sorted.get_unchecked_mut(*at as usize) = *record;
+            *at += 1;
+        }
+    }
+}
+
+/// The lookups and writes of records sorted by `bucket_by_hash`: each waits
+/// in the ring of `AHEAD` while its link-table entry loads, as in the order
+/// read, and `emit` writes it with its person's mixed name.
+#[inline(always)]
+fn forward_sorted(
+    links: &LinkTable,
+    out: &mut PassBOut,
+    sorted: &[[u64; 4]],
+    emit: impl Fn(&mut PassBOut, u64, [u64; 4]),
+) {
+    let mut ring = [([0u64; 4], [0u64; 2], 0u64); AHEAD];
+    let mut waiting = 0usize;
+    let mut slot = 0usize;
+    for record in sorted {
+        let user = record[1] >> 22;
+        let probe = links.probe_hashed(user, record[3]);
+        if waiting == AHEAD {
+            let (waited, waited_probe, waited_user) = ring[slot];
+            emit(out, links.person_mixed_probed(waited_user, waited_probe), waited);
+        } else {
+            waiting += 1;
+        }
+        ring[slot] = (*record, probe, user);
+        slot = (slot + 1) % AHEAD;
+    }
+    // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
+    let first = if waiting == AHEAD { slot } else { 0 };
+    for offset in 0..waiting {
+        let (waited, waited_probe, waited_user) = ring[(first + offset) % AHEAD];
+        emit(out, links.person_mixed_probed(waited_user, waited_probe), waited);
     }
 }
 
