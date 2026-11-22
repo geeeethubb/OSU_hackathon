@@ -548,6 +548,97 @@ pub fn chains(mut edges: Vec<Edge>) -> Option<Vec<Chain>> {
 /// the partitions set aside (index order).
 pub type Chain = (u64, Vec<Vec<Record>>);
 
+/// `chains`, done while the partitions are still being processed: the edge
+/// runs are joined in index order as soon as every partition before them is
+/// done, so a chain can be processed once the partition after its last piece
+/// is done, instead of after the last partition. The same joins and the same
+/// layout check as `chains`.
+pub struct Joiner {
+    done: Vec<bool>,
+    edges: Vec<Option<Edge>>,
+    /// The first partition not yet joined.
+    next: usize,
+    open: Option<Chain>,
+    ready: Vec<Chain>,
+    violated: bool,
+}
+
+impl Joiner {
+    pub fn new(parts: usize) -> Self {
+        Joiner {
+            done: vec![false; parts],
+            edges: (0..parts).map(|_| None).collect(),
+            next: 0,
+            open: None,
+            ready: Vec::new(),
+            violated: false,
+        }
+    }
+
+    /// Partition `part` is done; `edges` are the edge runs it set aside (one
+    /// at most; none when it held no valid event).
+    pub fn add(&mut self, part: usize, edges: impl Iterator<Item = Edge>) {
+        for edge in edges {
+            debug_assert_eq!(edge.part, part);
+            let at = edge.part;
+            self.edges[at] = Some(edge);
+        }
+        self.done[part] = true;
+        while self.next < self.done.len() && self.done[self.next] {
+            if let Some(edge) = self.edges[self.next].take() {
+                self.join(edge);
+            }
+            self.next += 1;
+        }
+    }
+
+    fn join(&mut self, edge: Edge) {
+        if self.violated {
+            return;
+        }
+        match &mut self.open {
+            Some((user, pieces)) if *user == edge.first_user => pieces.push(edge.first),
+            _ => {
+                if let Some(previous) = self.open.take() {
+                    if edge.first_user < previous.0 {
+                        self.violated = true;
+                        self.ready.clear();
+                        return;
+                    }
+                    self.ready.push(previous);
+                }
+                self.open = Some((edge.first_user, vec![edge.first]));
+            }
+        }
+        if edge.last_user != u64::MAX {
+            // The runner checked the order of the runs inside a partition:
+            // this is a later user.
+            self.ready.extend(self.open.take());
+            self.open = Some((edge.last_user, vec![edge.last]));
+        }
+    }
+
+    /// The largest complete chain not yet taken (the whale persons first).
+    pub fn take(&mut self) -> Option<Chain> {
+        if self.violated {
+            return None;
+        }
+        let at = (0..self.ready.len()).max_by_key(|&at| self.ready[at].1.iter().map(Vec::len).sum::<usize>())?;
+        Some(self.ready.swap_remove(at))
+    }
+
+    /// After the last partition: every chain not yet taken, or `None` when
+    /// user indexes decrease somewhere (as `chains`).
+    pub fn finish(mut self) -> Option<Vec<Chain>> {
+        if self.violated {
+            return None;
+        }
+        assert!(self.next == self.done.len(), "a partition was not reported to the joiner");
+        self.ready.extend(self.open.take());
+        Some(self.ready)
+    }
+}
+
 /// The main person of a run read straight from the slots, as the session
 /// kernel has it: in its batch, or on its own.
 #[derive(Clone, Copy)]

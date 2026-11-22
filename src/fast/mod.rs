@@ -752,6 +752,16 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             runner.measure = measure;
             runner
         });
+        // Runs that touch a partition's edge are joined across partitions
+        // while the partitions are still being processed, and after each
+        // partition a thread takes one complete chain (the largest) if there
+        // is one: the few whale persons' runs then overlap the partition pass
+        // instead of following it on one or two threads. A chain processed
+        // early writes the same rows as one processed afterwards; if the
+        // layout check fails later, all of it is dropped with the rest.
+        // `SS_CHAINS_EARLY=0` joins and processes every chain afterwards.
+        let early = !std::env::var_os("SS_CHAINS_EARLY").is_some_and(|value| value == "0");
+        let joiner = std::sync::Mutex::new(indexed::Joiner::new(parts));
         let next = AtomicUsize::new(0);
         parallel(threads, |thread| {
             // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
@@ -767,11 +777,23 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 lists.extend(indexed_lists.iter().map(|per_thread| per_thread[part]));
                 runner.partition(&shared, part, &lists, b, c);
                 sink.drain(c);
+                if early {
+                    let chain = {
+                        let mut joiner = joiner.lock().unwrap();
+                        joiner.add(part, runner.edges.drain(..));
+                        joiner.take()
+                    };
+                    if let Some((user, records)) = chain {
+                        let pieces: Vec<&[indexed::Record]> = records.iter().map(Vec::as_slice).collect();
+                        runner.process_run(&shared, b, c, user, &pieces);
+                        runner.flush(c);
+                        sink.drain(c);
+                    }
+                }
             }
         });
         timing.detail("index_partitions_done", timing.since_last());
-        // Runs that touch a partition's edge, joined across partitions. This
-        // is also where the layout check ends: user indexes must never
+        // This is also where the layout check ends: user indexes must never
         // decrease along the index order (`SS_FORCE_RESTART` pretends they did).
         let mut edges = Vec::new();
         let mut violated = std::env::var_os("SS_FORCE_RESTART").is_some();
@@ -781,12 +803,23 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             edges.append(&mut runner.edges);
             violated |= runner.violated;
         }
-        let Some(chains) = indexed::chains(edges).filter(|_| !violated) else {
+        let joined = if early { joiner.into_inner().unwrap().finish() } else { indexed::chains(edges) };
+        let Some(chains) = joined.filter(|_| !violated) else {
             if timing.enabled() {
                 eprintln!("SS_TIMING note=index layout check failed, starting over on the general path");
             }
             return Ok(Attempt::NotIndexed);
         };
+        // The largest chains first (the few whale persons hold over a
+        // percent of all events each): handed out in partition order, a
+        // whale that comes late keeps one thread busy after every other
+        // thread is done. Order does not change any row: each chain is one
+        // person's run, processed on its own. `SS_CHAIN_ORDER=index` keeps
+        // the partition order, for A/B runs.
+        let mut chains = chains;
+        if !std::env::var_os("SS_CHAIN_ORDER").is_some_and(|value| value == "index") {
+            chains.sort_by_cached_key(|(_, pieces)| std::cmp::Reverse(pieces.iter().map(Vec::len).sum::<usize>()));
+        }
         timing.detail("index_chains_joined", timing.since_last());
         let next = AtomicUsize::new(0);
         parallel(threads, |thread| {
