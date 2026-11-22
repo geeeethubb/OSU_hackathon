@@ -40,35 +40,42 @@ use crate::reference::FastHasher;
 /// Set in a name on its way into the table when the component is complex.
 const COMPLEX_BIT: u64 = 1 << 63;
 
-/// An entry of the table, from the low bits up: the complex flag; how many
-/// positions after its home position the entry sits; the bits of the ID's
-/// hash that the home position does not give; and the name code.
-const ENTRY_COMPLEX: u64 = 1;
-const ENTRY_NAME_SHIFT: u32 = 64 - CODE_BITS;
-const ENTRY_KEY_MASK: u64 = (1 << ENTRY_NAME_SHIFT) - 2;
-/// The table has 2^bits positions, with bits between these. At the fewest an
-/// entry has 19 hash bits and 2 displacement bits beside the flag.
-const MIN_POSITION_BITS: u32 = 23;
+/// An entry of the table is two words: the name code with `COMPLEX_BIT`
+/// for a complex component, and the ID's whole hash, which says exactly
+/// whose entry it is wherever it sits.
+type Entry = [u64; 2];
+/// The table has 2^bits positions, with bits between these.
+const MIN_POSITION_BITS: u32 = 10;
 const MAX_POSITION_BITS: u32 = CODE_BITS - 1;
 /// A lookup looks at up to 2^this entries; more displacement goes to the stash.
 const MAX_DISPLACEMENT_BITS: u32 = 4;
+
+/// Positions per entry of a table (`TableWriter::new`): `SS_LINK_SPREAD`,
+/// 2 to 64, default 4. The bitmap and its rank words take a bit and a
+/// quarter per position, and every probe reads them.
+fn link_spread() -> usize {
+    static SPREAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPREAD.get_or_init(|| {
+        std::env::var("SS_LINK_SPREAD").ok().and_then(|value| value.parse().ok()).unwrap_or(4usize).clamp(2, 64)
+    })
+}
 
 /// The lookup table: an entry for every linked ID whose person is named by a
 /// different ID, and for every member of a complex component, its own name
 /// included. Anything without an entry names itself and is simple.
 ///
-/// An ID's hash gives its home position among 2^23 or more. `bits` has a bit
-/// for every position that holds an entry, and the entries themselves are
-/// packed in position order in `entries`, so most IDs without an entry are
-/// answered by one bit of a small bitmap, and an entry costs 8 bytes with no
-/// empty slots between. An entry sits at its home position or just after it,
-/// and says how far; the position and the hash bits it keeps identify its ID.
+/// An ID's hash gives its home position among 2^bits (about `link_spread`
+/// per entry). `bits` has a bit for every position that holds an entry, and
+/// the entries themselves are packed in position order in `entries`, so
+/// most IDs without an entry are answered by one bit of a small bitmap,
+/// with no empty slots between entries. An entry sits at its home position
+/// or just after it, and holds its ID's whole hash.
 struct Table {
     bits: Vec<u64>,
     /// For every 256 positions: the entries before them (from bit 24 up),
     /// and the entries of the block before its words 1, 2 and 3 (8 bits each).
     blocks: Vec<u64>,
-    entries: Vec<u64>,
+    entries: Vec<Entry>,
     /// Hash bits below the ones that pick the home position.
     rem_bits: u32,
     displacement_bits: u32,
@@ -98,7 +105,7 @@ impl Table {
         // The entry, when there is one; otherwise this table, which is in the cache.
         let set = (word >> (home & 63)) & 1 != 0;
         let entry = self.entries.as_ptr().wrapping_add(self.rank(home, word));
-        prefetch_line(if set { entry } else { self as *const Self as *const u64 });
+        prefetch_line(if set { entry } else { self as *const Self as *const Entry });
     }
 
     /// `prefetch` and the first half of `lookup` in one: starts loading the
@@ -114,7 +121,7 @@ impl Table {
         let set = (word >> (home & 63)) & 1;
         let rank = self.rank(home, word);
         let entry = self.entries.as_ptr().wrapping_add(rank);
-        prefetch_line(if set != 0 { entry } else { self as *const Self as *const u64 });
+        prefetch_line(if set != 0 { entry } else { self as *const Self as *const Entry });
         [hash, (rank as u64) | (set << 63)]
     }
 
@@ -127,13 +134,12 @@ impl Table {
         }
         let rank = (at & !(1 << 63)) as usize;
         let home = (hash >> self.rem_bits) as usize;
-        let key = (hash << (self.displacement_bits + 1)) & ENTRY_KEY_MASK;
         // SAFETY: a set bit has an entry at its rank.
         let entry = unsafe { *self.entries.get_unchecked(rank) };
-        if entry & ENTRY_KEY_MASK == key {
-            return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        if entry[1] == hash {
+            return (entry[0] & CODE_MASK, entry[0] & COMPLEX_BIT != 0);
         }
-        self.lookup_further(user, home, rank, key)
+        self.lookup_further(user, hash, home, rank)
     }
 
     /// The name code of the person `user` belongs to. Codes are never 0.
@@ -156,13 +162,12 @@ impl Table {
             return (user, false);
         }
         let rank = self.rank(home, word);
-        let key = (hash << (self.displacement_bits + 1)) & ENTRY_KEY_MASK;
         // SAFETY: a set bit has an entry at its rank.
         let entry = unsafe { *self.entries.get_unchecked(rank) };
-        if entry & ENTRY_KEY_MASK == key {
-            return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        if entry[1] == hash {
+            return (entry[0] & CODE_MASK, entry[0] & COMPLEX_BIT != 0);
         }
-        self.lookup_further(user, home, rank, key)
+        self.lookup_further(user, hash, home, rank)
     }
 
     /// How many entries are at positions before `home`, whose word of `bits` is `word`.
@@ -177,7 +182,7 @@ impl Table {
     /// The rest of `lookup` when the entry at the home position is another
     /// ID's: the entries at the positions after it, then the stash.
     #[inline(never)]
-    fn lookup_further(&self, user: u64, home: usize, rank: usize, key: u64) -> (u64, bool) {
+    fn lookup_further(&self, user: u64, hash: u64, home: usize, rank: usize) -> (u64, bool) {
         for step in 1..1usize << self.displacement_bits {
             let at = home + step;
             // SAFETY: `bits` has room for the positions after the last home position.
@@ -186,8 +191,8 @@ impl Table {
             }
             // SAFETY: the positions from `home` to `at` all hold entries, in rank order.
             let entry = unsafe { *self.entries.get_unchecked(rank + step) };
-            if entry & ENTRY_KEY_MASK == key | (step as u64) << 1 {
-                return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+            if entry[1] == hash {
+                return (entry[0] & CODE_MASK, entry[0] & COMPLEX_BIT != 0);
             }
         }
         match self.stash.get(&user) {
@@ -209,22 +214,8 @@ impl Table {
     /// their components. An ID that is alone in a simple component (linked
     /// only to itself, and in a group) is not visited. In no particular order.
     fn for_each_member(&self, mut visit: impl FnMut(u64, u64, bool)) {
-        let rem_mask = (1u64 << self.rem_bits) - 1;
-        let mut rank = 0;
-        for (index, &word) in self.bits.iter().enumerate() {
-            let mut left = word;
-            while left != 0 {
-                let at = (index * 64 + left.trailing_zeros() as usize) as u64;
-                left &= left - 1;
-                let entry = self.entries[rank];
-                rank += 1;
-                // The position less the displacement is the home position:
-                // the high bits of the ID's hash, above the bits the entry kept.
-                let key = (entry & ENTRY_KEY_MASK) >> 1;
-                let home = at - (key & ((1 << self.displacement_bits) - 1));
-                let hash = (home << self.rem_bits) | ((key >> self.displacement_bits) & rem_mask);
-                visit(unmix(hash), entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
-            }
+        for entry in &self.entries {
+            visit(unmix(entry[1]), entry[0] & CODE_MASK, entry[0] & COMPLEX_BIT != 0);
         }
         for (&user, &name) in &self.stash {
             visit(user, name & CODE_MASK, name & COMPLEX_BIT != 0);
@@ -516,13 +507,13 @@ struct TableWriter {
 impl TableWriter {
     /// A writer for about `entries` entries.
     fn new(entries: usize) -> Self {
-        // At most a quarter of the positions hold an entry.
-        let position_bits = (entries * 4).next_power_of_two().trailing_zeros();
+        // At most one position in `link_spread` holds an entry.
+        let position_bits = (entries * link_spread()).next_power_of_two().trailing_zeros();
         Self::with_position_bits(entries, position_bits.clamp(MIN_POSITION_BITS, MAX_POSITION_BITS))
     }
 
     fn with_position_bits(entries: usize, position_bits: u32) -> Self {
-        let displacement_bits = (position_bits + ENTRY_NAME_SHIFT - CODE_BITS - 1).min(MAX_DISPLACEMENT_BITS);
+        let displacement_bits = MAX_DISPLACEMENT_BITS;
         // A word of padding for the positions that entries of the last home
         // positions are displaced to, and one more so that the last block is whole.
         let words = (1usize << position_bits) / 64 + 4;
@@ -556,8 +547,7 @@ impl TableWriter {
         // SAFETY: `at` is less than 2^`MAX_DISPLACEMENT_BITS` positions after
         // a home position, inside the padding of `bits`.
         unsafe { *table.bits.get_unchecked_mut(at >> 6) |= 1 << (at & 63) };
-        let key = ((hash << table.displacement_bits) | step as u64) << 1 & ENTRY_KEY_MASK;
-        table.entries.push((name & CODE_MASK) << ENTRY_NAME_SHIFT | key | name >> 63);
+        table.entries.push([name & (CODE_MASK | COMPLEX_BIT), hash]);
         self.next_free = at + 1;
     }
 
