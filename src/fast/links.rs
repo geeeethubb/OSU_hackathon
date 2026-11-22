@@ -101,6 +101,41 @@ impl Table {
         prefetch_line(if set { entry } else { self as *const Self as *const u64 });
     }
 
+    /// `prefetch` and the first half of `lookup` in one: starts loading the
+    /// ID's entry and returns the ID's hash and, with the home bit on top,
+    /// the entry's rank, so that `lookup_probed` does not work them out
+    /// again.
+    #[inline(always)]
+    fn probe(&self, user: u64) -> [u64; 2] {
+        let hash = mix(user);
+        let home = (hash >> self.rem_bits) as usize;
+        // SAFETY: `bits` has a word for every home position.
+        let word = unsafe { *self.bits.get_unchecked(home >> 6) };
+        let set = (word >> (home & 63)) & 1;
+        let rank = self.rank(home, word);
+        let entry = self.entries.as_ptr().wrapping_add(rank);
+        prefetch_line(if set != 0 { entry } else { self as *const Self as *const u64 });
+        [hash, (rank as u64) | (set << 63)]
+    }
+
+    /// `lookup(user)` from what `probe(user)` returned.
+    #[inline(always)]
+    fn lookup_probed(&self, user: u64, probe: [u64; 2]) -> (u64, bool) {
+        let [hash, at] = probe;
+        if at >> 63 == 0 {
+            return (user, false);
+        }
+        let rank = (at & !(1 << 63)) as usize;
+        let home = (hash >> self.rem_bits) as usize;
+        let key = (hash << (self.displacement_bits + 1)) & ENTRY_KEY_MASK;
+        // SAFETY: a set bit has an entry at its rank.
+        let entry = unsafe { *self.entries.get_unchecked(rank) };
+        if entry & ENTRY_KEY_MASK == key {
+            return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        }
+        self.lookup_further(user, home, rank, key)
+    }
+
     /// The name code of the person `user` belongs to. Codes are never 0.
     #[cfg(test)]
     fn person(&self, user: u64) -> u64 {
@@ -330,6 +365,29 @@ impl LinkTable {
         match &self.indexed {
             None => self.table.prefetch(user),
             Some(indexed) => self.prefetch_indexed(indexed, user),
+        }
+    }
+
+    /// `prefetch` that also hands back where the user's entry is (its hash,
+    /// home bit and rank), so that `person_probed` does not work it out
+    /// again. After an index-mode build it is `prefetch`.
+    #[inline(always)]
+    pub fn probe(&self, user: u64) -> [u64; 2] {
+        match &self.indexed {
+            None => self.table.probe(user),
+            Some(indexed) => {
+                self.prefetch_indexed(indexed, user);
+                [0, 0]
+            }
+        }
+    }
+
+    /// `person(user)`, given what `probe(user)` returned.
+    #[inline(always)]
+    pub fn person_probed(&self, user: u64, probe: [u64; 2]) -> u64 {
+        match &self.indexed {
+            None => self.table.lookup_probed(user, probe).0,
+            Some(indexed) => self.lookup_indexed(indexed, user).0,
         }
     }
 

@@ -101,8 +101,9 @@ const DIRECT_AHEAD: usize = 16;
 pub struct DirectClicks {
     links: *const LinkTable,
     out: *mut PassBOut,
-    /// User, click code and campaign, ts: what `emit_code_click` was given.
-    ring: [[u64; 3]; DIRECT_AHEAD],
+    /// User, click code and campaign, ts: what `emit_code_click` was given;
+    /// then what `LinkTable::probe` returned for the user.
+    ring: [[u64; 5]; DIRECT_AHEAD],
     waiting: usize,
     slot: usize,
 }
@@ -117,7 +118,7 @@ impl DirectClicks {
     /// `links` and `out` outlive the value, and nothing else uses `out`
     /// while it is alive.
     pub unsafe fn new(links: &LinkTable, out: &mut PassBOut) -> Self {
-        DirectClicks { links, out, ring: [[0; 3]; DIRECT_AHEAD], waiting: 0, slot: 0 }
+        DirectClicks { links, out, ring: [[0; 5]; DIRECT_AHEAD], waiting: 0, slot: 0 }
     }
 
     /// One click: its slot starts loading now; the click 16 before it goes.
@@ -125,14 +126,14 @@ impl DirectClicks {
     fn push(&mut self, user: u64, code_and_campaign: u64, ts: u64) {
         // SAFETY: as `new` requires.
         let (links, out) = unsafe { (&*self.links, &mut *self.out) };
-        links.prefetch(user);
+        let [hash, at] = links.probe(user);
         if self.waiting == DIRECT_AHEAD {
-            let [old_user, old_code, old_ts] = self.ring[self.slot];
-            forward_click(out, links.person(old_user), old_ts, old_code);
+            let [old_user, old_code, old_ts, old_hash, old_at] = self.ring[self.slot];
+            forward_click(out, links.person_probed(old_user, [old_hash, old_at]), old_ts, old_code);
         } else {
             self.waiting += 1;
         }
-        self.ring[self.slot] = [user, code_and_campaign, ts];
+        self.ring[self.slot] = [user, code_and_campaign, ts, hash, at];
         self.slot = (self.slot + 1) % DIRECT_AHEAD;
     }
 
@@ -142,8 +143,8 @@ impl DirectClicks {
         let (links, out) = unsafe { (&*self.links, &mut *self.out) };
         let first = if self.waiting == DIRECT_AHEAD { self.slot } else { 0 };
         for offset in 0..self.waiting {
-            let [user, code, ts] = self.ring[(first + offset) % DIRECT_AHEAD];
-            forward_click(out, links.person(user), ts, code);
+            let [user, code, ts, hash, at] = self.ring[(first + offset) % DIRECT_AHEAD];
+            forward_click(out, links.person_probed(user, [hash, at]), ts, code);
         }
         self.waiting = 0;
         self.slot = 0;

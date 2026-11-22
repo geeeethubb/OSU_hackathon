@@ -199,7 +199,7 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
     let lost = &scratch.long_lost;
     // As in `dedup_coded`: survivors wait in a small ring while their
     // person-table slot loads.
-    let mut ring = [[0u64; 3]; AHEAD];
+    let mut ring = [[0u64; 5]; AHEAD];
     let mut waiting = 0usize;
     let mut slot = 0usize;
     let mut sequence = 0u32;
@@ -209,21 +209,19 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
         if (word0 & 1) & !is_lost == 0 {
             return;
         }
-        links.prefetch(word1 >> 22);
+        let [hash, at] = links.probe(word1 >> 22);
         if waiting == AHEAD {
-            let [old0, old1, old_purchase] = ring[slot];
-            forward(links, out, old0, old1, old_purchase);
+            forward_ring(links, out, ring[slot]);
         } else {
             waiting += 1;
         }
-        ring[slot] = [word0, word1, purchase];
+        ring[slot] = [word0, word1, purchase, hash, at];
         slot = (slot + 1) % AHEAD;
     });
     // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
     let first = if waiting == AHEAD { slot } else { 0 };
     for offset in 0..waiting {
-        let [word0, word1, purchase] = ring[(first + offset) % AHEAD];
-        forward(links, out, word0, word1, purchase);
+        forward_ring(links, out, ring[(first + offset) % AHEAD]);
     }
     if let (Some(started), Some(between)) = (started, between) {
         scratch.winners_nanos += (between - started).as_nanos() as u64;
@@ -284,7 +282,7 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
 
     // The winner's own valid bit decides: an invalid winner drops the event.
     // Survivors wait in a small ring while their person-table slot loads.
-    let mut ring = [[0u64; 3]; AHEAD];
+    let mut ring = [[0u64; 5]; AHEAD];
     let mut waiting = 0usize;
     let mut slot = 0usize;
     let mut sequence = 0u32;
@@ -294,26 +292,32 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
         if (word0 & 1) & !is_lost == 0 {
             return;
         }
-        links.prefetch(word1 >> 22);
+        let [hash, at] = links.probe(word1 >> 22);
         if waiting == AHEAD {
-            let [old0, old1, old_purchase] = ring[slot];
-            forward(links, out, old0, old1, old_purchase);
+            forward_ring(links, out, ring[slot]);
         } else {
             waiting += 1;
         }
-        ring[slot] = [word0, word1, purchase];
+        ring[slot] = [word0, word1, purchase, hash, at];
         slot = (slot + 1) % AHEAD;
     });
     // Oldest first: a full ring starts at `slot`, a partly filled one at 0.
     let first = if waiting == AHEAD { slot } else { 0 };
     for offset in 0..waiting {
-        let [word0, word1, purchase] = ring[(first + offset) % AHEAD];
-        forward(links, out, word0, word1, purchase);
+        forward_ring(links, out, ring[(first + offset) % AHEAD]);
     }
     if let (Some(started), Some(between)) = (started, between) {
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
     }
+}
+
+/// Writes one surviving event waiting in a ring (record words, then what
+/// `LinkTable::probe` returned for its user) to its person's partition.
+#[inline(always)]
+fn forward_ring(links: &LinkTable, out: &mut PassBOut, waiting: [u64; 5]) {
+    let [word0, word1, purchase, hash, at] = waiting;
+    forward_named(out, links.person_probed(word1 >> 22, [hash, at]), word0, word1 & 1, purchase);
 }
 
 /// Writes one surviving event to its person's partition.
