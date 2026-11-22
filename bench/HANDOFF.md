@@ -4,18 +4,31 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (2026-11-22, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 05:05 UTC, shopping-sessions-5)
 
-- **Accepted official best: F5 `32b8fffd658af203da5e5809c9d3ce9eaede94ee` = 0.7698 s** (receipt
-  BB-4A6C474E; rank 11 as relayed; board top 0.5528 s as relayed). `bench/BEST_SHA` names F5. Earlier on
-  this dataset: `9735a63` 1.2745 s (BB-32BE0EA7); F4 `bad5c1b` 5.6629 s (index mode, outside the rules).
-- **Goal:** below 0.6018 s official (stretch 0.20 s). Only official scores count; CI ratios are not forecasts.
-- **F6 (being validated):** F5 + prepared link-table probes in the forward rings (`951373b`) + long user
-  IDs spelled out by the output writers (`9643656`), with direct click emission removed (`0e71b47`) and
-  the link-pool step reverted (`df5a154`). Steps measured in CI against their parents: probe tokens
-  +20 to +39 ms (12/12 seed runs, EPYC 9V74/9V45), names +35.5 / +40.0 / +29.2 ms (17/18, Xeon 8370C).
-- 60M: the CI reference is OOM-killed at 14 GiB; complete comparisons run on the laptop (31 GiB): F5 and
-  the later heads MATCH new 60M seed 2 (reference exit 0, 140 s).
+- **Accepted official best: F6 `2676ee043442f0c33357a6f07f3548ae6ead3a4e` = 0.7493 s** (BB-86EAB76C;
+  board as relayed 05:00: #1 0.5084 s, #2 0.5469 s, us #19). `bench/BEST_SHA` = F6; `pipeline` = F6.
+  Validated: 20M seeds 2/3/5 +46-49 ms vs F5 (18/18), fresh seeds 59/61/67 +63-67 ms (18/18), 60M
+  3,445 vs 3,649 ms with `/reference` 19/19 MATCH, peak 2.57 GiB; locally 60M MATCH.
+- Earlier on this dataset: F5 `32b8fff` 0.7698 s (BB-4A6C474E), `9735a63` 1.2745 s (BB-32BE0EA7);
+  F4 (index mode, outside the rules) 5.6629 s. Old-dataset scores are not comparable.
+- **Chain after F6 (local `master` of this checkout, not on `pipeline`):** `ce34ce4`+`dbaac1c` PGO
+  profile of F6 (+16/+25 ms vs F6 on EPYC 7763, run 44984655347); `50ed2ee` general-path assembly event
+  kernel (same image, compiled kernel 39-60 ms slower in three runs, but those images were PGO builds
+  whose profile was trained with the assembly running: the compiled kernel had no counts there);
+  `af75107` profile regenerated on that source (= F7); `0978393` mixed name reused from the probe
+  (+4/+12/+16 ms vs F7, 17/18, EPYC 7763); `dfd16d0` click map with the probe ring (unmeasured alone).
+- **Open question blocking F7:** on Intel runners (Xeon 8573C, 6975P-C) the PGO+assembly images
+  have a slower pass B (click map 171-203 -> 292-293, forward 763 -> 905 thread-ms, in the
+  same-image variant too); not on EPYC 7763. Replicates running: F6+PGO (`67e4892`, branches
+  exp-ci-pgo-r1/r2) and the new code without PGO (`a33259f` with variant SS_KERNEL=plain, branches
+  exp-ci-nopgo, -r1, -r2), each against F6. The no-PGO variant is the clean compiled-vs-assembly
+  comparison. Decision rule: a successor must win on Intel runners, not only on EPYC.
+- **Laptop timing:** shared with the session osu-hackathon-e1. All CPU-heavy laptop work goes through
+  `ss_work/tools/timed.sh` (lock directory `ss_work/bench.lock`); CI ranks, the laptop only screens.
+- Next after the Intel question: one structural parse bet (long-ID rows: 24% of rows, 41% of event
+  parse, about 105 vs 49 ns a row; see LEDGER 04:50) chosen by a design review; the e1 session's
+  hardware-counter probe (CI branch perf-probe-f7) informs it.
 
 ## Performance model on the current data (reset 03:00-03:27 UTC; MEASURED unless marked)
 
