@@ -2704,10 +2704,70 @@ macro_rules! lean_mix_codes {
     };
 }
 
+/// Right after `lean_codes` (the event code in r9): the mix of the event
+/// code (`codes::mix`, as `lean_mix_codes` works it out) and its partition's
+/// writer, both kept in the frame, and the writer's cursor loaded into rbp.
+/// The cursor's load is then issued about a hundred instructions before the
+/// store needs it, instead of at the end of the row's chain of dependencies
+/// (the IDs, the mix, the writer, the cursor). rax, r14 and r15 are free
+/// here: `lean_ts` writes each of them before it reads it.
+macro_rules! lean_hoist_codes {
+    () => {
+        concat!(
+            "mov rax, r9\n",
+            "imul rax, qword ptr [rdx + {mix_a}]\n",
+            "shl rax, 22\n",
+            "shr rax, 22\n",
+            "mov r15, rax\n",
+            "shr r15, 21\n",
+            "xor rax, r15\n",
+            "imul rax, qword ptr [rdx + {mix_b}]\n",
+            "shl rax, 22\n",
+            "shr rax, 22\n",
+            "mov qword ptr [rdx + {hoist_mixed}], rax\n",
+            "mov r15, qword ptr [rdx + {event_shift}]\n",
+            "shrx r15, rax, r15\n",
+            "shl r15, 4\n",
+            "add r15, qword ptr [rdx + {writers}]\n",
+            "mov qword ptr [rdx + {hoist_writer}], r15\n",
+            "mov rbp, qword ptr [r15]\n",
+        )
+    };
+}
+
+/// `lean_store_codes` with the mix, the writer and its cursor (rbp) from
+/// `lean_hoist_codes`: the same two words, the same exit for a full block (22).
+macro_rules! lean_store_hoisted {
+    () => {
+        concat!(
+            "mov r15, qword ptr [rdx + {hoist_writer}]\n",
+            "mov r8, qword ptr [rdx + {hoist_mixed}]\n",
+            "lea r13, [rbp + 16]\n",
+            "cmp r13, qword ptr [r15 + 8]\n",
+            "ja 22f\n",
+            "mov qword ptr [r15], r13\n",
+            // ts and valid: both, or neither for an invalid row.
+            "shl r8, 32\n",
+            "lea rax, [rax + rax + 1]\n",
+            "and rax, r12\n",
+            "or rax, r8\n",
+            "mov qword ptr [rbp], rax\n",
+            // The user (kept by a valid row only) at bit 22, the ingest seconds at bit 1.
+            "and r10, r12\n",
+            "shl r10, 22\n",
+            "lea r10, [r10 + rcx*2]\n",
+            "mov qword ptr [rbp + 8], r10\n",
+        )
+    };
+}
+
 /// A `view` or `cart` of the general path into the list of its event
 /// partition: the two words `emit_raw` stores (the mixed code's low 32 bits
 /// above ts and valid; the user, the ingest seconds). A full block is the
 /// caller's (22), with r9 and r10 still the codes.
+// The store as it was before `lean_store_hoisted` took its place in the loop;
+// kept as the plain form of what that one stores.
+#[allow(unused_macros)]
 macro_rules! lean_store_codes {
     () => {
         concat!(
@@ -2763,6 +2823,7 @@ macro_rules! lean_run_codes {
     ($store:ident, $bought:ident) => {
         concat!(
             "mov qword ptr [rdx + {saved}], rbx\n",
+            "mov qword ptr [rdx + {saved_rbp}], rbp\n",
             "9:\n",
             // The input two lines at `lead` bytes ahead (`prefetch_input`).
             "mov r15, qword ptr [rdx + {lead}]\n",
@@ -2770,6 +2831,7 @@ macro_rules! lean_run_codes {
             "prefetcht0 byte ptr [rdi + r15 + 64]\n",
             lean_head!("lea rbx, [rdi + rax + 65]\n"),
             lean_codes!(),
+            lean_hoist_codes!(),
             lean_ts!(),
             lean_ingest!(),
             lean_type!(),
@@ -2799,6 +2861,7 @@ macro_rules! lean_run_codes {
             "mov r15d, 1\n",
             "8:\n",
             "mov rbx, qword ptr [rdx + {saved}]\n",
+            "mov rbp, qword ptr [rdx + {saved_rbp}]\n",
             // The compiler does not know the vector registers were used here.
             "vzeroupper\n",
         )
@@ -3050,6 +3113,13 @@ pub struct LeanFrame {
     mix_b: u64,
     /// `input_lead()` for the loop in assembly on the general path (0 elsewhere).
     lead: u64,
+    /// The general path's loop: the caller's rbp while it runs, and for the
+    /// row being read its event partition's writer and its mixed event code,
+    /// worked out (and the writer's cursor loaded into rbp) right after the
+    /// IDs are read (`lean_hoist_codes`).
+    saved_rbp: u64,
+    hoist_writer: u64,
+    hoist_mixed: u64,
 }
 
 /// Whether a `PartWriter` is what the loop in assembly takes it for: two
@@ -3123,6 +3193,9 @@ impl LeanFrame {
             mix_a: 0,
             mix_b: 0,
             lead: 0,
+            saved_rbp: 0,
+            hoist_writer: 0,
+            hoist_mixed: 0,
         }
     }
 
@@ -3157,6 +3230,9 @@ impl LeanFrame {
             mix_a: super::codes::MIX_A,
             mix_b: super::codes::MIX_B,
             lead: input_lead() as u64,
+            saved_rbp: 0,
+            hoist_writer: 0,
+            hoist_mixed: 0,
         }
     }
 
@@ -3349,7 +3425,7 @@ pub unsafe fn event_lean_run_codes(
     let status: u64;
     let at: *const u8;
     lean_asm_codes!(
-        [lean_run_codes!(lean_store_codes, lean_bought_store_codes),]
+        [lean_run_codes!(lean_store_hoisted, lean_bought_store_codes),]
         inout("rdi") p => at,
         in("rsi") lean,
         in("rdx") frame,
@@ -3365,6 +3441,9 @@ pub unsafe fn event_lean_run_codes(
         mix_a = const std::mem::offset_of!(LeanFrame, mix_a),
         mix_b = const std::mem::offset_of!(LeanFrame, mix_b),
         lead = const std::mem::offset_of!(LeanFrame, lead),
+        saved_rbp = const std::mem::offset_of!(LeanFrame, saved_rbp),
+        hoist_writer = const std::mem::offset_of!(LeanFrame, hoist_writer),
+        hoist_mixed = const std::mem::offset_of!(LeanFrame, hoist_mixed),
     );
     (status, at)
 }
