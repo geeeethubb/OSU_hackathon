@@ -208,6 +208,12 @@ impl PartList {
         Blocks { block: self.head, _list: std::marker::PhantomData }
     }
 
+    /// Where the list's first block starts (its header), or null.
+    #[inline]
+    pub fn head(&self) -> *const u64 {
+        self.head
+    }
+
     /// Total words in the list.
     pub fn words(&self) -> usize {
         self.blocks().map(<[u64]>::len).sum()
@@ -224,6 +230,15 @@ impl PartList {
 pub struct Blocks<'a> {
     block: *const u64,
     _list: std::marker::PhantomData<&'a PartList>,
+}
+
+impl Blocks<'_> {
+    /// Where the block after the one `next` gave last starts (its header),
+    /// or null: known without reading that block.
+    #[inline]
+    pub fn following(&self) -> *const u64 {
+        self.block
+    }
 }
 
 impl<'a> Iterator for Blocks<'a> {

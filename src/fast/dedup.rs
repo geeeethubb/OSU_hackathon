@@ -76,13 +76,59 @@ pub struct ScratchB {
     pub forward_nanos: u64,
 }
 
+/// Whether the record scans ask for the block after the one they read
+/// (`ahead_of`): yes unless `SS_SCAN=0` (for A/B runs on one binary).
+fn scan_ahead() -> bool {
+    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("SS_SCAN").as_deref() != Ok("0"))
+}
+
+/// Asks for the cache line at `p`: a hint, which reads nothing into the
+/// program and never faults, whatever the address.
+#[inline(always)]
+fn prefetch_line(p: *const u64) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is only a hint (see above).
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// What a scan reading `block` asks for meanwhile, a line for every line it
+/// reads: the block after it in the chain (`following`), else the next
+/// list's first block, else nothing new (the block itself). A list is a
+/// chain of blocks scattered over the arena, and the hardware prefetchers
+/// start over at each block (on Intel at every 4 KB as well).
+#[inline(always)]
+fn ahead_of(block: &[u64], following: *const u64, next_list: Option<&PartList>) -> *const u64 {
+    if !following.is_null() {
+        return following;
+    }
+    match next_list.map(PartList::head) {
+        Some(head) if !head.is_null() => head,
+        _ => block.as_ptr(),
+    }
+}
+
 /// Calls `visit(word0, word1, purchase_word)` for every record of the lists.
 #[inline(always)]
 fn for_each_record(lists: &[PartList], mut visit: impl FnMut(u64, u64, u64)) {
-    for list in lists {
-        for block in list.blocks() {
+    let ahead = scan_ahead();
+    for (index, list) in lists.iter().enumerate() {
+        let mut blocks = list.blocks();
+        while let Some(block) = blocks.next() {
+            let next = ahead_of(block, blocks.following(), lists.get(index + 1));
+            // Words of `next` asked for so far (none at all without SS_SCAN).
+            let mut fetched = if ahead { 0 } else { usize::MAX };
             let mut at = 0;
             while at < block.len() {
+                if at >= fetched {
+                    prefetch_line(next.wrapping_add(fetched));
+                    fetched += 8;
+                }
                 // SAFETY: blocks hold whole records: two words, plus one when
                 // the purchase bit of the second word is set.
                 let (word0, word1) = unsafe { (*block.get_unchecked(at), *block.get_unchecked(at + 1)) };
@@ -117,10 +163,18 @@ pub fn dedup_partition(
 /// the ID's first byte, kept in the top byte of word0.
 #[inline(always)]
 fn for_each_long_record(lists: &[PartList], mut visit: impl FnMut(u8, u128, u64, u64, u64)) {
-    for list in lists {
-        for block in list.blocks() {
+    let ahead = scan_ahead();
+    for (index, list) in lists.iter().enumerate() {
+        let mut blocks = list.blocks();
+        while let Some(block) = blocks.next() {
+            let next = ahead_of(block, blocks.following(), lists.get(index + 1));
+            let mut fetched = if ahead { 0 } else { usize::MAX };
             let mut at = 0;
             while at < block.len() {
+                if at >= fetched {
+                    prefetch_line(next.wrapping_add(fetched));
+                    fetched += 8;
+                }
                 // SAFETY: blocks hold whole records: four words, plus one
                 // when the purchase bit of the fourth is set.
                 let (low, high, word0, word1) = unsafe {
@@ -380,8 +434,16 @@ pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
     let mut ring = [[0u64; 5]; AHEAD];
     let mut waiting = 0usize;
     let mut slot = 0usize;
-    for block in blocks {
-        for click in block.chunks_exact(RAW_CLICK_WORDS) {
+    let ahead = scan_ahead();
+    for (index, block) in blocks.iter().enumerate() {
+        // The next block, a line for every line of this one (`ahead_of`).
+        let next = blocks.get(index + 1).map_or(block.as_ptr(), |next| next.as_ptr());
+        let mut fetched = if ahead { 0 } else { usize::MAX };
+        for (number, click) in block.chunks_exact(RAW_CLICK_WORDS).enumerate() {
+            if number * RAW_CLICK_WORDS >= fetched {
+                prefetch_line(next.wrapping_add(fetched));
+                fetched += 8;
+            }
             let [hash, at] = links.probe(click[0]);
             if waiting == AHEAD {
                 forward_click_ring(links, out, ring[slot]);
