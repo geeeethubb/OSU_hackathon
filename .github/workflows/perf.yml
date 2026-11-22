@@ -75,32 +75,17 @@ jobs:
             grep -v '^#' "$W/stat_$label.csv" | grep -v '^$'
             for t in user_daily campaign_daily; do printf '%s files: ' $t; ls "$W/out/$t" | wc -l; done
           }
-          for round in 1 2; do
-            one "t4_r$round" 0-3 4
-            one "t2core_r$round" "$siblings" 2
-            one "t2cores_r$round" "0,$other" 2
-            one "t1_r$round" 0 1
+          for threads in 1 4; do
+            cpus=$([ $threads = 1 ] && echo 0 || echo 0-3)
+            for round in 1 2; do
+              echo "=== cpu-clock profile, NCPU=$threads, taskset $cpus, round $round"
+              rm -rf "$W/out" && mkdir -p "$W/out"
+              env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=$threads SS_TIMING=1 \
+                "$PERF" record -F 9999 -e cpu-clock -o "$W/clock.data" -- taskset -c $cpus "$W/pipeline" 2> "$W/rec.txt" || true
+              grep -E "stage=total|samples" "$W/rec.txt" | paste -sd' '
+              "$PERF" report -i "$W/clock.data" --stdio --no-children --sort dso,symbol --percent-limit 0.25 2>&1 | grep -v "^#" | grep -v "^$" | head -n 70
+            done
           done
-          echo "=== topdown (where the PMU offers it)"
-          rm -rf "$W/out" && mkdir -p "$W/out"
-          env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 "$PERF" stat --topdown -- taskset -c 0-3 "$W/pipeline" 2>&1 | tail -n 20 || true
-          rm -rf "$W/out" && mkdir -p "$W/out"
-          env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 "$PERF" stat -M PipelineL1 -- taskset -c 0-3 "$W/pipeline" 2>&1 | tail -n 20 || true
-          echo "=== record: cycles, instructions, branch misses per function (4 threads)"
-          rm -rf "$W/out" && mkdir -p "$W/out"
-          if ! env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 \
-              "$PERF" record -q -F 2999 -e '{cycles,instructions,branch-misses}' -o "$W/perf.data" -- taskset -c 0-3 "$W/pipeline" 2>/dev/null; then
-            echo "hardware sampling refused: cpu-clock instead"
-            rm -rf "$W/out" && mkdir -p "$W/out"
-            env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 \
-              "$PERF" record -q -F 4999 -e cpu-clock -o "$W/perf.data" -- taskset -c 0-3 "$W/pipeline" 2>/dev/null || true
-          fi
-          "$PERF" report -i "$W/perf.data" --stdio --group --sort comm,dso,symbol --percent-limit 0.3 2>/dev/null | head -n 120 || true
-          echo "=== record: cycles, L1 misses, LLC misses per function (4 threads)"
-          rm -rf "$W/out" && mkdir -p "$W/out"
-          env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 \
-            "$PERF" record -q -F 2999 -e '{cycles,L1-dcache-load-misses,LLC-load-misses}' -o "$W/perf2.data" -- taskset -c 0-3 "$W/pipeline" 2>/dev/null \
-            && "$PERF" report -i "$W/perf2.data" --stdio --group --sort symbol --percent-limit 0.5 2>/dev/null | head -n 80 || echo "cache sampling refused"
           mkdir -p "$W/probe" && cp "$W"/stat_*.csv "$W"/err_*.txt "$W/probe/" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
