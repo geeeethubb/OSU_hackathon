@@ -170,7 +170,38 @@ struct LongSlot {
 fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch: &mut ScratchB) {
     let words: usize = lists.iter().map(PartList::words).sum();
     let most_records = words / 4;
-    let bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    let started = scratch.measure.then(std::time::Instant::now);
+    // `parse::long_part` picked this partition with the top bits of one
+    // multiply of these words: every ID here has the same ones. Slots and
+    // buckets come from a different multiply (the same one would crowd the
+    // partition's IDs into a few slots, and probing would go quadratic).
+    let mixed = |first: u8, value: u128| -> u64 {
+        let folded = (value as u64) ^ ((value >> 64) as u64).rotate_left(29) ^ u64::from(first);
+        (folded ^ (folded >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+    };
+    // As in `dedup_coded`: only the records of buckets of IDs with two or
+    // more records go through the table, sized for them.
+    let filter_bits = may_repeat_bits(most_records);
+    let mut bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    if let Some(filter_bits) = filter_bits {
+        scratch.seen.clear();
+        scratch.seen.resize(1usize << (filter_bits - 6), [0; 2]);
+        let seen = &mut scratch.seen[..];
+        let mut repeats = 0usize;
+        for_each_long_record(lists, |first, value, _, _, _| {
+            let bucket = mixed(first, value) >> (64 - filter_bits);
+            let (word, bit) = ((bucket >> 6) as usize, 1u64 << (bucket & 63));
+            // SAFETY: `word` is below `seen.len()`: the bucket has `filter_bits` bits.
+            unsafe {
+                let cell = seen.get_unchecked_mut(word);
+                let before = cell[0] & bit;
+                cell[1] |= before;
+                cell[0] |= bit;
+                repeats += usize::from(before != 0);
+            }
+        });
+        bits = ((repeats * 2).max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    }
     let capacity = 1usize << bits;
     let table = &mut scratch.long_table;
     table.clear();
@@ -178,17 +209,21 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
     let lost = &mut scratch.long_lost;
     lost.clear();
     lost.resize(most_records / 64 + 1, 0);
-    let started = scratch.measure.then(std::time::Instant::now);
+    let seen = &scratch.seen[..];
     let mut sequence = 0u32;
     for_each_long_record(lists, |first, value, _, word1, _| {
+        let hashed = mixed(first, value);
+        if let Some(filter_bits) = filter_bits {
+            let bucket = hashed >> (64 - filter_bits);
+            // SAFETY: as in the first pass.
+            if unsafe { seen.get_unchecked((bucket >> 6) as usize)[1] } & (1u64 << (bucket & 63)) == 0 {
+                sequence += 1;
+                return;
+            }
+        }
         let ingest = (word1 >> 1) & INGEST_MASK;
         let (low, high) = (value as u64, (value >> 64) as u64);
-        // `parse::long_part` picked this partition with the top bits of one
-        // multiply of these words: every ID here has the same ones. The slot
-        // comes from a different multiply (the same one would crowd the
-        // partition's IDs into a few slots, and probing would go quadratic).
-        let folded = low ^ high.rotate_left(29) ^ u64::from(first);
-        let mut at = ((folded ^ (folded >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
+        let mut at = (hashed >> (64 - bits)) as usize;
         let named = u64::from(first) << 56;
         let meta = named | (ingest << 32) | u64::from(sequence + 1);
         loop {
