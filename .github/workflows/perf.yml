@@ -1,0 +1,97 @@
+# Paired native timings on Intel runners only (diagnostics, labelled native).
+#
+# Default against SS_STAGED=0: the scored build from the root
+# Dockerfile, /pipeline copied out and run natively, 4 threads pinned to CPUs
+# 0-3, warm page cache, on 20M seeds 2, 3 and 5. Per seed, six interleaved pairs
+# in the balanced order AB BA BA AB AB BA for each of: default (A) against
+# SS_LEAD=0 (B), default (A) against SS_LEAD=4096 (B), and default against
+# default (A/A). Each run: fresh output folder, sync before it, then its
+# in-process total (SS_TIMING stage=total) and its process wall clock.
+# A job that does not land on an Intel CPU stops at once.
+#
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  pairs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Intel only
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "CPU: $model"
+          if lscpu | grep -q GenuineIntel; then echo "intel=1" >> "$GITHUB_OUTPUT"; else echo "not Intel: nothing to do"; fi
+      - uses: actions/checkout@v4
+        if: steps.cpu.outputs.intel == '1'
+      - name: Restore generator and dev answer
+        if: steps.cpu.outputs.intel == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator, scored build
+        if: steps.cpu.outputs.intel == '1'
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          docker build -q -t ss-probe .
+          id=$(docker create ss-probe)
+          docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline"
+          docker rm "$id" >/dev/null
+          sha256sum "$RUNNER_TEMP/pipeline"
+          lscpu | grep -E "Model name|Thread|Core|L2|L3"
+      - name: Paired runs
+        if: steps.cpu.outputs.intel == '1'
+        run: |
+          cat > "$RUNNER_TEMP/pairs.py" <<'PYEOF'
+          import os, re, statistics, subprocess, sys, time
+          W = os.environ["RUNNER_TEMP"]
+          BIN = f"{W}/pipeline"
+          ORDER = ["AB", "BA", "BA", "AB", "AB", "BA"]
+          COMPARISONS = [("staged0", {"SS_STAGED": "0"}), ("aa", {})]
+
+          def run(data, extra):
+              out = f"{W}/out"
+              subprocess.run(["rm", "-rf", out], check=True)
+              os.makedirs(out)
+              subprocess.run(["sync"], check=True)
+              env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out, SCRATCH_DIR=out, NCPU="4", SS_TIMING="1", **extra)
+              start = time.perf_counter_ns()
+              p = subprocess.run(["taskset", "-c", "0-3", BIN], env=env, capture_output=True, text=True)
+              wall = (time.perf_counter_ns() - start) / 1e6
+              m = re.search(r"stage=total ms=([\d.]+)", p.stderr)
+              ok = p.returncode == 0 and os.listdir(f"{out}/user_daily") and os.listdir(f"{out}/campaign_daily")
+              if not ok:
+                  print(f"RUN FAILED rc={p.returncode} {p.stderr[-500:]}")
+              return float(m.group(1)) if m else float("nan"), wall
+
+          for seed in sys.argv[1:]:
+              data = f"{W}/data_{seed}"
+              subprocess.run([f"{os.environ['HOME']}/ss-tools/generate", "--seed", seed, "--events", "20000000",
+                              "--clicks", "5000000", "--output", data], check=True, capture_output=True)
+              subprocess.run(f"find {data} -type f -exec cat {{}} + > /dev/null", shell=True, check=True)
+              run(data, {})  # first touch of the binary and the data, not counted
+              for name, variant in COMPARISONS:
+                  diffs, walls = [], []
+                  print(f"seed {seed} {name} (A = default, B = {variant or 'default'}): in-process ms, wall ms")
+                  for i, order in enumerate(ORDER):
+                      res = {}
+                      for label in order:
+                          res[label] = run(data, {} if label == "A" else variant)
+                      a, b = res["A"], res["B"]
+                      diffs.append(b[0] - a[0]); walls.append(b[1] - a[1])
+                      print(f"  pair {i+1} {order}: A {a[0]:8.1f} ({a[1]:7.1f})  B {b[0]:8.1f} ({b[1]:7.1f})  B-A {b[0]-a[0]:+7.1f} ({b[1]-a[1]:+7.1f})")
+                  won = sum(d > 0 for d in diffs)
+                  print(f"  seed {seed} {name}: median B-A in-process {statistics.median(diffs):+.1f} ms (wall {statistics.median(walls):+.1f}); "
+                        f"default faster in {won}/6 pairs")
+              subprocess.run(["rm", "-rf", data], check=True)
+          PYEOF
+          python3 "$RUNNER_TEMP/pairs.py" 2 3 5
