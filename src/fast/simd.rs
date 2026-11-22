@@ -394,8 +394,11 @@ pub unsafe fn event_row_fast<const MODE: u32, const INDEXED: bool>(
     let block0 = _mm256_loadu_si256(p as *const __m256i);
     let block1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
     let block2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+    // Rows of up to 127 bytes: a row with an ID of 33 characters (one in
+    // eight distinct IDs of current generated data) is about 100 to 125.
+    let block3 = _mm256_loadu_si256(p.add(96) as *const __m256i);
     let newline_low = mask(block0, newline) | (mask(block1, newline) << 32);
-    let newline_high = mask(block2, newline);
+    let newline_high = mask(block2, newline) | (mask(block3, newline) << 32);
     if newline_low != 0 {
         return (newline_low.trailing_zeros() as usize, ROW_SLOW);
     }
@@ -407,9 +410,9 @@ pub unsafe fn event_row_fast<const MODE: u32, const INDEXED: bool>(
     let length = 64 + high_length as usize;
     let below_high = (1u64 << high_length) - 1;
     let comma_low = mask(block0, comma) | (mask(block1, comma) << 32);
-    let comma_high = mask(block2, comma) & below_high;
+    let comma_high = (mask(block2, comma) | (mask(block3, comma) << 32)) & below_high;
     let quote_low = mask(block0, quote) | (mask(block1, quote) << 32);
-    let quote_high = mask(block2, quote) & below_high;
+    let quote_high = (mask(block2, quote) | (mask(block3, quote) << 32)) & below_high;
     if MODE == 2 {
         row.event ^= comma_low ^ comma_high ^ quote_low ^ quote_high;
         return (length, ROW_DROP);
@@ -439,25 +442,20 @@ pub unsafe fn event_row_fast<const MODE: u32, const INDEXED: bool>(
         return (length, ROW_DROP);
     }
 
-    // The first three commas from the low word, the last three from the 64
-    // bytes that end at the newline.
-    let tail = (comma_low >> high_length) | comma_high.wrapping_shl(64 - high_length);
-    if commas_low < 3 || tail.count_ones() < 3 {
-        return (length, ROW_SLOW);
-    }
-    let c0 = comma_low.trailing_zeros() as usize;
-    let rest = comma_low & (comma_low - 1);
-    let c1 = rest.trailing_zeros() as usize;
-    let rest = rest & (rest - 1);
-    let c2 = rest.trailing_zeros() as usize;
-    let lead5 = tail.leading_zeros();
-    let tail = _bzhi_u64(tail, 63 - lead5);
-    let lead4 = tail.leading_zeros();
-    let tail = _bzhi_u64(tail, 63 - lead4);
-    let lead3 = tail.leading_zeros();
-    let c5 = length - 1 - lead5 as usize;
-    let c4 = length - 1 - lead4 as usize;
-    let c3 = length - 1 - lead3 as usize;
+    // The six commas, in order, from both words (exactly six, checked above).
+    let all = (u128::from(comma_high) << 64) | u128::from(comma_low);
+    let c0 = all.trailing_zeros() as usize;
+    let all = all & (all - 1);
+    let c1 = all.trailing_zeros() as usize;
+    let all = all & (all - 1);
+    let c2 = all.trailing_zeros() as usize;
+    let all = all & (all - 1);
+    let c3 = all.trailing_zeros() as usize;
+    let all = all & (all - 1);
+    let c4 = all.trailing_zeros() as usize;
+    let all = all & (all - 1);
+    let c5 = all.trailing_zeros() as usize;
+    let _ = commas_low;
     if MODE == 3 {
         row.event ^= (c0 ^ c1 ^ c2 ^ c3 ^ c4 ^ c5) as u64 ^ opened;
         return (length, ROW_DROP);
