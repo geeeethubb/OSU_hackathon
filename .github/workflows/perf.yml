@@ -1,0 +1,93 @@
+# cpu-clock profile of the scored build on Intel runners only (diagnostics).
+#
+# Root Dockerfile build, /pipeline copied out and run natively on 20M seed 2,
+# 4 threads on CPUs 0-3, warm page cache, two recorded rounds at 9,999 Hz.
+# Reported: in-process stages; per-function shares at 0.3% and up (pipeline and
+# kernel) for both rounds; the same for the link stage alone (the samples of the
+# first (startup + links_parse) / total of the run, via perf report --time);
+# and the 8 hottest instructions, each with the 10 before it, of every pipeline
+# function at 1% or more of the run and of every function at 3% or more of the
+# link-stage window. Jobs on a non-Intel CPU stop at once.
+#
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Intel only
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "CPU: $model"
+          if lscpu | grep -q GenuineIntel; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "not Intel: nothing to do"; fi
+      - uses: actions/checkout@v4
+        if: steps.cpu.outputs.go == '1'
+      - name: Restore generator and dev answer
+        if: steps.cpu.outputs.go == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator, data, scored build
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data"
+          docker build -q -t ss-probe .
+          id=$(docker create ss-probe)
+          docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline"
+          docker rm "$id" >/dev/null
+          sha256sum "$RUNNER_TEMP/pipeline"
+          lscpu | grep -E "Model name|Thread|Core|L1d|L2|L3"
+      - name: perf
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1)
+          [ -x "$PERF" ] || PERF=$(command -v perf)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          W="$RUNNER_TEMP"
+          find "$W/data" -type f -exec cat {} + > /dev/null
+          annotate() {
+            local data="$1" sym="$2" label="$3"
+            "$PERF" annotate -i "$data" --stdio --no-source "$sym" > "$W/ann.txt" 2>/dev/null || true
+            echo "=== annotate $sym ($label): the 8 hottest instructions, each with the 10 before it"
+            for at in $(awk '/^ +[0-9]+\.[0-9]+ +:/ {print $1 " " NR}' "$W/ann.txt" | sort -rn | head -n 8 | cut -d' ' -f2); do
+              echo "- line $at"
+              sed -n "$((at > 10 ? at - 10 : 1)),$((at + 1))p" "$W/ann.txt" | cut -c1-130
+            done
+          }
+          for round in 1 2; do
+            rm -rf "$W/out" && mkdir -p "$W/out"
+            echo "=== round $round"
+            env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 SS_TIMING=1 \
+              "$PERF" record -F 9999 -e cpu-clock -o "$W/clock_$round.data" -- taskset -c 0-3 "$W/pipeline" 2> "$W/rec_$round.txt" || true
+            grep -E "stage=|cpu_|links_build|startup_" "$W/rec_$round.txt" | sed 's/SS_TIMING //' | paste -sd' '
+            "$PERF" report -i "$W/clock_$round.data" --stdio --no-children --sort dso,symbol --percent-limit 0.3 2>&1 | grep -E "^ +[0-9]" | head -n 70
+            pct=$(awk '/stage=startup ms=/ {split($0,a,"ms="); s+=a[2]} /stage=links_parse ms=/ {split($0,a,"ms="); s+=a[2]} /stage=total ms=/ {split($0,a,"ms="); t=a[2]} END {printf "%d", (s / t) * 100 + 1}' "$W/rec_$round.txt")
+            echo "=== round $round link stage window: the first ${pct}% of the run's samples"
+            "$PERF" report -i "$W/clock_$round.data" --stdio --no-children --sort dso,symbol --percent-limit 0.5 --time "0%-${pct}%" 2>&1 | grep -E "^ +[0-9]" | head -n 40
+          done
+          syms=$("$PERF" report -i "$W/clock_1.data" --stdio --no-children --sort symbol --percent-limit 1 2>/dev/null \
+            | grep -E "^ +[0-9]" | grep -v "\[k\]" | sed -E 's/^ +[0-9.]+% +\[\.\] +//; s/ {2,}.*$//; s/ +$//')
+          while IFS= read -r sym; do [ -n "$sym" ] && annotate "$W/clock_1.data" "$sym" "whole run, round 1"; done <<< "$syms"
+          pct=$(awk '/stage=startup ms=/ {split($0,a,"ms="); s+=a[2]} /stage=links_parse ms=/ {split($0,a,"ms="); s+=a[2]} /stage=total ms=/ {split($0,a,"ms="); t=a[2]} END {printf "%d", (s / t) * 100 + 1}' "$W/rec_1.txt")
+          lsyms=$("$PERF" report -i "$W/clock_1.data" --stdio --no-children --sort symbol --percent-limit 3 --time "0%-${pct}%" 2>/dev/null \
+            | grep -E "^ +[0-9]" | grep -v "\[k\]" | sed -E 's/^ +[0-9.]+% +\[\.\] +//; s/ {2,}.*$//; s/ +$//')
+          while IFS= read -r sym; do
+            [ -n "$sym" ] || continue
+            echo "$syms" | grep -qxF "$sym" && continue
+            annotate "$W/clock_1.data" "$sym" "link stage window, whole-run samples"
+          done <<< "$lsyms"
