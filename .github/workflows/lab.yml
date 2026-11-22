@@ -1,0 +1,36 @@
+# One-off measurement, branch exp-lab only: the session kernel's own lap
+# profile (sessions.rs PROFILE = true) on a hosted runner, F4's code, 20M seed 2.
+# Diagnostic build only; nothing here is ranked or scored.
+name: profile-lab
+on:
+  push:
+    branches: [exp-lab]
+permissions:
+  contents: read
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Machine
+        run: lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core" || true
+      - name: Tools and data
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data" >/dev/null
+          cat "$RUNNER_TEMP"/data/*/*.csv > /dev/null
+      - name: Build with the session kernel's profile on
+        run: |
+          sed -i 's/^const PROFILE: bool = false;$/const PROFILE: bool = true;/' src/fast/sessions.rs
+          grep -n "^const PROFILE" src/fast/sessions.rs
+          docker buildx build --platform linux/amd64 --load -t ss-prof .
+          cid=$(docker create ss-prof); docker cp "$cid:/pipeline" "$RUNNER_TEMP/pipeline"; docker rm "$cid" >/dev/null
+      - name: Runs
+        run: |
+          for round in 1 2 3; do
+            O="$RUNNER_TEMP/out"; rm -rf "$O"; mkdir -p "$O"
+            echo "== round $round" | tee -a "$GITHUB_STEP_SUMMARY"
+            DATA_DIR="$RUNNER_TEMP/data" OUTPUT_DIR="$O" SCRATCH_DIR="$O" NCPU=4 SS_TIMING=1 "$RUNNER_TEMP/pipeline" 2>&1 \
+              | grep -E "SESSIONS_PROFILE|stage=indexed|cpu_index_kernel|cpu_index_partitions|stage=total" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
