@@ -210,7 +210,7 @@ variable-width IDs, one in eight long hexadecimal). Scores on it are not compara
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| presumably `32b8fffd658af203da5e5809c9d3ce9eaede94ee` (F5, `pipeline` head when submitted; SHA not relayed, to confirm) | **0.7698 s** (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:45 UTC: rank 11, the team's best ever; board top 0.5528 s |
+| `32b8fffd658af203da5e5809c9d3ce9eaede94ee` (F5) | **0.7698 s** (shopping-sessions-5) | BB-4A6C474E | relayed by the user 2026-11-22 about 03:45 UTC (SHA and receipt confirmed in the audit relayed about 04:00): rank 11, the team's best ever; board top 0.5528 s (not rechecked here); current accepted baseline |
 | `9735a63d039ee9ee843e0204f1d988bd5c822f41` (opaque IDs, general path) | 1.2745 s (shopping-sessions-5) | BB-32BE0EA7 | relayed by the user 2026-11-22 about 03:20 UTC |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 5.6629 s (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:20 UTC: index mode, outside the new rules |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 0.4648 s (previous dataset) | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
@@ -1077,3 +1077,25 @@ base was `b890895` and the comparison was against candidate E.
   user-table lookups are about 100 thread-ms of the parse at 4 threads (-25 ms of parse stage), net of
   the forward's added work below the +15 ms bar: NOT BUILT. Long-row kernel for every row: 4% slower
   (laptop): rejected.
+
+### 04:00 UTC: F5 confirmed as the accepted baseline; 60M gap closed; D1 measured
+
+- F5 = `32b8fff`, 0.7698 s, receipt BB-4A6C474E (confirmed). `bench/BEST_SHA` now names it: every CI
+  run pairs against today's best, so regressions against it show.
+- **60M reference comparison, complete (local, untimed):** new generator seed 2, 60M events / 15M
+  clicks, laptop with 31 GiB: `reference.exe` (unchanged since `9735a63`) exit 0 in 140 s; F5's exact code
+  (built from `32b8fff`) **MATCH** both tables; the current head `951373b` **MATCH**. This closes the CI
+  run's incomplete comparison (the reference was OOM-killed at 14 GiB there).
+- **D1, clicks straight into person partitions (`f1121d0`): REJECTED by measurement.** Against its
+  parent -9.0 / -8.7 / -9.2 ms (3/18 pairs, Xeon 6975P-C, run 44981178620); same image with the old path
+  (`SS_CLICKS_DIRECT=0`) +7.1 / +8.1 / +6.5 ms faster than the default. Stages: parse +47 ms (click parse
+  310 -> 524 thread-ms with the link lookups and scatter inside the hyperthreaded parse), dedup -43 ms.
+  Diagnosis: moving latency-bound lookups into a uop-bound phase whose hyperthreads already fill the core
+  costs more than the separate pass it removes; the raw list traffic it saves is cheap. The code goes.
+- **C, user identity resolved after dedup: bounded, not built.** Linux `SS_DIAG_USERS=1` (run
+  44980589665, EPYC 7763): the parse's user-table lookups are about 100 thread-ms at 4 threads (parse
+  stage -24/-25 ms), about 92 ms of a one-thread parse; moving them to the forward costs part of that back.
+- **Serial and barrier time (hypothesis from CI scaling, run 44979567715):** one to two threads on two
+  cores leaves about 50 / 41 / 42 ms unscaled in parse / dedup / sessions (plus about 12 in link rows):
+  single-threaded sections between stages and stragglers. On an 8-thread scorer these do not shrink.
+  Being measured directly (per-phase idle time) next.
