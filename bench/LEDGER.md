@@ -205,9 +205,14 @@ known so far is 1.38 s for `e4eef020`).
 
 ## Official practice scores (reported by the team's submission watch, not measured here)
 
+From 2026-11-22 the official page runs **shopping-sessions-5** (the republished generator: opaque
+variable-width IDs, one in eight long hexadecimal). Scores on it are not comparable with the earlier ones.
+
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | **0.4648 s** | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
+| `9735a63d039ee9ee843e0204f1d988bd5c822f41` (opaque IDs, general path) | **1.2745 s** (shopping-sessions-5) | BB-32BE0EA7 | relayed by the user 2026-11-22 about 03:20 UTC; current accepted baseline |
+| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 5.6629 s (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:20 UTC: index mode, outside the new rules |
+| `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 0.4648 s (previous dataset) | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
 | `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | 0.4663 s | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:45 UTC |
 | `1033956062d3cd948462c664d822f2636bcf1153` (candidate F) | 0.5231 s | BB-337F162E | relayed by the user 2026-11-21 about 23:22 UTC; rank 37 when checked; the board's best was 0.2778 s |
 | `2dae9298f4e1e0a5259eec54c400501b00fae26f` | 0.6389 s (shown earlier as 0.64 s) | not relayed | relayed by the user 2026-11-21 |
@@ -1002,7 +1007,7 @@ base was `b890895` and the comparison was against candidate E.
   cells cheap; reach, credit and setup about 70 CPU-ms (cross-runner subtraction, approximate).
 - **E3, allocator with 2 MiB-aligned own mappings** (`ea7d6ac`, branch `exp-ci-align`, with 60M): in CI.
 
-### 02:00-03:40 UTC: the republished generator, and the opaque-ID engine
+### 02:00-02:50 UTC: the republished generator, and the opaque-ID engine
 
 - **Republish, MEASURED (about 01:30 UTC):** the track page's `rules.md`, generator and dev answer
   changed (generator.zip sha256 `78f973f7...`, dev-answer.zip `c2439e0e...`; `bench/fetch_tools.sh`
@@ -1033,3 +1038,21 @@ base was `b890895` and the comparison was against candidate E.
   (event parse CPU -20% with the lock-free table).
 - Lesson recorded: `727afb7` passed every correctness check and lost 500 ms; a step is judged by its
   paired CI run, never by its local parse timing alone.
+
+### 03:20 UTC: official result on shopping-sessions-5; baseline moved
+
+- **Official: `9735a63` scored 1.2745 s** (receipt BB-32BE0EA7) on the current dataset version
+  shopping-sessions-5; F4 `bad5c1b` scores 5.6629 s there. `9735a63` is the accepted baseline;
+  `bench/BEST_SHA` now names it, so CI pairs every push against it (F4 took about 5 s per run).
+- Calibration point (one runner type, EPYC 7763): `9735a63` CI container 2,070 / 2,128 / 2,079 ms
+  (seeds 2/3/5, run 44973966804) against 1,274.5 ms official: official/CI about 0.61 on this data
+  (0.66 slope + 80 ms on the old data would have predicted 1.46 s). New goal: below 0.6018 s official,
+  roughly CI 900-990 ms on an EPYC 7763 runner by this ratio; stretch 0.20 s.
+- Further steps measured since the table above (A = parent, B = step; EPYC 7763 unless named):
+  `e2aed79` stack (long-ID dedup by value + its fix, click kernel to 127 bytes, click IDs per worker)
+  against `4cea00c`: +413 / +442 / +420 ms (18/18, Xeon 8370C, run 44977055289); `a2cf9f0` alone
+  +72 / +70 / +70 (16/18, run 44976784731); `6d9ec1f` lock-free user table and vector hex digits
+  +56 / +62 / +57 (18/18, run 44977620389); `1ffd278` prefetch ring for long-ID survivors
+  +13 / +9 / -12 (10/18, run 44977877879): NOT DEMONSTRATED, neutral, left in the chain.
+  Container of `1ffd278` on EPYC 7763: about 1,250-1,270 ms. Its startup stage is 18 ms (was 2):
+  the user table's 32 MiB zeroed on one thread; `dffab6f` moves it to fresh zero pages (in CI).
