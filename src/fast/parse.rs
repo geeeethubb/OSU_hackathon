@@ -1254,7 +1254,9 @@ pub fn parse_links_chunk(ctx: &Ctx, buffer: &[u8], start: usize, end: usize, out
         let safe = buffer.len().saturating_sub(ROW_PAD);
         let verify = ctx.verify;
         let mut pair = (0u64, 0u64);
+        let lead = super::simd::input_lead();
         while position < limit && position < safe {
+            super::simd::prefetch_input(buffer.as_ptr().wrapping_add(position), lead);
             // SAFETY: at least ROW_PAD readable bytes follow `position`.
             let (length, status) = unsafe { link_row_fast(ctx, buffer.as_ptr().add(position), &mut pair) };
             if status == ROW_EMIT && !verify {
