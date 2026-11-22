@@ -4,7 +4,12 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 07:00 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 07:30 UTC, shopping-sessions-5)
+
+- **Candidate F11 = head of `pipeline` (this commit)** = F10 + long-ID link kernel (`SS_LINK_LONG`) + user
+  indexes in per-thread blocks with padded region locks (`SS_INDEX_BLOCK`); build inputs = `9612344` (C4).
+  Against F10: Intel +7 to +16 ms (CI 34/36, e1 native 68/72), AMD +10 to +14 (49/54 incl. fresh seeds),
+  60M 19/19 MATCH (LEDGER 07:30). F10 `20d2f71` and F8 `8652004` are the fallbacks.
 
 - **Candidate F10 = head of `pipeline` (this commit)** = F8 + click long-ID path (`SS_CLICK_LONG`) + block
   recycling in pass B (`SS_RECYCLE`) + wide-row kernel (`SS_WIDE`); build inputs = `929baca` (C2). Against

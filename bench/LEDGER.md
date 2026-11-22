@@ -1411,3 +1411,43 @@ C2 (`929baca`) against F8 as whole binaries (A-B > 0 = C2 faster):
   engine's other modes (SS_KERNEL=plain and general, SS_STRUCT=1, SS_FAST=0); new 60M: all MATCH.
 - **F10 = the head of `pipeline` after this commit**: `0a8c971` + `723c51a` + `9870032` cherry-picked onto
   F8's commit, the same build inputs as `929baca`. Native whole-image Intel pairs (e1) still running.
+
+### 07:10 UTC: F10's exact commit; native Intel image pairs; link stage
+
+- **F10 `20d2f71` push run (44996016661) against F6**: 20M on an EPYC 9V45 +57.2 / +56.3 / +60.5 ms (18/18);
+  **60M on an EPYC 7763 +266.5 ms (6/6), F10's 19/19 runs MATCH `/reference`, peak 2.12 GiB**; 36/36, 43/43.
+- **e1, native whole-image pairs against F8** (images built from 284f1ca, fc165ba, 929baca): C2 (= F10's
+  build) Xeon 8573C +24.8 / +16.0 / +26.0 ms (18/18); Xeon 6975P-C +18.2 / +13.6 / +18.4 (18/18), +10.3 /
+  +17.7 / +20.2 (17/18), +15.4 / +17.1 / +19.9 (17/18); Xeon 6973P-C +29.5 / +33.6 / +32.7 (17/18): 87/90.
+  C1: 8573C +10.6 / +5.0 / +12.5 (18/18), 6975P-C +5 to +8 (14-16/18), 6973P-C +22 to +26 (18/18).
+- **e1's profile of F10 on Intel** (8573C x2, 6975P-C): pass B 24%, short-row assembly 18.5%, event_lean_long
+  11-12%, pass C ~17% (closure 7, finish_person 3.7, attribute 4, buckets 2), map_clicks 4%, click parse 6%,
+  kernel_init_pages 2.7%, link builder 1.7%, memset 0.8%. **Link stage (35-41 ms on the 8573C)**:
+  Interner::code 19-26%, split_fields::<2> 12-16%, HexTable::insert 14-17%, parse_links_chunk 11-17%,
+  kernel_init_pages 8-10%: the long-ID rows' general path and first-time inserts.
+- **C4 = F10 + `link_lean_long` (`c689268`) + per-thread index blocks and padded region locks (`9612344`)**:
+  laptop link stage 32.5 -> 24.7 ms at 4 threads, 27.0 -> 19.5 at 8; all sets MATCH (incl. a mutated link
+  set of 6,681 rows, SS_INDEX_BLOCK=1, 60M). CI against F10 on exp-c4-a running.
+
+### 07:30 UTC: F11 = F10 + long-ID link kernel + per-thread index blocks passes its gate
+
+C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same build inputs) against F10:
+
+| Runner | Run | Seeds | A-B per seed | Pairs |
+|---|---|---|---|---|
+| Xeon 6975P-C | 44996766465 | 2 / 3 / 5 | +15.1 / +14.2 / +12.6 ms | 18/18 |
+| Xeon 6975P-C | 44996759241 | 2 / 3 / 5 | +7.4 / +7.9 / +11.8 ms | 16/18 |
+| EPYC 7763 | 44996755709 | 2 / 3 / 5 | +13.4 / +13.0 / +11.8 ms | 17/18 |
+| EPYC 7763 | 44997475457 | fresh 149 / 151 / 157 | +14.0 / +10.5 / +11.3 ms | 15/18 |
+| EPYC 7763 | 44997479405 | fresh 163 / 167 / 173 | +10.1 / +12.1 / +10.1 ms | 17/18 |
+
+- Same image, F10's behaviour (SS_INDEX_BLOCK=1 SS_LINK_LONG=0) slower by 12.1 / 13.2 / 12.5 and 13.0 / 9.3 / 8.7 ms
+  on the two 6975P-C runs. e1, native whole images against F10: Xeon 8573C +15.7 / +13.3 / +13.2 (17/18),
+  Xeon 6975P-C +8.0 / +13.1 / +16.4 (16/18), +12.8 / +13.6 / +10.2 (18/18), +8.7 / +8.1 / +9.8 (17/18): 68/72;
+  the link kernel alone +3 to +7 ms, the index blocks +5 to +9 ms more.
+- 60M (EPYC 9V74, push run): 19/19 runs MATCH `/reference`, peak 2.14 GiB, +2.2 ms against F10 (3/6).
+- Every run 36/36, 43/43, dev MATCH. Local gate on the exact tree: all sets incl. a mutated link set
+  (6,681 rows) in default, SS_VERIFY and SS_INDEX_BLOCK=1 modes; 60M MATCH.
+- In flight: a link table with two-word entries so the bitmap can shrink (`4117620`, SS_LINK_SPREAD; e1's
+  bound: forward + click map -20% (8573C) to -30% (6975P-C) with the bitmap always cached), and
+  `event_lean_long` finding its commas with pdep (`5c7749b`).
