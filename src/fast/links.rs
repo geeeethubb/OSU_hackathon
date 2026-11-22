@@ -29,6 +29,7 @@
 //! links one entry cannot describe, go through a forest and into a table,
 //! which is small.
 
+use std::hint::select_unpredictable;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -119,21 +120,29 @@ impl Table {
     }
 
     /// `lookup(user)` from what `probe(user)` returned.
+    ///
+    /// Whether the home bit is set is as good as random (about half of all
+    /// lookups find an entry), so no branch is taken on it: the entry, or a
+    /// word of no consequence when there is none, is read either way, and
+    /// the name is picked from the two. Only an entry that sits past its
+    /// home position (rare) takes the branch to `lookup_further`.
     #[inline(always)]
     fn lookup_probed(&self, user: u64, probe: [u64; 2]) -> (u64, bool) {
+        static NO_ENTRY: u64 = 0;
         let [hash, at] = probe;
-        if at >> 63 == 0 {
-            return (user, false);
-        }
+        let set = at >> 63 != 0;
         let rank = (at & !(1 << 63)) as usize;
-        let home = (hash >> self.rem_bits) as usize;
         let key = (hash << (self.displacement_bits + 1)) & ENTRY_KEY_MASK;
-        // SAFETY: a set bit has an entry at its rank.
-        let entry = unsafe { *self.entries.get_unchecked(rank) };
-        if entry & ENTRY_KEY_MASK == key {
-            return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        let source = select_unpredictable(set, self.entries.as_ptr().wrapping_add(rank), &NO_ENTRY as *const u64);
+        // SAFETY: a set bit has an entry at its rank; otherwise `source` is
+        // `NO_ENTRY`.
+        let entry = unsafe { *source };
+        let found = set & (entry & ENTRY_KEY_MASK == key);
+        if set & !found {
+            let home = (hash >> self.rem_bits) as usize;
+            return self.lookup_further(user, home, rank, key);
         }
-        self.lookup_further(user, home, rank, key)
+        (select_unpredictable(found, entry >> ENTRY_NAME_SHIFT, user), found & (entry & ENTRY_COMPLEX != 0))
     }
 
     /// The name code of the person `user` belongs to. Codes are never 0.
@@ -391,11 +400,8 @@ impl LinkTable {
         match &self.indexed {
             None => {
                 let name = self.table.lookup_probed(user, probe).0;
-                if name == user {
-                    probe[0]
-                } else {
-                    mix(name)
-                }
+                // As unpredictable as the lookup: both, then a pick.
+                select_unpredictable(name == user, probe[0], mix(name))
             }
             Some(indexed) => mix(self.lookup_indexed(indexed, user).0),
         }
