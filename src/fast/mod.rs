@@ -390,19 +390,46 @@ impl<T> Slots<T> {
     }
 }
 
+/// Diagnostics (`SS_TIMING`): every parallel phase reports its wall time,
+/// when its first and its last thread were done, and the thread time spent
+/// waiting at its end for the last one.
+static PHASE_REPORT: AtomicBool = AtomicBool::new(false);
+
 /// Runs `work(thread_index)` on `threads` threads and waits for all of them.
 fn parallel(threads: usize, work: impl Fn(usize) + Sync) {
     if threads <= 1 {
         work(0);
         return;
     }
+    let report = PHASE_REPORT.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let done: Vec<AtomicU64> = (0..if report { threads } else { 0 }).map(|_| AtomicU64::new(0)).collect();
+    let finish = |thread: usize| {
+        if report {
+            done[thread].store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    };
     std::thread::scope(|scope| {
         for thread in 1..threads {
-            let work = &work;
-            scope.spawn(move || work(thread));
+            let (work, finish) = (&work, &finish);
+            scope.spawn(move || {
+                work(thread);
+                finish(thread);
+            });
         }
         work(0);
+        finish(0);
     });
+    if report {
+        let wall = started.elapsed().as_secs_f64() * 1e3;
+        let ends: Vec<f64> = done.iter().map(|at| at.load(Ordering::Relaxed) as f64 / 1e6).collect();
+        let last = ends.iter().copied().fold(0.0, f64::max);
+        let first = ends.iter().copied().fold(f64::INFINITY, f64::min);
+        let idle: f64 = ends.iter().map(|end| last - end).sum();
+        eprintln!(
+            "SS_TIMING phase wall_ms={wall:.2} first_done_ms={first:.2} last_done_ms={last:.2} idle_thread_ms={idle:.2}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -464,6 +491,7 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> std::io::Result<bool> 
 
 fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::io::Result<Attempt> {
     let mut timing = Timing::new();
+    PHASE_REPORT.store(timing.enabled(), Ordering::Relaxed);
     let threads = threads.max(1);
     let Some(mut ctx) = Ctx::load_header(data)? else {
         return Ok(Attempt::Declined);
@@ -686,6 +714,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     timing.detail("cpu_parse_clicks", click_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.detail("links_build", link_build_nanos.load(Ordering::Relaxed) as f64 / 1e6);
     timing.stage("parse");
+    let serial_started = Instant::now();
     if ctx.diag != 0 {
         eprintln!("SS_DIAG={}: parse-only diagnostic, no output written", ctx.diag);
         timing.total();
@@ -712,6 +741,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
+    timing.detail("serial_dedup_setup", serial_started.elapsed().as_secs_f64() * 1e3);
     let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
     let winners_nanos = AtomicU64::new(0);
@@ -773,9 +803,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         _ => None,
     };
     timing.stage("dedup");
+    let serial_started = Instant::now();
 
     let click_exotic = ctx.click_ids.snapshot().with_threads(kept_click_ids);
-    let user_exotic = ctx.user_ids.snapshot_with(true);
+    // Long hexadecimal user IDs stay values: the user_daily writers spell
+    // out the ones that name a person as they write them, on every thread,
+    // instead of all of them being spelled out here on one (about 30 ms of
+    // a 20M input before the sessions pass could start).
+    let user_exotic = ctx.user_ids.snapshot();
     let c_out: Slots<PassCOut> = Slots::new(threads, || PassCOut::new(&ctx));
     // Each thread's user_daily file, written while the rows are produced.
     let sinks = UserSink::slots(&ctx, output, threads, &user_exotic);
@@ -923,6 +958,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         b_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     let person_clicks: Vec<Vec<PartList>> =
         b_out.iter_mut().map(|out| out.clicks.iter_mut().map(|writer| writer.finish()).collect()).collect();
+    timing.detail("serial_sessions_setup", serial_started.elapsed().as_secs_f64() * 1e3);
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {
         // SAFETY: slot `thread` of each belongs to this thread for the whole phase.
@@ -1034,7 +1070,13 @@ fn pattern_characters(code: u64) -> (u64, usize) {
 #[inline]
 fn user_name<'a>(code: u64, slot: &mut [u8; parquet::SHORT_TEXT], exotic: &'a Exotic) -> Text<'a> {
     if code >= codes::EXOTIC_BASE {
-        return Text::Long(exotic.text((code - codes::EXOTIC_BASE) as usize));
+        let index = (code - codes::EXOTIC_BASE) as usize;
+        if let Some((first, value)) = exotic.hex(index) {
+            let text: &mut [u8; 33] = (&mut slot[..33]).try_into().unwrap();
+            codes::write_hex_id(first, value, text);
+            return Text::Short(33);
+        }
+        return Text::Long(exotic.text(index));
     }
     let (characters, count) = pattern_characters(code);
     slot[0] = b'u';
@@ -1656,5 +1698,29 @@ mod tests {
             Text::Long(bytes) => assert_eq!(bytes, exotic.text(1)),
             Text::Short(_) => panic!("an exotic code is long"),
         }
+    }
+
+    #[test]
+    fn hexadecimal_names_are_spelled_out_in_the_slot() {
+        // A snapshot that keeps hexadecimal IDs as values, as the output uses.
+        let users = Interner::looked_up();
+        let ids: [&[u8]; 4] = [
+            b"u0123456789abcdef0123456789abcdef",
+            b"uffffffffffffffffffffffffffffffff",
+            b"x00000000000000000000000000000001",
+            b"UPPER-CASE AND LONGER THAN THE SLOT OF FORTY-EIGHT BYTES",
+        ];
+        let codes: Vec<u64> = ids.iter().map(|id| codes::id_code(id, b'u', &users)).collect();
+        let exotic = users.snapshot();
+        for (id, &code) in ids.iter().zip(&codes) {
+            let mut slot = [0xEEu8; parquet::SHORT_TEXT];
+            let written: &[u8] = match user_name(code, &mut slot, &exotic) {
+                Text::Short(length) => &slot[..length],
+                Text::Long(bytes) => bytes,
+            };
+            assert_eq!(written, *id);
+        }
+        assert!(exotic.hex((codes[0] - codes::EXOTIC_BASE) as usize).is_some());
+        assert!(exotic.hex((codes[3] - codes::EXOTIC_BASE) as usize).is_none());
     }
 }

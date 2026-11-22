@@ -606,11 +606,33 @@ impl Interner {
     }
 }
 
+/// The two lowercase hexadecimal digits of every byte.
+const fn hex_pairs() -> [[u8; 2]; 256] {
+    let mut pairs = [[0u8; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        pairs[byte] = [HEX_DIGITS[byte >> 4], HEX_DIGITS[byte & 15]];
+        byte += 1;
+    }
+    pairs
+}
+static HEX_PAIRS: [[u8; 2]; 256] = hex_pairs();
+
+/// Writes the ID of first byte `first` and hexadecimal value `value` (33
+/// bytes: the byte, then 32 lowercase digits, most significant first).
+#[inline]
+pub fn write_hex_id(first: u8, value: u128, out: &mut [u8; 33]) {
+    out[0] = first;
+    for (at, byte) in value.to_be_bytes().into_iter().enumerate() {
+        out[1 + 2 * at..3 + 2 * at].copy_from_slice(&HEX_PAIRS[usize::from(byte)]);
+    }
+}
+
 #[inline]
 fn push_hex(value: u128, out: &mut Vec<u8>) {
-    for shift in (0..32).rev() {
-        out.push(HEX_DIGITS[((value >> (shift * 4)) & 15) as usize]);
-    }
+    let mut text = [0u8; 33];
+    write_hex_id(0, value, &mut text);
+    out.extend_from_slice(&text[1..]);
 }
 
 #[derive(Clone, Copy)]
@@ -684,6 +706,17 @@ impl Exotic {
         match self.entry(index) {
             Entry::Bytes { start, end } => &self.arena[start as usize..end as usize],
             Entry::Hex { .. } => panic!("exotic ID {index} was not materialized"),
+        }
+    }
+
+    /// Exotic ID `index` as its first byte and value, when the snapshot holds
+    /// it that way (a hexadecimal ID of a snapshot made without
+    /// `materialize`); `None` when it holds its bytes.
+    #[inline]
+    pub fn hex(&self, index: usize) -> Option<(u8, u128)> {
+        match self.entry(index) {
+            Entry::Hex { first, value } => Some((first, value)),
+            Entry::Bytes { .. } => None,
         }
     }
 

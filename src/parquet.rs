@@ -993,7 +993,7 @@ pub const MAX_GROUP_ROWS: usize = 1 << 14;
 /// Pending bytes at which [`GroupWriter::begin`] writes before it starts a row group.
 const FLUSH_BYTES: usize = 1 << 16;
 /// Bytes of the slot [`GroupWriter::runs`] hands its callback.
-pub const SHORT_TEXT: usize = 16;
+pub const SHORT_TEXT: usize = 48;
 /// Integers below this find their dictionary index in a direct map.
 const DIRECT: usize = 1 << 16;
 /// Distinct integers outside the direct map a chunk may hold before it is written PLAIN.
