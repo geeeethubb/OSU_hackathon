@@ -1099,3 +1099,28 @@ base was `b890895` and the comparison was against candidate E.
   cores leaves about 50 / 41 / 42 ms unscaled in parse / dedup / sessions (plus about 12 in link rows):
   single-threaded sections between stages and stragglers. On an 8-thread scorer these do not shrink.
   Being measured directly (per-phase idle time) next.
+
+### 04:10 UTC: audit experiments 2A and 4 measured; serial time found
+
+- **Experiment 2A, prepared probe token (`951373b`): DEMONSTRATED.** Against `f1121d0`: +31.0 / +32.2 /
+  +31.6 ms (16/18, EPYC 9V74, run 44981757670): forward 628 -> 536 thread-ms. Without D1 (`0e71b47`)
+  against F5 `32b8fff`: +24.3 / +23.6 / +29.9, +22.0 / +24.4 / +28.4 (9V74), +20.6 / +22.1 / +39.3 (9V45),
+  +24.4 / +23.1 / +24.7 ms (runs 44982428067, -434104, -439287, -444957): 12 seed runs, all positive.
+- **Experiment 2B, worker-private user-to-person cache: REJECTED on reuse.** A user has about 14
+  events at 20M, spread over 1,024 random event partitions; a worker sees a user again only after
+  hundreds of thousands of other survivors, so a cache that hits would be the link table itself.
+- **Experiment 4, partition sizes (same image, A = default 10 bits): REJECTED, defaults stay.**
+  `SS_EVENT_PART_BITS=11` -5.2 / -5.5 / -14.6 ms, `=12` -20.9 / -16.0 / -17.6 (0/18); `SS_PERSON_PART_BITS=11`
+  -13.6 / +10.6 / +17.1 (noisy 9V45 runner, inconclusive), `=12` -5.7 / -16.1 / -10.3 (negative: the
+  variant is slower). Fewer than 10 bits cannot be represented (32-bit local keys of 42-bit codes).
+- **Container overhead is Docker's:** `diag noop` 63-69 ms; container minus in-process 72-79 ms, so
+  6-12 ms is process start and teardown. Nothing to win there.
+- **Barriers measured (`SS_TIMING` phase lines, laptop):** every parallel phase idles 2-8 thread-ms at
+  its end: balanced. **Serial sections:** 31 ms before the sessions pass (at 4 and 8 threads alike),
+  nearly all of it spelling out 186K long user IDs (`9643656` moves it to the output writers: 31 -> 5
+  ms; in CI), and the link-row stage (24-35 ms at 4 threads in CI for 66-75 ms of one-thread work;
+  `b236711` folds it into the parse pool; in CI).
+- **Generated code of the hot event loop (`events_lean_loop<0,false>`, inspected):** about 250
+  instructions for a view/cart row; about 10 reloads of spilled pointers, the F2 branch laid out as the
+  fall-through. An opaque-ID assembly loop could plausibly cut 20-25% of decode (about 4-5% of thread
+  time): not yet started.
