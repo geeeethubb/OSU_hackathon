@@ -1141,3 +1141,17 @@ base was `b890895` and the comparison was against candidate E.
   0.7698 s. Its CI steps against their parents were about +24 ms (probe tokens) and +29 to +40 ms (lazy
   names). `bench/BEST_SHA` now names F6. F6's own CI validation (20M three seeds and 60M against F5,
   fresh seeds 59/61/67) was still running when it was submitted; local gate: all MATCH, 60M MATCH.
+
+### 04:40 UTC: F6 validated in full; PGO demonstrated; assembly port in CI
+
+- **F6 `2676ee043442f0c33357a6f07f3548ae6ead3a4e`, official 0.7493 s, receipt BB-86EAB76C** (relayed).
+  Against F5 in CI: 20M seeds 2/3/5 +48.5 / +45.6 / +46.1 ms (18/18, Xeon 6975P-C, run 44984209007), 23/23
+  runs MATCH `/reference` per seed; fresh seeds 59/61/67 +63.3 / +67.1 / +63.9 ms (18/18, run
+  44984214146); **60M 3,445 vs 3,649 ms (+203.8, 6/6), peak 2.57 GiB, `/reference` exit 0 (147 s), 19/19
+  MATCH**; locally 60M MATCH too.
+- **PGO (`dbaac1c` = F6 + profile of F6 + `.dockerignore` fix) against F6: +25.1 / +15.5 / +16.0 ms
+  (18/18, EPYC 7763, run 44984655347)**: event parse 1,826 -> 1,743 thread-ms. DEMONSTRATED. The profile
+  must be made again on the final source (functions whose code changed lose their counts).
+- **Assembly kernel on the general path (`50ed2ee`)**: all checks pass (see the commit); laptop screen
+  -6.5% event-parse CPU at 4 threads. In CI against F6 (with PGO in the image; the same-image variant
+  `SS_KERNEL=plain` isolates the kernel).
