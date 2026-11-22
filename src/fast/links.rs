@@ -118,6 +118,32 @@ impl Table {
         [hash, (rank as u64) | (set << 63)]
     }
 
+    /// The first step of a staged lookup: the ID's hash, and the lines of
+    /// `bits` and `blocks` that `probe_hash` will read start loading. Their
+    /// addresses come from the hash alone, so nothing here waits for memory.
+    #[inline(always)]
+    fn stage_hash(&self, user: u64) -> u64 {
+        let hash = mix(user);
+        let home = (hash >> self.rem_bits) as usize;
+        prefetch_line(self.bits.as_ptr().wrapping_add(home >> 6));
+        prefetch_line(self.blocks.as_ptr().wrapping_add(home >> 8));
+        hash
+    }
+
+    /// `probe` from the ID's hash: the second word of what `probe` returns,
+    /// and the entry, when there is one, starts loading.
+    #[inline(always)]
+    fn probe_hash(&self, hash: u64) -> u64 {
+        let home = (hash >> self.rem_bits) as usize;
+        // SAFETY: `bits` has a word for every home position.
+        let word = unsafe { *self.bits.get_unchecked(home >> 6) };
+        let set = (word >> (home & 63)) & 1;
+        let rank = self.rank(home, word);
+        let entry = self.entries.as_ptr().wrapping_add(rank);
+        prefetch_line(if set != 0 { entry } else { self as *const Self as *const u64 });
+        (rank as u64) | (set << 63)
+    }
+
     /// `lookup(user)` from what `probe(user)` returned.
     #[inline(always)]
     fn lookup_probed(&self, user: u64, probe: [u64; 2]) -> (u64, bool) {
@@ -379,6 +405,31 @@ impl LinkTable {
                 self.prefetch_indexed(indexed, user);
                 [0, 0]
             }
+        }
+    }
+
+    /// The first step of a staged lookup (`stage_hash`, then `probe_hash`
+    /// some records later, then `person_mixed_probed` some records after
+    /// that): returns the ID's hash and starts loading the lines the second
+    /// step reads. After an index-mode build it is `prefetch`.
+    #[inline(always)]
+    pub fn stage_hash(&self, user: u64) -> u64 {
+        match &self.indexed {
+            None => self.table.stage_hash(user),
+            Some(indexed) => {
+                self.prefetch_indexed(indexed, user);
+                0
+            }
+        }
+    }
+
+    /// The second step of a staged lookup: with the hash from `stage_hash`,
+    /// what `probe(user)` would return. The entry starts loading.
+    #[inline(always)]
+    pub fn probe_hash(&self, hash: u64) -> [u64; 2] {
+        match &self.indexed {
+            None => [hash, self.table.probe_hash(hash)],
+            Some(_) => [0, 0],
         }
     }
 

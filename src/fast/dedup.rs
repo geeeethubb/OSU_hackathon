@@ -197,6 +197,24 @@ fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch
     });
     let between = scratch.measure.then(std::time::Instant::now);
     let lost = &scratch.long_lost;
+    if let Some(distances) = staged_distances() {
+        let mut staged = Staged::new(distances);
+        let mut sequence = 0u32;
+        for_each_long_record(lists, |_, _, word0, word1, purchase| {
+            let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
+            sequence += 1;
+            if (word0 & 1) & !is_lost == 0 {
+                return;
+            }
+            staged.push(links, out, [word0, word1, purchase], word1 >> 22, emit_event);
+        });
+        staged.drain(links, out, emit_event);
+        if let (Some(started), Some(between)) = (started, between) {
+            scratch.winners_nanos += (between - started).as_nanos() as u64;
+            scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+        }
+        return;
+    }
     // As in `dedup_coded`: survivors wait in a small ring while their
     // person-table slot loads.
     let mut ring = [[0u64; 5]; AHEAD];
@@ -280,6 +298,26 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
 
     let between = scratch.measure.then(std::time::Instant::now);
 
+    if let Some(distances) = staged_distances() {
+        // The winner's own valid bit decides: an invalid winner drops the event.
+        let mut staged = Staged::new(distances);
+        let mut sequence = 0u32;
+        for_each_record(lists, |word0, word1, purchase| {
+            let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
+            sequence += 1;
+            if (word0 & 1) & !is_lost == 0 {
+                return;
+            }
+            staged.push(links, out, [word0, word1, purchase], word1 >> 22, emit_event);
+        });
+        staged.drain(links, out, emit_event);
+        if let (Some(started), Some(between)) = (started, between) {
+            scratch.winners_nanos += (between - started).as_nanos() as u64;
+            scratch.forward_nanos += between.elapsed().as_nanos() as u64;
+        }
+        return;
+    }
+
     // The winner's own valid bit decides: an invalid winner drops the event.
     // Survivors wait in a small ring while their person-table slot loads.
     let mut ring = [[0u64; 5]; AHEAD];
@@ -310,6 +348,111 @@ fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratc
         scratch.winners_nanos += (between - started).as_nanos() as u64;
         scratch.forward_nanos += between.elapsed().as_nanos() as u64;
     }
+}
+
+/// Room of a `Staged` pipeline: more than both of its distances together.
+const STAGED: usize = 64;
+
+/// The distances of a staged lookup, in records: from `stage_hash` to
+/// `probe_hash`, and from there to `person_mixed_probed`. `None` with
+/// `SS_STAGED=0`: the plain ring (`AHEAD`), which starts each lookup with
+/// two loads it then waits for. `SS_STAGE1` and `SS_STAGE2` set them.
+fn staged_distances() -> Option<(usize, usize)> {
+    static DISTANCES: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *DISTANCES.get_or_init(|| {
+        if std::env::var_os("SS_STAGED").is_some_and(|value| value == "0") {
+            return None;
+        }
+        let read = |name: &str, default: usize| {
+            std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default).clamp(1, 31)
+        };
+        Some((read("SS_STAGE1", 8), read("SS_STAGE2", 16)))
+    })
+}
+
+/// Person lookups of a stream of records in three steps, each some records
+/// after the one before, so that no step waits for memory:
+///
+/// 1. `stage_hash`: the user's hash; the lines of the link table's bitmap
+///    and rank directory that step 2 reads start loading.
+/// 2. `probe_hash`, `first` records later: where the user's entry is; the
+///    entry starts loading.
+/// 3. `person_mixed_probed`, `second` records after that: the person, and
+///    `emit` writes the record.
+///
+/// The plain ring did steps 1 and 2 at once, waiting for the bitmap line
+/// (on Intel runners the forward's hottest load) on every record. The same
+/// lookups and answers; only the loads move earlier. Records are emitted in
+/// the order they were pushed.
+struct Staged {
+    /// Per record: three words for `emit`, the user, the hash, the probe.
+    entries: [[u64; 6]; STAGED],
+    pushed: usize,
+    first: usize,
+    second: usize,
+}
+
+impl Staged {
+    fn new((first, second): (usize, usize)) -> Self {
+        Self { entries: [[0; 6]; STAGED], pushed: 0, first, second }
+    }
+
+    #[inline(always)]
+    fn push(
+        &mut self,
+        links: &LinkTable,
+        out: &mut PassBOut,
+        record: [u64; 3],
+        user: u64,
+        emit: impl Fn(&mut PassBOut, u64, [u64; 3]),
+    ) {
+        let at = self.pushed;
+        // SAFETY (every index below): reduced modulo `STAGED`.
+        unsafe {
+            *self.entries.get_unchecked_mut(at % STAGED) =
+                [record[0], record[1], record[2], user, links.stage_hash(user), 0];
+            if at >= self.first {
+                let entry = self.entries.get_unchecked_mut((at - self.first) % STAGED);
+                let [hash, probe] = links.probe_hash(entry[4]);
+                entry[4] = hash;
+                entry[5] = probe;
+            }
+            if at >= self.first + self.second {
+                let [a, b, c, user, hash, probe] = *self.entries.get_unchecked((at - self.first - self.second) % STAGED);
+                emit(out, links.person_mixed_probed(user, [hash, probe]), [a, b, c]);
+            }
+        }
+        self.pushed = at + 1;
+    }
+
+    /// Emits every record still in the pipeline, in push order.
+    fn drain(&mut self, links: &LinkTable, out: &mut PassBOut, emit: impl Fn(&mut PassBOut, u64, [u64; 3])) {
+        let pushed = self.pushed;
+        for at in pushed.saturating_sub(self.first)..pushed {
+            let entry = &mut self.entries[at % STAGED];
+            let [hash, probe] = links.probe_hash(entry[4]);
+            entry[4] = hash;
+            entry[5] = probe;
+        }
+        for at in pushed.saturating_sub(self.first + self.second)..pushed {
+            let [a, b, c, user, hash, probe] = self.entries[at % STAGED];
+            emit(out, links.person_mixed_probed(user, [hash, probe]), [a, b, c]);
+        }
+        self.pushed = 0;
+    }
+}
+
+/// `Staged`'s `emit` for an event record: word 0, word 1, purchase word,
+/// with the person's mixed name.
+#[inline(always)]
+fn emit_event(out: &mut PassBOut, mixed: u64, [word0, word1, purchase]: [u64; 3]) {
+    forward_mixed(out, mixed, word0, word1 & 1, purchase);
+}
+
+/// The same for a parsed click: click code and campaign, then ts.
+#[inline(always)]
+fn emit_click(out: &mut PassBOut, mixed: u64, [code_and_campaign, ts, _]: [u64; 3]) {
+    forward_click_mixed(out, mixed, ts, code_and_campaign);
 }
 
 /// Writes one surviving event waiting in a ring (record words, then what
@@ -373,6 +516,16 @@ pub fn forward_click_mixed(out: &mut PassBOut, mixed: u64, ts: u64, code_and_cam
 /// Map a batch of parsed clicks (blocks of `[user, click code and campaign,
 /// ts]` triples) to their persons' partitions.
 pub fn map_clicks(links: &LinkTable, blocks: &[&[u64]], out: &mut PassBOut) {
+    if let Some(distances) = staged_distances() {
+        let mut staged = Staged::new(distances);
+        for block in blocks {
+            for click in block.chunks_exact(RAW_CLICK_WORDS) {
+                staged.push(links, out, [click[1], click[2], 0], click[0], emit_click);
+            }
+        }
+        staged.drain(links, out, emit_click);
+        return;
+    }
     // As the forward of events: each click waits in a ring of 16 while its
     // link-table slot loads, and the probe made for that prefetch is where
     // its lookup starts (no second hash and rank); a person named by the
