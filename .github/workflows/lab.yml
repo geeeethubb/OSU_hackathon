@@ -1,36 +1,85 @@
-# One-off measurement, branch exp-lab only: the session kernel's own lap
-# profile (sessions.rs PROFILE = true) on a hosted runner, F4's code, 20M seed 2.
-# Diagnostic build only; nothing here is ranked or scored.
-name: profile-lab
+# One-off measurement, branch exp-lab only: look for hosted runners whose CPU is
+# of the scorer's kind (Skylake-family Xeon: Skylake-SP, Cascade Lake, Cooper
+# Lake; GCP n2 runs Cascade Lake or Ice Lake) and, on any such runner, (1) time
+# F4's stages and (2) pair F4 against F4 built with jumps padded off 32-byte
+# boundaries (the Skylake-family branch erratum). Every other runner only
+# reports its CPU. Nothing here is ranked or scored.
+name: cpu-hunt
 on:
   push:
     branches: [exp-lab]
 permissions:
   contents: read
+env:
+  F4: bad5c1b1bc3178508db7de5d7459197741497236
 jobs:
-  lab:
+  hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
+      - name: CPU
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)
+          echo "slot ${{ matrix.slot }}: $model" | tee -a "$GITHUB_STEP_SUMMARY"
+          flags=$(grep -m1 '^flags' /proc/cpuinfo)
+          vbmi2=no; echo "$flags" | grep -qw avx512_vbmi2 && vbmi2=yes
+          echo "avx512_vbmi2=$vbmi2" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Skylake-family server parts: Xeon Platinum/Gold/Silver 81xx/61xx/41xx (Skylake-SP),
+          # 82xx/62xx/42xx (Cascade Lake), 83xxH (Cooper Lake), Azure's 8171M / 8272CL.
+          if echo "$model" | grep -Eq 'Xeon.*(Platinum|Gold|Silver|Bronze) [8642]1[0-9][0-9]|Xeon.*(Platinum|Gold|Silver|Bronze) [8642]2[0-9][0-9]|Xeon.*8171M|Xeon.*8272CL|Xeon.*83[0-9][0-9]H'; then
+            echo "match=yes" >> "$GITHUB_OUTPUT"; echo "MATCH: Skylake-family" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "match=no" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v7
-      - name: Machine
-        run: lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core" || true
-      - name: Tools and data
+        if: steps.cpu.outputs.match == 'yes'
+        with:
+          fetch-depth: 0
+      - name: Tools and images
+        if: steps.cpu.outputs.match == 'yes'
         run: |
+          python3 -m pip install --quiet polars
           bash bench/fetch_tools.sh "$HOME/ss-tools"
-          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data" >/dev/null
-          cat "$RUNNER_TEMP"/data/*/*.csv > /dev/null
-      - name: Build with the session kernel's profile on
-        run: |
-          sed -i 's/^const PROFILE: bool = false;$/const PROFILE: bool = true;/' src/fast/sessions.rs
-          grep -n "^const PROFILE" src/fast/sessions.rs
-          docker buildx build --platform linux/amd64 --load -t ss-prof .
-          cid=$(docker create ss-prof); docker cp "$cid:/pipeline" "$RUNNER_TEMP/pipeline"; docker rm "$cid" >/dev/null
-      - name: Runs
-        run: |
-          for round in 1 2 3; do
-            O="$RUNNER_TEMP/out"; rm -rf "$O"; mkdir -p "$O"
-            echo "== round $round" | tee -a "$GITHUB_STEP_SUMMARY"
-            DATA_DIR="$RUNNER_TEMP/data" OUTPUT_DIR="$O" SCRATCH_DIR="$O" NCPU=4 SS_TIMING=1 "$RUNNER_TEMP/pipeline" 2>&1 \
-              | grep -E "SESSIONS_PROFILE|stage=indexed|cpu_index_kernel|cpu_index_partitions|stage=total" | tee -a "$GITHUB_STEP_SUMMARY"
+          for v in plain jcc; do
+            d="$RUNNER_TEMP/ctx-$v"; mkdir -p "$d"; git archive "$F4" | tar -x -C "$d"
+            if [ $v = jcc ]; then
+              sed -i 's|^ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3"$|ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3 -C llvm-args=-x86-branches-within-32B-boundaries"|' "$d/Dockerfile"
+              grep -n RUSTFLAGS "$d/Dockerfile"
+            fi
+            docker buildx build --platform linux/amd64 --load -t "ss-$v:latest" "$d" > "$RUNNER_TEMP/build-$v.log" 2>&1 || { tail -30 "$RUNNER_TEMP/build-$v.log"; exit 1; }
           done
+          docker buildx build --platform linux/amd64 --load -t ss-diag:latest -f bench/diag.Dockerfile bench > /dev/null 2>&1
+      - name: Pair F4 (prior) against F4 with padded jumps (new)
+        if: steps.cpu.outputs.match == 'yes'
+        run: |
+          python3 bench/bench.py bench20m --image ss-jcc:latest --diag-image ss-diag:latest \
+            --generator "$HOME/ss-tools/generate" --work "$RUNNER_TEMP/ss" \
+            --out-json "$RUNNER_TEMP/hunt-${{ matrix.slot }}.json" \
+            --seeds "2 3" --runs 3 --pairs 6 --pair-budget-s 300 \
+            --prior-image ss-plain:latest --prior-sha "$F4" --prior-status built || true
+          python3 - "$RUNNER_TEMP/hunt-${{ matrix.slot }}.json" <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          for seed in d['seeds']:
+              for name in ('aa', 'ab'):
+                  b = seed.get(name) or {}
+                  print('seed', seed['seed'], name, 'median A %.1f B %.1f A-B %+.1f ms, B faster %s/%s' % (
+                      b.get('median_a_ms', 0), b.get('median_b_ms', 0), b.get('median_a_minus_b_ms', 0), b.get('b_faster_pairs'), b.get('n')))
+              for label, run in (('padded', seed['pipeline'].get('timing_run')), ('F4', seed.get('prior_timing_run'))):
+                  if run:
+                      print('  ', label, 'stages', ' '.join('%s=%.1f' % (a, b) for a, b in run.get('ss_timing', [])))
+                      print('  ', label, 'detail', ' '.join('%s=%.1f' % (a, b) for a, b in run.get('ss_detail', [])))
+          print('errors', d.get('errors'))
+          EOF
+      - name: Keep the result
+        if: steps.cpu.outputs.match == 'yes'
+        uses: actions/upload-artifact@v7
+        with:
+          name: hunt-${{ matrix.slot }}
+          path: ${{ runner.temp }}/hunt-${{ matrix.slot }}.json
+          if-no-files-found: warn
