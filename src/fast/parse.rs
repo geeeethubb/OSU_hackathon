@@ -981,7 +981,10 @@ fn event_row_declined<const MODE: u32, const INDEXED: bool>(
     position: usize,
     out: &mut ParseOut,
 ) -> usize {
-    use super::simd::{event_lean_long, event_row_fast, MODE_ROW, MODE_STORE, ROW_DECLINE, ROW_DONE, ROW_DROP, ROW_LONG};
+    use super::simd::{
+        event_lean_long, event_lean_wide, event_row_fast, wide_rows, MODE_ROW, MODE_STORE, ROW_DECLINE, ROW_DONE,
+        ROW_DROP, ROW_LONG,
+    };
     let mut row = EventRow::default();
     super::simd::prefetch_input(buffer.as_ptr().wrapping_add(position), super::simd::input_lead());
     if !INDEXED && MODE != MODE_ROW {
@@ -990,6 +993,14 @@ fn event_row_declined<const MODE: u32, const INDEXED: bool>(
         if status != ROW_DECLINE {
             std::hint::black_box(row.event);
             return position + length + 1;
+        }
+        if wide_rows() {
+            // SAFETY: as above.
+            let (length, status) = unsafe { event_lean_wide::<MODE>(ctx, buffer.as_ptr().add(position), out, &mut row) };
+            if status != ROW_DECLINE {
+                std::hint::black_box(row.event);
+                return position + length + 1;
+            }
         }
     }
     // SAFETY: at least ROW_PAD readable bytes follow `position`.
