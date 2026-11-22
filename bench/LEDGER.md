@@ -1155,3 +1155,19 @@ base was `b890895` and the comparison was against candidate E.
 - **Assembly kernel on the general path (`50ed2ee`)**: all checks pass (see the commit); laptop screen
   -6.5% event-parse CPU at 4 threads. In CI against F6 (with PGO in the image; the same-image variant
   `SS_KERNEL=plain` isolates the kernel).
+
+### 04:50 UTC: hypothesis B (identity forwarding) measured and rejected; where parse time goes now
+
+- **Reuse, MEASURED** (experiment build, laptop, new 20M, 4 threads; never committed): of 19,556,998
+  survivors, a per-worker direct-mapped cache of the last users would hit 13.8% with 4,096 entries and
+  34.1% with 65,536 (whale users make reuse real).
+- **What a hit could save, MEASURED** (same build): forward CPU 318-326 ms; without the link lookup at
+  all 270-278 (-15%); without the scatter over person partitions (everything into one) 273-275 (-15%).
+  With the probe ring the lookup is already cheap: a perfect cache could remove at most about 5% of
+  forward, before its own probes and stores. **REJECTED** (B, exact bounded reuse); a different
+  link-table layout is bounded by the same 15%.
+- **Parse time by row kind with the general-path assembly** (`50ed2ee`, laptop, one thread, stores
+  included): short-ID rows 81 ms for 1.644M (49 ns), long-ID rows 57 ms for 516K (110 ns), mixed 130-142
+  ms against 138 for the two apart: no interleaving penalty left. Rows with a long ID are 24% of rows and
+  41% of event-parse time: the next target (a long-row path in the assembly: 128-byte head, hex values,
+  the user table probed after a prefetch, the long-event store; ts, ingest, type and tail reused).
