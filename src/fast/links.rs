@@ -82,6 +82,12 @@ struct Table {
     simple_names: Vec<u64>,
 }
 
+/// Timing only, wrong answers: `SS_DIAG_BITMAP=1` (see `Table::probe`).
+fn diag_bitmap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SS_DIAG_BITMAP").is_some_and(|value| value == "1"))
+}
+
 impl Table {
     /// Starts loading what `lookup(user)` will read, so that a lookup a few
     /// records later finds it in the cache. Changes no result.
@@ -108,7 +114,9 @@ impl Table {
     #[inline(always)]
     fn probe(&self, user: u64) -> [u64; 2] {
         let hash = mix(user);
-        let home = (hash >> self.rem_bits) as usize;
+        // Timing only: the bitmap and rank words of the first 4,096
+        // positions (512 bytes, always cached) stand in for the real ones.
+        let home = (hash >> self.rem_bits) as usize & if diag_bitmap() { 4095 } else { usize::MAX };
         // SAFETY: `bits` has a word for every home position.
         let word = unsafe { *self.bits.get_unchecked(home >> 6) };
         let set = (word >> (home & 63)) & 1;
@@ -132,6 +140,9 @@ impl Table {
         let entry = unsafe { *self.entries.get_unchecked(rank) };
         if entry & ENTRY_KEY_MASK == key {
             return (entry >> ENTRY_NAME_SHIFT, entry & ENTRY_COMPLEX != 0);
+        }
+        if diag_bitmap() {
+            return (user, false);
         }
         self.lookup_further(user, home, rank, key)
     }
