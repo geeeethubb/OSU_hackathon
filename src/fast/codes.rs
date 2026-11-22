@@ -353,6 +353,19 @@ pub fn take_long_value() -> (u8, u128) {
     LONG_VALUE.with(std::cell::Cell::get)
 }
 
+/// Diagnostic only: with `SS_DIAG_USERS=1` and a parse-only `SS_DIAG`, long
+/// IDs met after the link rows get a made-up index instead of a lookup in
+/// the user table, to time what the lookups cost. The output is wrong by
+/// design (the run stops after the parse anyway).
+static FAKE_LOOKUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns `FAKE_LOOKUPS` on when `SS_DIAG_USERS=1` asks for it.
+pub fn arm_fake_lookups() {
+    if std::env::var_os("SS_DIAG_USERS").is_some_and(|value| value == "1") {
+        FAKE_LOOKUPS.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Leaves a long event ID for `take_long_value`, as coding it would.
 #[inline]
 pub fn set_long_value(first: u8, value: u128) {
@@ -509,6 +522,9 @@ impl Interner {
 
     #[inline]
     fn hex_index(&self, first: u8, value: u128) -> u32 {
+        if FAKE_LOOKUPS.load(AtomicOrdering::Relaxed) {
+            return (value as u32) & 0xF_FFFF;
+        }
         if let Some(table) = &self.table {
             let (low, high) = (value as u64, (value >> 64) as u64);
             let hash = table_hash(first, low, high);

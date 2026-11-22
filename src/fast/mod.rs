@@ -521,6 +521,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         (tables, clicks.join().unwrap(), front, (tables_spent, front_done.elapsed()))
     });
     let (event_files, parse_out, link_pairs, buffers_spent, link_rows_spent) = front?;
+    // Parse-only diagnostics may time the parse without user-table lookups.
+    if ctx.diag != 0 {
+        codes::arm_fake_lookups();
+    }
     // What the stage before the parse is made of (diagnostics): the workers'
     // output buffers, the link rows, and the lookup tables on their own
     // thread, with how long the others then waited for them.
