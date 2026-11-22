@@ -629,12 +629,16 @@ fn event_row_rare<const MODE: u32>(
     user_number: u64,
     keep: u64,
 ) -> usize {
-    if status == 2 {
+    if status == 2 || status == 4 {
         let read = super::simd::LeanRow { status, ts, ingest_seconds, index, user_number, keep };
         // SAFETY: the frame is the one the assembly just filled for this
         // row, which ends right before `next`, inside the buffer.
         unsafe {
-            super::simd::event_lean_purchase::<MODE>(ctx, &*frame, read, out, row);
+            if status == 2 {
+                super::simd::event_lean_purchase::<MODE>(ctx, &*frame, read, out, row);
+            } else {
+                super::simd::event_lean_bought::<MODE>(&*frame, read, out, row);
+            }
             return (*frame).next.offset_from(buffer.as_ptr()) as usize;
         }
     }

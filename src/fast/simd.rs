@@ -684,6 +684,19 @@ pub fn event_kernel() -> u32 {
     })
 }
 
+/// What the kernel in assembly does itself with the rows that are not a
+/// plain `view` or `cart` (`SS_RARE`, for A/B runs on one binary): bit 0,
+/// it finishes purchases. `SS_RARE=0`: nothing, every purchase goes back to
+/// its caller as it did before; `SS_RARE=a`: purchases; unset: everything.
+pub fn rare_rows() -> u64 {
+    static RARE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RARE.get_or_init(|| match std::env::var("SS_RARE").as_deref() {
+        Ok("0") => 0,
+        Ok("a") => 1,
+        _ => u64::MAX,
+    })
+}
+
 /// What the lean kernel reads from memory at every use. The three byte
 /// vectors are here and not constants in the code so that each compare takes
 /// its operand straight from memory, on every target, with a call in the loop
@@ -708,8 +721,21 @@ pub struct LeanTables {
     /// eight bytes from the comma after ingest_ts, and the four texts.
     type_masks: [u64; 4],
     type_texts: [u64; 4],
-    /// The first eight bytes of `,purchase,` and of `,"purchase",`.
+    /// The first eight bytes of `,purchase,` and of `,"purchase",`, then
+    /// what to keep of the next four bytes and what that must be (`e,` and
+    /// `se",`).
     purchase: [u64; 2],
+    purchase_rest_mask: [u32; 2],
+    purchase_rest: [u32; 2],
+    /// A purchase's price and its product's number, as two texts of digits
+    /// in the sixteen bytes that end with them: all ones in the last `n`
+    /// bytes (by `n`), `0` bytes, nines, and the weights that make two
+    /// numbers of eight digits each of sixteen digit pairs.
+    keep_last: [[u8; 16]; 17],
+    digit_zero: [u8; 32],
+    nines: [u8; 32],
+    hundreds: [i16; 16],
+    ten_thousands: [i16; 16],
     /// Added to a thousand times the ingest seconds, less ts since the
     /// window's start: how late the row is, plus 2^62 so that an unsigned
     /// compare does; and the first such number that is too late.
@@ -926,6 +952,13 @@ impl LeanTables {
             type_masks: [TYPE_SHORT, TYPE_SHORT, u64::MAX, u64::MAX],
             type_texts: [TYPE_VIEW, TYPE_CART, TYPE_VIEW_QUOTED, TYPE_CART_QUOTED],
             purchase: [TYPE_PURCHASE, TYPE_PURCHASE_QUOTED],
+            purchase_rest_mask: [0xFFFF, 0xFFFF_FFFF],
+            purchase_rest: [0x2C65, 0x2C22_6573],
+            keep_last: std::array::from_fn(|kept| std::array::from_fn(|at| if at >= 16 - kept { 0xFF } else { 0 })),
+            digit_zero: [b'0'; 32],
+            nines: [9; 32],
+            hundreds: std::array::from_fn(|at| if at % 2 == 0 { 100 } else { 1 }),
+            ten_thousands: std::array::from_fn(|at| if at % 2 == 0 { 10_000 } else { 1 }),
             late_bias: base_ms - window_start + (1 << 62),
             late_limit: LATE_MS as u64 + (1 << 62) + 1,
             tens,
@@ -1742,28 +1775,37 @@ macro_rules! lean_offset {
     };
 }
 
-/// A purchase: `,purchase,` or `,"purchase",`, then the same 32 bytes, of
-/// which the frame gets what the caller needs to read product and price.
-/// `$next` is the tail's; `$then` is where a purchase that is regular goes.
+/// A purchase: `,purchase,` or `,"purchase",`, then the same 32 bytes, and
+/// what `event_lean` reads of them for a valid row: the price (digits only,
+/// at most eight of them after leading zeros, 1 to 10,000,000) and the
+/// category of the product. The category is taken from the table by
+/// product number for a product written `p` and 1 to 7 digits with no
+/// leading zero; any other product, a number past the table, and a price
+/// text of more than 16 bytes are left to the caller (25), with what it
+/// needs to read product and price in the frame. A row that is not valid,
+/// or whose price is no price (26: then it is not valid either), goes on as
+/// the invalid row it is (24), like a `view`.
+///
+/// `$next` is the tail's; `$caller` is where 25 goes on to after setting
+/// r15 to 2; `$bought` ends a valid purchase: r13 holds its price (low
+/// half) and category (high half), and rax, rcx, r9, r10 and r12 are as
+/// for a `view`.
 macro_rules! lean_purchase {
-    ($next:literal, $then:literal) => {
+    ($next:literal, $caller:literal, $bought:ident) => {
         concat!(
             "3:\n",
+            // Which of the two texts (r13: 1 for the one in quotes), then all of it.
             "mov r8, qword ptr [r11]\n",
-            "cmp r8, qword ptr [rsi + {purchase}]\n",
-            "jne 6f\n",
-            "movzx r8d, word ptr [r11 + 8]\n",
-            "cmp r8d, 0x2C65\n",
-            "jne 2f\n",
-            "add r11, 9\n",
-            "jmp 7f\n",
-            "6:\n",
+            "xor r13d, r13d\n",
             "cmp r8, qword ptr [rsi + {purchase} + 8]\n",
+            "sete r13b\n",
+            "cmp r8, qword ptr [rsi + r13*8 + {purchase}]\n",
             "jne 2f\n",
-            "cmp dword ptr [r11 + 8], 0x2C226573\n",
+            "mov r8d, dword ptr [r11 + 8]\n",
+            "and r8d, dword ptr [rsi + r13*4 + {purchase_rest_mask}]\n",
+            "cmp r8d, dword ptr [rsi + r13*4 + {purchase_rest}]\n",
             "jne 2f\n",
-            "add r11, 11\n",
-            "7:\n",
+            "lea r11, [r11 + r13*2 + 9]\n",
             "mov qword ptr [rdx + {region}], r11\n",
             lean_tail!(
                 $next,
@@ -1772,13 +1814,139 @@ macro_rules! lean_purchase {
                 "mov dword ptr [rdx + {opened}], r8d\n"
             ),
             "jnz 2f\n",
+            // (Unless this run leaves every purchase to the caller.)
+            "test byte ptr [rdx + {rare}], 1\n",
+            "jz 25f\n",
+            "test r12, r12\n",
+            "jz 24b\n",
+            // r8 the newline, r13 the comma between product and price (both
+            // from r11 on), r14 whether the product opens with a quote, r15
+            // whether the price does.
+            "mov r8d, dword ptr [rdx + {reach}]\n",
+            "mov r13d, dword ptr [rdx + {last_comma}]\n",
+            "mov r14d, dword ptr [rdx + {opened}]\n",
+            "tzcnt r13d, r13d\n",
+            "mov r15d, r14d\n",
+            "shr r15d, 1\n",
+            "and r14d, 1\n",
+            // The price: where it ends (r8), its length (r15); the sixteen
+            // bytes that end with it, and which of them are its own.
+            "add r8, r11\n",
+            "sub r8, r15\n",
+            "lea r15, [r13 + r15 + 1]\n",
+            "add r15, r11\n",
+            "neg r15\n",
+            "add r15, r8\n",
+            "cmp r15, 16\n",
+            "ja 25f\n",
+            "vmovdqu xmm0, xmmword ptr [r8 - 16]\n",
+            "shl r15, 4\n",
+            "vmovdqu xmm1, xmmword ptr [rsi + r15 + {keep_last}]\n",
+            // The product: `p`, then a digit that is not `0`; where it ends
+            // (r8); the same sixteen bytes for it; 1 to 7 digits (r13 is
+            // their number plus two).
+            "cmp byte ptr [r11 + r14 + 1], 112\n",
+            "jne 25f\n",
+            "cmp byte ptr [r11 + r14 + 2], 48\n",
+            "je 25f\n",
+            "lea r8, [r11 + r13]\n",
+            "sub r8, r14\n",
+            "vinserti128 ymm0, ymm0, xmmword ptr [r8 - 16], 1\n",
+            "sub r13, r14\n",
+            "sub r13, r14\n",
+            "lea r8, [r13 - 3]\n",
+            "cmp r8, 6\n",
+            "ja 25f\n",
+            "shl r13, 4\n",
+            "vinserti128 ymm1, ymm1, xmmword ptr [rsi + r13 + {keep_last} - 32], 1\n",
+            // Digit values of both texts, nothing for the bytes before
+            // them. A product with anything but digits is the caller's; a
+            // price with anything but digits is no price.
+            "vpxor ymm0, ymm0, ymmword ptr [rsi + {digit_zero}]\n",
+            "vpand ymm0, ymm0, ymm1\n",
+            "vpsubusb ymm1, ymm0, ymmword ptr [rsi + {nines}]\n",
+            "vextracti128 xmm2, ymm1, 1\n",
+            "vptest xmm2, xmm2\n",
+            "jnz 25f\n",
+            "vptest xmm1, xmm1\n",
+            "jnz 26f\n",
+            // Each text as its first eight digits and its last eight.
+            "vpmaddubsw ymm0, ymm0, ymm8\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [rsi + {hundreds}]\n",
+            "vpackusdw ymm0, ymm0, ymm0\n",
+            "vpmaddwd ymm0, ymm0, ymmword ptr [rsi + {ten_thousands}]\n",
+            "vmovq r8, xmm0\n",
+            "vextracti128 xmm0, ymm0, 1\n",
+            "vmovq r13, xmm0\n",
+            // The price (r8): nothing in the first eight digits, 1 to 10,000,000.
+            "rorx r8, r8, 32\n",
+            "lea r14, [r8 - 1]\n",
+            "cmp r14, 9999999\n",
+            "ja 26f\n",
+            // The product's number, inside the table; its category above the price.
+            "shr r13, 32\n",
+            "cmp r13, qword ptr [rdx + {category_count}]\n",
+            "jae 25f\n",
+            "mov r14, qword ptr [rdx + {categories}]\n",
+            "mov r13d, dword ptr [r14 + r13*4]\n",
+            "shl r13, 32\n",
+            "or r13, r8\n",
+            $bought!(),
+            "26:\n",
+            "xor r12d, r12d\n",
+            "jmp 24b\n",
+            "25:\n",
             "mov r15d, 2\n",
-            $then,
+            $caller,
         )
     };
 }
 
-/// The whole row. r15 at the end: 0 for a `view` or `cart` that is read, 2
+/// A valid purchase, for the caller of one row: price and category into the frame.
+macro_rules! lean_bought_row {
+    () => {
+        concat!("mov qword ptr [rdx + {bought}], r13\n", "mov r15d, 4\n", "jmp 8f\n",)
+    };
+}
+
+/// A valid purchase into the list of its index partition: the three words
+/// `emit_indexed` stores. A full block is the caller's (who reads price and
+/// category again).
+macro_rules! lean_bought_store {
+    () => {
+        concat!(
+            "pext r8, r9, qword ptr [rdx + {part_mask}]\n",
+            "shl r8, 5\n",
+            "add r8, qword ptr [rdx + {writers}]\n",
+            "mov r11, qword ptr [r8]\n",
+            "lea r14, [r11 + 24]\n",
+            "cmp r14, qword ptr [r8 + 8]\n",
+            "ja 25f\n",
+            "mov qword ptr [r8], r14\n",
+            "shl r9, 24\n",
+            "and r9, qword ptr [rdx + {low_mask}]\n",
+            "lea rax, [rax + rax + 1]\n",
+            "bts rax, 32\n",
+            "or rax, r9\n",
+            "mov qword ptr [r11], rax\n",
+            "shr r10, 2\n",
+            "lea r10, [r10 + rcx*2 + 1]\n",
+            "mov qword ptr [r11 + 8], r10\n",
+            "mov qword ptr [r11 + 16], r13\n",
+            "jmp 27b\n",
+        )
+    };
+}
+
+/// A valid purchase in the timing variant that stores nothing.
+macro_rules! lean_bought_dropped {
+    () => {
+        "jmp 27b\n"
+    };
+}
+
+/// The whole row. r15 at the end: 0 for a row that is read and is no valid
+/// purchase, 4 for a valid purchase (price and category in the frame), 2
 /// for a purchase that is read up to its product and price, 1 for a row the
 /// kernel declines.
 macro_rules! lean_row {
@@ -1792,8 +1960,11 @@ macro_rules! lean_row {
             lean_tail!("cmp r15, qword ptr [rdx + {next}]\n", "", "", ""),
             "jz 8f\n",
             "jmp 2f\n",
+            "24:\n",
+            "xor r15d, r15d\n",
+            "jmp 8f\n",
             lean_offset!(),
-            lean_purchase!("cmp r15, qword ptr [rdx + {next}]\n", "jmp 8f\n"),
+            lean_purchase!("cmp r15, qword ptr [rdx + {next}]\n", "jmp 8f\n", lean_bought_row),
             "2:\n",
             "mov r15d, 1\n",
             "8:\n",
@@ -1849,7 +2020,7 @@ macro_rules! lean_no_store {
 /// next row starts is in rbx while a row is read; rbx is the compiler's, so
 /// it is saved in the frame and put back at the end.
 macro_rules! lean_run {
-    ($store:ident) => {
+    ($store:ident, $bought:ident) => {
         concat!(
             "mov qword ptr [rdx + {saved}], rbx\n",
             "9:\n",
@@ -1860,14 +2031,16 @@ macro_rules! lean_run {
             lean_type!(),
             lean_tail!("cmp r15, rbx\n", "", "", ""),
             "jnz 2f\n",
+            "24:\n",
             $store!(),
+            "27:\n",
             "mov rdi, rbx\n",
             "cmp rdi, qword ptr [rdx + {last}]\n",
             "jb 9b\n",
             "xor r15d, r15d\n",
             "jmp 8f\n",
             lean_offset!(),
-            lean_purchase!("cmp r15, rbx\n", "jmp 23f\n"),
+            lean_purchase!("cmp r15, rbx\n", "jmp 23f\n", $bought),
             "22:\n",
             "mov r15d, 3\n",
             "23:\n",
@@ -1919,6 +2092,16 @@ macro_rules! lean_asm {
             type_texts = const std::mem::offset_of!(LeanTables, type_texts),
             type_step = const std::mem::offset_of!(LeanTables, type_step),
             purchase = const std::mem::offset_of!(LeanTables, purchase),
+            purchase_rest_mask = const std::mem::offset_of!(LeanTables, purchase_rest_mask),
+            purchase_rest = const std::mem::offset_of!(LeanTables, purchase_rest),
+            keep_last = const std::mem::offset_of!(LeanTables, keep_last),
+            digit_zero = const std::mem::offset_of!(LeanTables, digit_zero),
+            nines = const std::mem::offset_of!(LeanTables, nines),
+            hundreds = const std::mem::offset_of!(LeanTables, hundreds),
+            ten_thousands = const std::mem::offset_of!(LeanTables, ten_thousands),
+            categories = const std::mem::offset_of!(LeanFrame, categories),
+            rare = const std::mem::offset_of!(LeanFrame, rare),
+            category_count = const std::mem::offset_of!(LeanFrame, category_count),
             late_bias = const std::mem::offset_of!(LeanTables, late_bias),
             late_limit = const std::mem::offset_of!(LeanTables, late_limit),
             tens = const std::mem::offset_of!(LeanTables, tens),
@@ -2004,6 +2187,13 @@ pub struct LeanFrame {
     handed: [u64; 5],
     /// The caller's rbx while the loop runs.
     saved: u64,
+    // Purchases: the categories by product number, and what a valid
+    // purchase read for one row cost and is (price low, category high).
+    categories: *const u32,
+    category_count: u64,
+    bought: u64,
+    /// `rare_rows()`.
+    rare: u64,
 }
 
 /// Whether a `PartWriter` is what the loop in assembly takes it for: four
@@ -2069,6 +2259,10 @@ impl LeanFrame {
             low_mask: ((1u64 << keys.index_shift) - 1) << 48,
             handed: [0; 5],
             saved: 0,
+            categories: ctx.category_by_product_number.as_ptr(),
+            category_count: ctx.category_by_product_number.len() as u64,
+            bought: 0,
+            rare: rare_rows(),
         }
     }
 
@@ -2095,7 +2289,8 @@ impl LeanFrame {
 /// What the kernel in assembly read of a row.
 #[derive(Clone, Copy)]
 pub struct LeanRow {
-    /// 0: a `view` or `cart`, read. 2: a purchase, read up to its product
+    /// 0: a row that is read and is no valid purchase. 4: a valid purchase
+    /// (`event_lean_bought` ends it). 2: a purchase, read up to its product
     /// and price (`event_lean_purchase` reads those). 1: declined, and the
     /// rest means nothing.
     pub status: u64,
@@ -2135,6 +2330,7 @@ pub unsafe fn event_lean_asm(lean: *const LeanTables, p: *const u8, frame: *mut 
         lateout("r12") keep,
         out("r8") _, out("r11") _, out("r13") _, out("r14") _,
         out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm4") _,
+        bought = const std::mem::offset_of!(LeanFrame, bought),
     );
     LeanRow { status, ts, ingest_seconds, index, user_number, keep }
 }
@@ -2171,7 +2367,7 @@ pub unsafe fn event_lean_run<const STORE: bool>(
     let at: *const u8;
     if STORE {
         lean_asm!(
-            [lean_run!(lean_store),]
+            [lean_run!(lean_store, lean_bought_store),]
             inout("rdi") p => at,
             in("rsi") lean,
             in("rdx") frame,
@@ -2188,7 +2384,7 @@ pub unsafe fn event_lean_run<const STORE: bool>(
         );
     } else {
         lean_asm!(
-            [lean_run!(lean_no_store),]
+            [lean_run!(lean_no_store, lean_bought_dropped),]
             inout("rdi") p => at,
             in("rsi") lean,
             in("rdx") frame,
@@ -2244,7 +2440,32 @@ pub unsafe fn event_lean_purchase<const MODE: u32>(
     )
 }
 
-/// The end of a `view` or `cart` `event_lean_asm` read (status 0).
+/// The end of a valid purchase `event_lean_asm` read whole (status 4): its
+/// price and category are in the frame.
+///
+/// # Safety
+/// `frame` is the one `event_lean_asm` just filled for this row.
+#[inline(always)]
+pub unsafe fn event_lean_bought<const MODE: u32>(
+    frame: &LeanFrame,
+    read: LeanRow,
+    out: &mut ParseOut,
+    row: &mut EventRow,
+) -> u32 {
+    let purchase = Some((frame.bought as u32, (frame.bought >> 32) as u32));
+    event_lean_finish::<MODE, true>(
+        out,
+        row,
+        read.index,
+        read.user_number,
+        read.ts,
+        true,
+        read.ingest_seconds as i64,
+        purchase,
+    )
+}
+
+/// The end of a row `event_lean_asm` read that is no valid purchase (status 0).
 ///
 /// # Safety
 /// As `event_lean_finish`.
@@ -2306,6 +2527,9 @@ pub unsafe fn event_row_lean_step<const MODE: u32, const INDEXED: bool>(
 thread_local! {
     /// Rows the lean event kernel declined on this thread.
     static DECLINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Purchases the kernel in assembly finished by itself on this thread,
+    /// and purchases it left to its caller.
+    static BOUGHT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// As `event_row_fast`, with the lean kernel in front of it: the same
@@ -2352,12 +2576,15 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
         assert_eq!(read.status != 1, taken, "the assembly and the lean kernel take different rows");
         if taken {
             assert_eq!(frame.next, p.add(length + 1), "the assembly ends the row elsewhere");
-            assert_eq!(read.status == 2, purchase_text(p, length), "a purchase or not");
+            // A purchase comes back as one the assembly finished (4), one
+            // for the caller (2), or as the invalid row it is (0).
+            assert!(read.status == 0 || purchase_text(p, length), "a purchase or not");
+            assert!(read.status != 0 || twin.purchase.is_none(), "a purchase or not");
             let mut mine = EventRow::default();
-            let finished = if read.status == 2 {
-                event_lean_purchase::<MODE>(ctx, frame, read, out, &mut mine)
-            } else {
-                event_lean_common::<MODE>(read, out, &mut mine)
+            let finished = match read.status {
+                2 => event_lean_purchase::<MODE>(ctx, frame, read, out, &mut mine),
+                4 => event_lean_bought::<MODE>(frame, read, out, &mut mine),
+                _ => event_lean_common::<MODE>(read, out, &mut mine),
             };
             assert!(finished == ROW_EMIT && mine == twin, "the assembly reads {mine:?}, the lean kernel {twin:?}");
         }
@@ -2366,9 +2593,18 @@ pub unsafe fn event_row_lean_asm<const MODE: u32>(
         let length = frame.next.offset_from(p) as usize - 1;
         return (length, event_lean_common::<MODE>(read, out, row));
     }
+    #[cfg(test)]
+    BOUGHT.with(|count| {
+        let (whole, left) = count.get();
+        count.set((whole + usize::from(read.status == 4), left + usize::from(read.status == 2)));
+    });
     if read.status == 2 {
         let length = frame.next.offset_from(p) as usize - 1;
         return (length, event_lean_purchase::<MODE>(ctx, frame, read, out, row));
+    }
+    if read.status == 4 {
+        let length = frame.next.offset_from(p) as usize - 1;
+        return (length, event_lean_bought::<MODE>(frame, read, out, row));
     }
     event_row_lean::<MODE, true>(ctx, p, out, row)
 }
@@ -3775,6 +4011,48 @@ mod tests {
                 check.click(&line);
             }
             assert!(check.answered.iter().all(|&count| count > rounds / 20), "{:?}", check.answered);
+        });
+    }
+
+    /// Valid purchases of the usual kind (a product written `p` and a
+    /// number that is in the table, a price of digits) are finished by the
+    /// assembly; the unusual ones are left to its caller. Either way the row
+    /// is what the general parser makes of it (`Checker::event` sees to that).
+    #[test]
+    fn the_assembly_finishes_purchases() {
+        for_each_window(|check| {
+            let bought = || BOUGHT.with(|count| count.get());
+            let ts = check.ts.clone();
+            // The products of the table (see PRODUCTS), every way of quoting.
+            for (product, price) in [("p1", "1"), ("p12345", "3216"), ("p2", "0250"), ("p10", "10000000"), ("p50000", "00000042")] {
+                for quotes in 0..4 {
+                    let product = if quotes & 1 == 1 { format!("\"{product}\"") } else { product.to_string() };
+                    let price = if quotes & 2 == 2 { format!("\"{price}\"") } else { price.to_string() };
+                    let before = bought();
+                    let line = check.purchase(&ts, &product, &price);
+                    assert!(line.len() >= 64 && line.len() <= 95);
+                    check.event_with(&line, TAILS[0]);
+                    assert_eq!(bought(), (before.0 + 1, before.1), "not finished in assembly: {product} {price}");
+                }
+            }
+            // Left to the caller: a product that is not `p` and a number, a
+            // leading zero, a number past the table, a price too long for
+            // the assembly's sixteen bytes.
+            for (product, price) in [("px", "5"), ("p007", "5"), ("P9", "5"), ("p9999999", "5"), ("p1", "00000000000000042")] {
+                let before = bought();
+                let line = check.purchase(&ts, product, price);
+                check.event_with(&line, TAILS[0]);
+                assert_eq!(bought(), (before.0, before.1 + 1), "finished in assembly: {product} {price}");
+            }
+            // No price: the row is not valid, and nobody finishes anything.
+            for price in ["", "0", "000", "12x", "+5", "10000001", "123456789", " 5", "5 "] {
+                let before = bought();
+                let line = check.purchase(&ts, "p12345", price);
+                check.event_with(&line, TAILS[0]);
+                assert_eq!(bought(), before, "a price after all: {price:?}");
+            }
+            // The clicks and counts `for_each_window` asks for.
+            check.times(&ts);
         });
     }
 
