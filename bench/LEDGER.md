@@ -772,3 +772,35 @@ base was `b890895` and the comparison was against candidate E.
   links `cfdf102`. Unit tests 52/52, fixtures 36/36 and 43/43, dev, 20M seeds 2 and 3 MATCH locally.
   Its CI run pairs it against F and carries the 60M check; the steps were measured one at a time, and
   only this combined run counts for the combination.
+
+### 00:40 UTC
+
+- **Agents stopped.** At about 00:15 UTC the parser, index-pass, click and correctness agents all ended
+  on the account's model usage limit (resets 2026-11-24, after the cutoff). Committed work is intact;
+  the click agent's unfinished J prototype was finished, verified and committed by the lead (`48a5427`).
+  The correctness agent's queued checks of F2 keep running on the laptop. From here the lead works
+  alone; no replacement agents, to keep the budget for integration and validation.
+- **Reviewer (independent agent, read-only)**, main points: Q's kill holds but for a different reason
+  (placing early only moves work); M was refuted only in its latency-hiding form, two rows sharing
+  vector registers is untested; on an Intel scorer the saturated resource may be one port (shuffles,
+  tzcnt/pext/imul) or legacy decode (branch erratum), so uop counts per port matter more than totals;
+  H's realistic bound is about 5% of the partition pass; two official points are consistent with a
+  fixed official part of 105-140 ms, which a one-runner timing of all scored commits would test (not
+  run yet). Correctness traps listed for G, H and J (used in the checks below).
+- **Results** (median paired ms; positive = the change is faster):
+  | Exp | Against | Result | Same-image variant | Decision |
+  |---|---|---|---|---|
+  | F2 + fixes `c8676bf` | F | +18.4 / +17.7 / +14.8, 18/18 (second run of the F2 code; first: +15.0 / +12.9 / +13.7, 18/18) | | candidate base |
+  | G(a) purchases in the assembly `e552939` | `64eecd8` | +6.0 / +8.9 / +3.0 (14/18); +4.0 / +1.9 / +0.1 (13/18), EPYC 7763 | `SS_RARE=0` 3.5 / 6.3 / 4.5 slower (16/18) | keep |
+  | H wide slot scan `2764dfa`, `f5aa625` | same image | | `SS_WIDE=1`: +11.9 / -0.2 / -8.1 (9V74); -1.1 / -3.3 / -0.0 (9V45) | not demonstrated; stays off |
+  | J clicks grouped on demand `48a5427` | F2 `9e31bf3` | **-31.5 / -27.3 / -29.3 (0/18)**, EPYC 7763; -23.7 / -21.6 / -15.5 (1/18), 9V45 | `SS_CLICK_GROUP=0` 24.8 / 24.6 / 23.3 faster (18/18) | **killed** |
+  | K chains processed early `eff462b` | `c8676bf` | +4.6 / +13.2 / +9.1 (14/18); +6.3 / +16.4 / +15.0 (17/18), EPYC 7763 | `SS_CHAINS_EARLY=0` 16.5 / 18.5 / 12.8 slower (15/18) | keep |
+  Why J lost (measured): the click-index phase went from 23.8 to 0.4 ms, but the partition pass grew
+  from 181.6 to 215.0 ms and its summed time by 130 CPU-ms. Neighbouring partitions run at the same
+  time on different threads, so the range they share is grouped by one while the other waits, in the
+  middle of its scan. A phase of its own does the same grouping with all threads busy and no waiting.
+  K, measured: time after the last partition 12.7 ms -> 0.3 ms.
+- **Fresh seeds for the F2 code** (seeds 29 / 31 / 37, run 44965105727): void, the runner was
+  disturbed (A/A pairs up to +-264 ms); repeated as run 44966494904.
+- **Candidate F3 (this push):** F2 + fixes + K + G(a). Unit tests 53/53, fixtures 36/36 and 43/43,
+  dev, 20M seeds 2 and 3 MATCH locally. Its CI run pairs it against F with the 60M check.
