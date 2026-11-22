@@ -504,6 +504,20 @@ impl Interner {
         EXOTIC_BASE + u64::from(self.hex_index(first, value))
     }
 
+    /// What `code` gives an ID of one byte (`first`) and 32 lowercase
+    /// hexadecimal digits (`value`), already read: the same three cases.
+    #[inline]
+    pub fn hex_code_of(&self, first: u8, value: u128) -> u64 {
+        if self.partition_local {
+            LONG_VALUE.with(|cell| cell.set((first, value)));
+            return LONG_EVENT;
+        }
+        match self.per_thread.then(|| thread_code(first, value)).flatten() {
+            Some(code) => code,
+            None => EXOTIC_BASE + u64::from(self.hex_index(first, value)),
+        }
+    }
+
     /// The code of an exotic ID.
     #[inline(never)]
     pub fn code(&self, id: &[u8]) -> u64 {
