@@ -954,3 +954,17 @@ base was `b890895` and the comparison was against candidate E.
   campaign cells, assists flush) costs about 230 CPU-ms, about 35% of the index pass and about 10% of
   the container time on that runner: the largest single block outside the event parser. Its output is
   wrong by design under the switch; the diagnostic never enters a candidate.
+
+### 02:00 UTC
+
+- **Attribution anatomy** (profile lab, run 44970524890, EPYC 9V45, F4's code built with the session
+  kernel's lap profiler on, 20M seed 2, NCPU=4, three rounds, per-worker laps summed over four workers):
+  per-click reach loop about 56 CPU-ms (4.8M clicks, about 11.7 ns each); credit choice about 8;
+  generating the assists (one pending entry per campaign and person-day with an assisted session) about
+  52; applying them to the campaign cells (`cpu_index_flush`) about 26 (11.5M entries, about 6.8 ns
+  each with the generation); the rest of the measured 230 CPU-ms (setup copies per clicked person, the
+  per-person click copy, credited-cell updates) about 90, not separable with these laps (the profiler's
+  setup bucket also absorbs non-attribution work in the batched path, and its first bucket counts from
+  process start: both discarded). **No single removable block**; a redesign could plausibly save about a
+  third of attribution, about 20 ms of CI container time (3%): an exploitation item, not an architecture
+  change. Recorded as hypothesis I with that bound.
