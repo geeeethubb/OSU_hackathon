@@ -3462,6 +3462,157 @@ unsafe fn product_category(ctx: &Ctx, p: *const u8, length: usize) -> u32 {
     ctx.product_category.get(product).copied().unwrap_or(ctx.unknown_category)
 }
 
+/// Whether click rows with a long ID go through `click_lean_long` before
+/// `click_row_fast`: yes unless `SS_CLICK_LONG=0` (for A/B runs on one binary).
+pub fn click_long_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SS_CLICK_LONG").as_deref() != Ok("0"))
+}
+
+/// The click rows the lean kernels decline because an ID is long (one byte
+/// and 32 lowercase hexadecimal digits; a quarter of the rows of current
+/// generated data), in `MODE_STORE` on the general path. `click_row_fast`'s
+/// reading of the row, with the long IDs read here: a click ID coded as
+/// `Interner::code` codes it, without the detour through `id_code`; a user
+/// ID's user-table slot asked for, and its lookup and the store left to the
+/// worker's ring (`parse::defer_click`). A row it does not take whole (no
+/// long ID, a short ID of another kind, a row `click_row_fast` would drop,
+/// any odd field) it declines (`ROW_DECLINE`) before anything is stored or
+/// coded, and `click_row_fast` reads it as before.
+///
+/// # Safety
+/// `ROW_PAD` bytes after `p` are readable.
+#[inline(never)]
+pub unsafe fn click_lean_long(ctx: &Ctx, p: *const u8, out: &mut ParseOut) -> (usize, u32) {
+    const DECLINE: (usize, u32) = (0, ROW_DECLINE);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let blocks = [
+        _mm256_loadu_si256(p as *const __m256i),
+        _mm256_loadu_si256(p.add(32) as *const __m256i),
+        _mm256_loadu_si256(p.add(64) as *const __m256i),
+        _mm256_loadu_si256(p.add(96) as *const __m256i),
+    ];
+    let wide = |byte: __m256i| -> u128 {
+        let low = mask(blocks[0], byte) | (mask(blocks[1], byte) << 32);
+        let high = mask(blocks[2], byte) | (mask(blocks[3], byte) << 32);
+        (u128::from(high) << 64) | u128::from(low)
+    };
+    let newlines = wide(newline);
+    if newlines == 0 {
+        return DECLINE;
+    }
+    let length = newlines.trailing_zeros() as usize;
+    let below = (1u128 << length) - 1;
+    let commas = wide(comma) & below;
+    let quotes = wide(quote) & below;
+    if commas.count_ones() != 3 || commas & 1 != 0 {
+        return DECLINE;
+    }
+    // `click_row_fast`'s quote rule.
+    let separators = commas | (1u128 << length);
+    let starts = (separators << 1) | 1;
+    let ends = separators >> 1;
+    let pext128 = |bits: u128, select: u128| -> u64 {
+        let (low, high) = (bits as u64, (bits >> 64) as u64);
+        let (select_low, select_high) = (select as u64, (select >> 64) as u64);
+        _pext_u64(low, select_low) | (_pext_u64(high, select_high) << select_low.count_ones())
+    };
+    let opened = pext128(quotes, starts);
+    if ((quotes & !(starts | ends)) | (quotes & starts & ends)) != 0 || opened != pext128(quotes, ends) {
+        return DECLINE;
+    }
+    let c0 = commas.trailing_zeros() as usize;
+    let rest = commas & (commas - 1);
+    let c1 = rest.trailing_zeros() as usize;
+    let rest = rest & (rest - 1);
+    let c2 = rest.trailing_zeros() as usize;
+    let quoted = |index: u32| ((opened >> index) & 1) as usize;
+    let (q0, q1, q2, q3) = (quoted(0), quoted(1), quoted(2), quoted(3));
+    let (s0, e0) = (q0, c0 - q0);
+    let (s1, e1) = (c0 + 1 + q1, c1 - q1);
+    let (s2, e2) = (c1 + 1 + q2, c2 - q2);
+    let (s3, e3) = (c2 + 1 + q3, length - q3);
+    if e0 == s0 || e1 == s1 {
+        return DECLINE;
+    }
+    let click_long = e0 - s0 == 33;
+    let user_long = e1 - s1 == 33;
+    if !(click_long | user_long) {
+        return DECLINE;
+    }
+    let field = |start: usize, end: usize| std::slice::from_raw_parts(p.add(start), end - start);
+
+    let click_window_start = ctx.window_start - WEEK_MS;
+    let tables = &ctx.ts_tables;
+    let ts_ms = ts_value(tables, p.add(s3), e3 - s3, iso_one(tables, p.add(s3)));
+    if ts_ms < click_window_start || ts_ms >= ctx.window_end {
+        return DECLINE;
+    }
+    let campaign = match campaign_number(p.add(s2), e2 - s2) {
+        Some(number) if number < ctx.campaign_by_number.len() => ctx.campaign_by_number[number],
+        _ => ctx.campaign_index.get(field(s2, e2)).copied().unwrap_or(u32::MAX),
+    };
+    if campaign == u32::MAX {
+        return DECLINE;
+    }
+
+    // Both IDs, with no side effect yet: long ones as values, short ones
+    // only of the kind `click_row_fast` codes from their text.
+    let click_chars = e0 - s0 - 1;
+    let user_chars = e1 - s1 - 1;
+    let click_text = _bzhi_u64(read_u64(p.add(s0 + 1)), (click_chars as u32).wrapping_mul(8));
+    let user_text = _bzhi_u64(read_u64(p.add(s1 + 1)), (user_chars as u32).wrapping_mul(8));
+    let (click_fast_code, user_fast_code, known) = two_codes(click_text, user_text);
+    let click_value = if click_long {
+        match hex_value32(p.add(s0 + 1)) {
+            Some(value) => Some(value),
+            None => return DECLINE,
+        }
+    } else {
+        let click_need = (1u32 << (click_chars & 15)) - 1;
+        if !((click_chars.wrapping_sub(1) < 8) & (*p.add(s0) == b'k') & (known & click_need == click_need)) {
+            return DECLINE;
+        }
+        None
+    };
+    let user_value = if user_long {
+        match hex_value32(p.add(s1 + 1)) {
+            Some(value) => Some(value),
+            None => return DECLINE,
+        }
+    } else {
+        let user_need = (1u32 << (user_chars & 15)) - 1;
+        if !((user_chars.wrapping_sub(1) < 8) & (*p.add(s1) == b'u') & ((known >> 8) & user_need == user_need)) {
+            return DECLINE;
+        }
+        None
+    };
+
+    // The row is taken: code the click ID, then store or defer.
+    let click_code = match click_value {
+        Some(value) => ctx.click_ids.hex_code_of(*p.add(s0), value),
+        None => click_fast_code,
+    };
+    let code_and_campaign = click_code | (u64::from(campaign) << 42);
+    let since = (ts_ms - click_window_start) as u64;
+    match user_value {
+        Some(value) => {
+            ctx.user_ids.prefetch_hex(*p.add(s1), value);
+            let deferred = super::parse::DeferredClick {
+                user_value: value,
+                code_and_campaign,
+                ts: since,
+                user_first: *p.add(s1),
+            };
+            super::parse::defer_click(ctx, out, deferred);
+        }
+        None => emit_code_click(out, user_fast_code, code_and_campaign, since),
+    }
+    (length, ROW_DONE)
+}
+
 /// Parses the click row starting at `p` (with `ROW_PAD` readable bytes after
 /// it). Rows of up to 127 bytes take the fast path: a click row with an ID of
 /// 33 characters (current generated data has them) is about 70 to 100.
@@ -4068,6 +4219,12 @@ pub unsafe fn click_row_lean<const MODE: u32, const INDEXED: bool>(
 ) -> (usize, u32) {
     let (length, status) = click_decode_lean::<MODE, INDEXED>(ctx, frame, p, out, click);
     if status == ROW_DECLINE {
+        if MODE == MODE_STORE && !INDEXED && click_long_path() {
+            let (length, status) = click_lean_long(ctx, p, out);
+            if status != ROW_DECLINE {
+                return (length, status);
+            }
+        }
         return click_row_declined::<INDEXED>(ctx, p, click);
     }
     (length, status)
@@ -4600,6 +4757,12 @@ pub unsafe fn click_row_shapes<const MODE: u32, const INDEXED: bool>(
 ) -> (usize, u32) {
     let (length, status) = click_decode_shapes::<MODE, INDEXED>(ctx, frame, p, out, click);
     if status == ROW_DECLINE {
+        if MODE == MODE_STORE && !INDEXED && click_long_path() {
+            let (length, status) = click_lean_long(ctx, p, out);
+            if status != ROW_DECLINE {
+                return (length, status);
+            }
+        }
         return click_row_declined::<INDEXED>(ctx, p, click);
     }
     (length, status)
