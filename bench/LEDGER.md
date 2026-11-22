@@ -210,7 +210,8 @@ variable-width IDs, one in eight long hexadecimal). Scores on it are not compara
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `32b8fffd658af203da5e5809c9d3ce9eaede94ee` (F5) | **0.7698 s** (shopping-sessions-5) | BB-4A6C474E | relayed by the user 2026-11-22 about 03:45 UTC (SHA and receipt confirmed in the audit relayed about 04:00): rank 11, the team's best ever; board top 0.5528 s (not rechecked here); current accepted baseline |
+| `2676ee043442f0c33357a6f07f3548ae6ead3a4e` (F6) | **0.7493 s** (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 04:30 UTC: the new best, 20.5 ms (2.7%) below F5 |
+| `32b8fffd658af203da5e5809c9d3ce9eaede94ee` (F5) | 0.7698 s (shopping-sessions-5) | BB-4A6C474E | relayed by the user 2026-11-22 about 03:45 UTC (SHA and receipt confirmed in the audit relayed about 04:00): rank 11, the team's best ever; board top 0.5528 s (not rechecked here); current accepted baseline |
 | `9735a63d039ee9ee843e0204f1d988bd5c822f41` (opaque IDs, general path) | 1.2745 s (shopping-sessions-5) | BB-32BE0EA7 | relayed by the user 2026-11-22 about 03:20 UTC |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 5.6629 s (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:20 UTC: index mode, outside the new rules |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 0.4648 s (previous dataset) | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
@@ -1133,3 +1134,10 @@ base was `b890895` and the comparison was against candidate E.
   run 44983001687); serial sessions setup 5.2 ms on Linux; every phase idles under 5 thread-ms.
 - **F6** = source of `9643656` (F5 + probe tokens + lazy names; D1 removed): pushed to `pipeline` with
   [60m] for the paired 20M/60M run against F5, plus a fresh-seed run; local 60M comparison follows.
+
+### 04:30 UTC: F6 scored 0.7493 s
+
+- **Official: F6 `2676ee043442f0c33357a6f07f3548ae6ead3a4e` = 0.7493 s** (relayed; receipt not relayed), 20.5 ms (2.7%) faster than F5's
+  0.7698 s. Its CI steps against their parents were about +24 ms (probe tokens) and +29 to +40 ms (lazy
+  names). `bench/BEST_SHA` now names F6. F6's own CI validation (20M three seeds and 60M against F5,
+  fresh seeds 59/61/67) was still running when it was submitted; local gate: all MATCH, 60M MATCH.
