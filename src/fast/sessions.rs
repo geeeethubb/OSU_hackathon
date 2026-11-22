@@ -96,8 +96,20 @@ struct Profile {
 /// run against the normal path measures what attribution costs end to end.
 /// The output is then wrong by design; never set it in a scored run.
 fn skip_attribution() -> bool {
-    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SKIP.get_or_init(|| std::env::var_os("SS_DIAG_ATTR").is_some_and(|value| value == "1"))
+    attribution_diag() == 1
+}
+
+/// `SS_DIAG_ATTR`: 1 skips all attribution, 2 only the assists (credit is
+/// still chosen and written), 3 only the writes of credited sessions to the
+/// campaign cells. Diagnostics only: the output is wrong by design.
+fn attribution_diag() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SS_DIAG_ATTR").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        _ => 0,
+    })
 }
 
 fn time_stamp() -> u64 {
@@ -1495,6 +1507,9 @@ fn finish_batch(
         }
         for session in 0..count {
             let day = batch.row_day[batch.row_of[from + session] as usize] as usize;
+            if attribution_diag() == 3 {
+                continue;
+            }
             let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
             cell[0] += 1;
             cell[1] += i64::from(batch.bought[from + session] > 0);
@@ -1893,8 +1908,10 @@ fn attribute_narrow(
             reach_by_count(&work.start, blocks, floor, ts)
         };
         offer(&mut work.best, clicks, click_exotic, at, from);
-        let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
-        work.masks[slot] |= low_bits(to) & !low_bits(from);
+        if attribution_diag() != 2 {
+            let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
+            work.masks[slot] |= low_bits(to) & !low_bits(from);
+        }
     }
     work.profile.lap(7);
 
@@ -1950,9 +1967,11 @@ fn attribute_wide(
         let ts = click[0] as u32;
         let (from, to) = reach_by_lookup(&work.lookup, limit, ts.saturating_sub(WEEK), ts);
         offer(&mut work.best, clicks, click_exotic, at, from);
-        let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
-        if from < to {
-            set_bits(&mut work.masks[slot * words..(slot + 1) * words], from, to);
+        if attribution_diag() != 2 {
+            let slot = slot_for(&mut work.slot_of, &mut work.slot_campaign, &mut slots, (click[1] >> 42) as usize);
+            if from < to {
+                set_bits(&mut work.masks[slot * words..(slot + 1) * words], from, to);
+            }
         }
     }
     work.profile.lap(7);
@@ -2086,6 +2105,9 @@ fn finish_person(
         }
         for session in 0..sessions {
             let day = work.row_day[work.row[session] as usize] as usize;
+            if attribution_diag() == 3 {
+                continue;
+            }
             let cell = &mut out.campaign_days[work.credited[session] as usize * params.day_count + day];
             cell[0] += 1;
             if has_purchases {
