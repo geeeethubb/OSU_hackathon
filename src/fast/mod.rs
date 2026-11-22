@@ -575,7 +575,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let event_nanos = AtomicU64::new(0);
     let click_nanos = AtomicU64::new(0);
     let link_build_nanos = AtomicU64::new(0);
-    let (link_table, click_index) = std::thread::scope(|scope| {
+    // Pass B's per-thread person partitions, made now: on the general path a
+    // click task that starts once the link table is built sends its clicks
+    // straight there (`parse::DirectClicks`); `SS_CLICKS_DIRECT=0` keeps
+    // every click for the click-map pass, as before.
+    let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
+    let direct_clicks = ctx.keys.is_none() && !std::env::var_os("SS_CLICKS_DIRECT").is_some_and(|value| value == "0");
+    let link_cell: std::sync::OnceLock<links::LinkTable> = std::sync::OnceLock::new();
+    let click_index = std::thread::scope(|scope| {
         // The links are resolved beside the parse, on one thread. In index
         // mode almost every link joins two IDs of one user, and those are
         // done user by user with no shared table (`links::build_indexed`), a
@@ -587,7 +594,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 None => links::build(&link_pairs, &ctx.user_ids),
             };
             link_build_nanos.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            table
+            let _ = link_cell.set(table);
         });
         parallel(threads, |thread| {
             // SAFETY: slot `thread` belongs to this thread for the whole phase.
@@ -599,7 +606,16 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 if task.kind == Kind::Events {
                     parse::parse_events_chunk(&ctx, event_files[task.file].bytes(), task.start, task.end, out);
                 } else {
+                    if let Some(table) = link_cell.get().filter(|_| direct_clicks) {
+                        // SAFETY: slot `thread` of `b_out` belongs to this
+                        // thread for the whole phase, and the table outlives
+                        // the task; the value is dropped at its end.
+                        out.direct = Some(unsafe { parse::DirectClicks::new(table, b_out.get(thread)) });
+                    }
                     parse::parse_clicks_chunk(&ctx, click_files[task.file].bytes(), task.start, task.end, out);
+                    if let Some(mut direct) = out.direct.take() {
+                        direct.flush();
+                    }
                 }
                 if let Some(started) = started {
                     let spent = started.elapsed().as_nanos() as u64;
@@ -676,8 +692,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             });
             (builder.finish(), started.elapsed())
         });
-        (builder.join().unwrap(), click_index)
+        builder.join().unwrap();
+        click_index
     });
+    let link_table = link_cell.into_inner().expect("the link builder ended without a table");
     let link_table: &links::LinkTable = &link_table;
     if let Some((_, spent)) = &click_index {
         timing.detail("click_index", spent.as_secs_f64() * 1e3);
@@ -711,7 +729,6 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
-    let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
     let event_parts = ctx.event_parts();
     let next = AtomicUsize::new(0);
     let winners_nanos = AtomicU64::new(0);
