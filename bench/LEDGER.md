@@ -851,3 +851,54 @@ base was `b890895` and the comparison was against candidate E.
   should not be taken as a rule for the next step either.
 - **Agents remain stopped** (usage limit); the lead works alone with CI. Budget is kept for integration
   and the final candidate's validation.
+
+### 01:15 UTC
+
+- **F3 fresh seeds 41 / 43 / 47** (run 44968021383): +27.1 / +30.9 / +28.9 ms against F, 18/18 pairs,
+  A/A medians +1.3 / -0.3 / -1.0. F3 is confirmed on nine seeds in all.
+- **F3's profile, refreshed** (run 44967278499, EPYC 9V74, 2 cores x 2 threads, seed 2, one
+  instrumented run): container 552.3 ms; process 473.2 = startup 2.4, link stage 14.7 (link rows 8.7 on
+  all threads; the lookup tables took 16.8 ms on their own thread and were waited for 5.3 ms), parse
+  stage 294.3 (workers 274.1, click index 20.0), odd events 2.1, index pass 156.3 (partitions 155.7,
+  tail after the last partition 0.2), general remainder 2.1, output 1.1. Summed worker time: event
+  parse 914, click parse 181, link builder 44.5 (beside the parse, never waited for), index partitions
+  538 = place 131 + session kernel 229 + assists 26 + the rest 152; output encode 33 CPU-ms. **Event
+  parse 62% of the process, index pass 33%, everything else 5%.** The only idle time on the critical
+  path is the 5.3 ms table wait; the stages are otherwise parallel and compute-bound.
+- **G(b)(1), declined rows straight to the general kernel** (`1b73234` against F3, runs 44967865665 and
+  44967875462, EPYC 7763): +2.6 / -0.3 / -3.2 (10/18) and +1.1 / +4.3 / +0.7 (11/18); same image with
+  `SS_RARE=a` (old route) +2.9 / -0.4 / -3.6 ms. **Not demonstrated**, as the bound predicted (1.5% of
+  rows x 25 ns = about 2 ms elapsed). Stays (harmless), counts for nothing.
+- **Lookup tables without one allocation per product** (`60758b0`, pushed 00:55, pairs against F3):
+  in CI. Bound: the 5.3 ms wait (about 9 ms with eight threads, since the link rows then finish sooner).
+- **The user's three hypotheses, screened:**
+  1. *Multi-row parsing with shared vector work.* Assigned to the parser agent after its current step,
+     time-boxed: count first (kill unless a pair saves at least 12% of the straight line's
+     instructions), build behind `SS_KERNEL=pair` only then. Why it could pay: the straight line runs at
+     about 3.4 IPC single-thread and a second hardware thread adds only 23-32%, so the core is
+     throughput-bound and fewer uops per row are time. Prior failure it must avoid: the "two halves out
+     of step" parser (c890351) lost 10-17 ms in CI because it lengthened the dependency chain of each
+     row; the pair design must keep field finding per row and share only the ID and timestamp vector
+     work. Bound: 10-15% of event parse CPU, about 6-9% of the process.
+  2. *Partial-parse reuse for expensive fallback rows.* This is the G(b) line. Measured bound: rows
+     that leave the straight line are 4.45% (purchases 2.95%, declines 1.50%); purchases are finished
+     inside the assembly since F3 (G(a), +4 to +9 ms); the declines cost about 150 ns each (about 45
+     CPU-ms of 914, 5% of event parse, about 2% of the process), of which the wasted re-read was
+     measured as nothing. The last step with a measurable bound is (b)(2), invalid-timestamp rows
+     finished inside the assembly (0.69% of rows), which the parser agent is building; everything
+     beyond it is below the noise floor of the measurement. No separate agent.
+  3. *A representation or ownership change that removes event rearrangement work.* What rearranges
+     events today: the parse writes 16-byte records to per-thread lists by partition (lists cost 9% of
+     event parse CPU, measured in the lab), `place` reads them into the slot table (131 CPU-ms, 24% of
+     the index pass), the scan reads the slots. Together about 11% of all CPU. Designs measured and
+     rejected: records written straight to their slots by all threads (direct atomic scatter, 1.5-2.2x
+     slower: random writes over 335 MB from every thread), one stream per owner (2-3x slower),
+     two-level partitioning (30-40% slower at 20M), 2^13 / 2^15 partitions, write-combining stores.
+     Sessionizing from the lists without placing is killed on paper: within a user the copies arrive in
+     file order, which is random, so every person would need a sort, which is more work than place; and
+     a record cannot shrink below 16 bytes because the winning copy's own ts, ingest, user and purchase
+     must travel with it (copies with different ingest may differ in any field). What has not been
+     tried and could still pay: nothing with a bound above 5% that avoids the measured failures. Killed
+     for this sprint; recorded so it is not retried without a new argument.
+- **Agents:** three were resumed at 00:52 and two stopped again at 00:56 on the user's budget note; the
+  parser agent alone continues, scoped to G(b)(2) and hypothesis 1, then stops.

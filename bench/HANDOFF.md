@@ -6,15 +6,18 @@ from about 13:00 the effort shifts to validating one reliable final candidate.
 
 ## Best verified implementation
 
-- **Official best: 0.5231 s**, candidate F, `1033956062d3cd948462c664d822f2636bcf1153` (receipt
-  BB-337F162E). Previous: 0.6389 s `2dae9298f4e1e0a5259eec54c400501b00fae26f`, 0.66 s `4567e953...`,
-  0.71 s `2b2cccd1...`. Board best when last checked: 0.2778 s. Official scores are relayed by the
-  user's submission watch; nothing here submits.
-- `bench/BEST_SHA` = F: every CI run pairs HEAD against the officially scored commit. F must stay
-  recoverable: it is the commit named in the PR until a successor is confirmed.
-- **Candidate F2 in CI** (pushed 00:00): `9e31bf35b6926a20b282ad270c8005082c6ec40f` = F + parser chain
-  to `64eecd8` + index-pass chain to `4f16ecb` + links `cfdf102`. Named in the PR only if its own run
-  confirms it against F (20M three seeds, fresh seeds, 60M).
+- **Official best: 0.4663 s**, candidate F3, `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (receipt
+  BB-9900D7A0). Before it: 0.5231 s F `1033956062d3cd948462c664d822f2636bcf1153`, 0.6389 s
+  `2dae9298...`, 0.66 s `4567e953...`, 0.71 s `2b2cccd1...`. Board best when last checked: 0.2778 s.
+  Official scores are relayed by the user's submission watch; nothing here submits.
+- `bench/BEST_SHA` = F3: every CI run pairs HEAD against the officially scored commit. F3 must stay
+  recoverable: it is the commit named in the PR until a successor is confirmed (fresh seeds and 60M).
+- F3 = F + event loop and store in assembly, merged vector checks, constants in registers, purchases
+  finished in the assembly; edge chains processed while partitions run; place restructured, odd-ID
+  events merged by time; new link builder; stale output files removed. In CI against F: +42.5 / +38.9 /
+  +42.2 ms (18/18), fresh seeds +27 / +31 / +29 ms (18/18), 60M +84.8 ms, peak memory 1.69 GiB.
+- Calibration of official scores against one runner (seven points, EPYC 7763): slope about 0.65,
+  intercept 65 to 100 ms; F3's own step carried over at more than one to one. Data, not a model.
 
 ## What the measurements say about the bottleneck (details: LEDGER 23:30 and 23:58)
 
@@ -36,18 +39,20 @@ from about 13:00 the effort shifts to validating one reliable final candidate.
 
 | ID | Architectural difference | Correctness argument | Measured / bounded benefit | Added costs | Decision |
 |---|---|---|---|---|---|
-| G | Purchases and declined rows finished inside the assembly instead of leaving for slower parsers that re-read them | the assembly takes exactly the rows the general parser accepts, with identical values; per-case proof for rows rejected inside; differential tests both ways | 4.45% of rows take ~30% of kernel time; bound ~25% of event parse, ~10% of process | code size, a purchase path | BUILD, parser agent (`SS_RARE=0` switch) |
-| H | Slot scan four slots per step, purchases and invalid winners included | per-slot semantics unchanged; tested against one-at-a-time code | one-slot path 14-17% of the partition pass (3.75M mispredicted exits) | AVX2 classification per four slots | IN CI (`2764dfa`, `SS_WIDE=1`), sessions agent |
-| I | Batch finish (attribution, cells, rows) restructured to remove work | rules for credited/assists/organic unchanged | 37-39% of the partition pass; bound not yet known | unknown | DESIGN FIRST, sessions agent; stop if under 5% |
-| J | Clicks grouped per partition inside the index pass; no click-index phase and no 80 MB second copy | same click set per user and same filter; the kernel is order-free over a person's clicks | the phase is 19.6-25.2 ms elapsed (3-4% of process) | ranges straddling two partitions read twice or built once with a wait | BUILD, click agent (`SS_CLICK_GROUP=0`); kill on no paired win |
-| K | The five whale persons spread over threads (split at session gaps or stitch the boundary sessions) and chains started early | session boundaries come from consecutive ts; a session's day and attribution depend on its start only | tail 12.5 ms on CI; larger share with 8 threads | stitching code | MEASURE the tail left in F2 first; lead |
+| G | Purchases and declined rows finished inside the assembly instead of leaving for slower parsers that re-read them | the assembly takes exactly the rows the general parser accepts, with identical values; differential tests both ways | (a) purchases: +4 to +9 ms, `SS_RARE=0` 3.5-6.3 ms slower (16/18): in F3. (b)(1) declined rows without the re-read: +2.6 / -0.3 / -3.2, nothing. (b)(2) invalid-ts rows inside: building | a purchase path in the assembly | (a) KEPT, (b)(1) neutral, (b)(2) in progress |
+| H | Slot scan four slots per step, purchases and invalid winners included | per-slot semantics tested against the one-at-a-time code | `SS_WIDE=1` same image: +11.9 / -0.2 / -8.1 and -1.1 / -3.3 / -0.0 ms | AVX2 classification | NOT DEMONSTRATED; stays off |
+| I | Batch finish (attribution, cells, rows) restructured to remove work | rules for credited/assists/organic unchanged | 37-39% of the partition pass (about 200 CPU-ms); split not measured | unknown | PARKED (agent stopped for budget) |
+| J | Clicks grouped per partition inside the index pass; no click-index phase | same clicks per user, same order | **-31.5 / -27.3 / -29.3 ms** (0/18): the phase went from 23.8 to 0.4 ms but the partition pass grew 130 CPU-ms (neighbouring partitions wait on the range they share) | waiting | KILLED by measurement |
+| K | Edge chains joined and processed while partitions still run | same joins and layout check; restart drops everything | +6.3 / +16.4 / +15.0 ms (17/18); tail after the last partition 12.7 -> 0.3 ms | a mutex per partition | KEPT, in F3 |
+| M2 | Two rows per pass sharing the ID and timestamp vector work (the other form of M) | every row through today's checks, grouped in pairs; a declined second row falls back to the one-row path for both | bound 10-15% of event parse; killed on paper unless a pair saves 12% of the straight line's instructions | gathering the second row's fields | COUNT FIRST, parser agent |
+| T | Lookup tables without one allocation per product | same table and map contents; readers try the table first | bound: the 5.3 ms table wait at startup (about 9 ms with eight threads) | none | IN CI (`60758b0`) |
 | L | 8-byte records | needs at least 80 bits without truncation; truncating user numbers would make the layout check unsound | lists are 9% of event parse | | KILLED on paper (bit budget); 12-byte variant bounded at ~3%, not now |
 | M | Two rows interleaved per loop iteration | | none: with both hardware threads busy the core is already throughput-bound | | KILLED by measurement |
 | N | Eight rows per vector lane (transposed) for timestamp and ID arithmetic | same decode, vertical | arithmetic ~90 of 197 straight-line instructions; transposition eats much of it; estimate under 15% | large rewrite | PAPER SCREEN by the parser agent after G; build only above 15% |
 | O | EVEX-256 kernel (AVX-512 F/BW/VL/VNNI) with runtime dispatch; AVX2 fallback | same acceptance set | unknown; the scorer's n2 Xeons have these instructions | second kernel; the scorer's exact CPU cannot be tested | PAPER SCREEN (uop count) by the parser agent |
 | P | Decode after dedup (offsets instead of records) | | measured earlier: at most 2-4% of parse before the random re-read of 1.6 GB | | KILLED; nothing has changed since |
 | Q | Index pass overlapped with the parse | any file holds copies of any event: no partition is final before the last row | | | KILLED on paper |
-| R | Scorer calibration through official submissions: R1 an identical binary again (run-to-run variation); R2 F + jumps padded off 32-byte boundaries (Skylake-family erratum; CI has no affected CPU) | both builds pass every CI check | R2 unknown; CI cost of the padding 1-5 ms on an EPYC 7763 | two submissions | RECOMMENDED to the submission watch |
+| R | Scorer calibration through official submissions (identical binary again; F + jump padding) | both builds pass every CI check | padding costs 1-5 ms on an unaffected AMD runner; the scorer's CPU is unknown | two submissions | NOT PURSUED: the user ruled out calibration submissions; the one-runner calibration above replaces R1 |
 
 Bounded incremental stream on F, one step at a time: the parser's kernel steps, the sessions agent's
 scan steps, links and click kernels (small), memory reuse of consumed list blocks (small).
