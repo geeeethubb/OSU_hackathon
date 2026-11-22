@@ -4,18 +4,30 @@ Short and current; the evidence itself is in `LEDGER.md`. Times are UTC, 2026-11
 Competition cutoff: 2026-11-22 16:00 UTC (10:00 America/Chicago). No major rewrite after 14:30 UTC;
 from about 13:00 the effort shifts to validating one reliable final candidate.
 
-## Where it stands (checkpoint 2026-11-22 08:45 UTC, shopping-sessions-5)
+## Where it stands (checkpoint 2026-11-22 10:08 UTC, shopping-sessions-5)
 
-- **Candidate F12 = head of `pipeline` (this commit)** = F11 + the ring of pending user codes (`SS_PENDING`) +
+- **Candidate F13 = this commit** = F12 + the general path's credited sessions and assists kept in
+  compact per-cell counts (`SS_HOLD`; index mode's mechanism); build inputs = `1718c6e`. F12 `e89b50c`
+  is the first fallback (the stronger-measured one), F11 `8f39109` the second.
+  Hold against F12: Intel 206/306 pairs over two batches (about +2.7 ms, 0.35%, on Granite and Emerald
+  Rapids; the second batch passed a criterion fixed before its results), Ice Lake 31/54 (neutral), AMD
+  neutral (9/18; fresh seeds 193 / 197 / 199 7/18), 60M -2.8 ms (2/6, noise) with 19/19 MATCH; local
+  gate all MATCH (LEDGER 09:27 and after). The difference between F12 and F13 is within the noise of
+  one official run.
+- F12 against F11 on Ice Lake (one 8370C, e1): 18/18 pairs, about 1.4%.
+
+## Checkpoint 2026-11-22 08:40 UTC (superseded above)
+
+- **F12 `e89b50c` (then the candidate, now the first fallback)** = F11 + the ring of pending user codes (`SS_PENDING`) +
   16-byte partition writers + the ID snapshots beside pass B + lists sealed by their own workers; build
   inputs = `9226397`. F11 `8f39109` and F10 `20d2f71` are the fallbacks.
   Against F11: Intel CI +0.1 / +7.8 / +6.0 ms (6975P-C, 13/18), e1 native 74/90 pairs (+0.4-2.1%); AMD
   fresh seeds +9 to +26 ms (179/181/191 never used: +8.9 / +13.5 / -2.3); 60M +17.8 ms, 19/19 MATCH,
-  peak 2.14 GiB; local gate all MATCH (LEDGER 08:45).
+  peak 2.14 GiB; local gate all MATCH (LEDGER 08:40).
 - Rejected since 07:45: the branchless link lookup (-20 ms on Intel, 0/54), the two-word link table,
   the pdep commas (C5); dropped on the laptop before Intel: mixed names in link entries, per-block slot
   prefetch for the winner and person tables.
-- Profile of F11 by call site (e1, LEDGER 08:25): pass B 24% (link probe 12-13% of all CPU, winners about
+- Profile of F11 by call site (e1, LEDGER 08:22): pass B 24% (link probe 12-13% of all CPU, winners about
   6%), assembly loop 19%, `event_lean_long` 12.6-14.2%, pass C about 17%, clicks about 10%.
 
 ## Checkpoint 2026-11-22 07:30 UTC (superseded above)

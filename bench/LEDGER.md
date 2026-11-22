@@ -1472,7 +1472,7 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   pairs; A/A F11 medians -3.4 to +2.1, 43/90). CI (run 44999034299, Xeon 8573C): -1.0 / -4.0 / +6.4 ms (10/18).
   Not demonstrated alone.
 
-### 08:00 UTC: 16-byte partition writers (`3d40691`, on top of the snapshots)
+### 07:56 UTC: 16-byte partition writers (`3d40691`, on top of the snapshots)
 
 - **Change**: `PartWriter` is the cursor and the end of its block (two words, not four): the block being
   filled is the `block_words` before the end, and every block's header carries the list's first block
@@ -1491,7 +1491,7 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   About 25% of event rows leave the loop (23% with a long ID, 3% purchases), so batching them would save
   about 1% of the event parse: not pursued. The long rows' cost is inside `event_lean_long`.
 
-### 08:25 UTC: F11's profile by call site; the ring kept, the branchless link lookup rejected
+### 08:22 UTC: F11's profile by call site; the ring kept, the branchless link lookup rejected
 
 - **e1's F11 profile, every sample resolved to its call site (addr2line -i; Xeon 8573C x3, 6975P-C x1;
   probe 87cd81d).** Shares of CPU: pass B 24.2% (the link probe's bitmap word and rank 43-47% of pass B
@@ -1528,7 +1528,7 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   block prefetched before the block is walked, and the same for the sessions person table
   (`exp-winpf`): winner step 220-227 ms against 179-187, sessions no better.
 
-### 08:35 UTC: F12 assembled
+### 08:28 UTC: F12 assembled
 
 - **F12 = `9226397`** (branch scratch-f12) = F11 (`8f39109`) + the snapshots (`58670ca`) + 16-byte writers
   (`3d40691`) + the ring of pending user codes (`439917f`) + lists sealed by their workers (`bdc0e87`),
@@ -1536,7 +1536,7 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   local gate; CI against F11's code `af07f59` with [60m] (exp-f12-a) and with fresh seeds 131/137/139
   (exp-f12-b); e1's native whole-image pairs against F11 on Intel.
 
-### 08:45 UTC: F12 passes its gate
+### 08:40 UTC: F12 passes its gate
 
 - **Local gate on F12's exact tree (`9226397`)**: unit tests (57), 36/36 and 43/43 fixtures, dev and dev_new,
   new 20M, old 20M seeds 2 and 3, the mutated long-ID, click, wide-row and link sets with and without
@@ -1566,3 +1566,97 @@ C4 (`9612344`; F11 = `8b38f50` + `af07f59` cherry-picked onto F10, the same buil
   loop on Ice Lake, 7.6-8.9% on 8573C and 6975P-C, 10.2% on the 6973P-C), at the end of the row's
   dependency chain (codes, mix, writer index, cursor load). Bounded experiment: the mix and the cursor
   load hoisted to right after `lean_codes`, so the load overlaps ts, ingest, type and tail.
+
+### 08:51 UTC: F12's exact commit; the cursor hoist in flight
+
+- **F12 `e89b50cc28baa759a534dae01c85dd837c5ccabb` on its exact commit against F6** (push run 45003914547): 20M on
+  an EPYC 7763 +93.8 / +98.0 / +95.8 ms (18/18; A/A +2.5 / -4.2 / -3.3); **60M on an EPYC 9V45 +280.6 ms (6/6),
+  F12's 19/19 runs MATCH `/reference`, peak memory 2.14 GiB**; 36/36, 43/43, dev MATCH. PR #1 names F12.
+- **Cursor hoist (`22108d3`, on F12)**: right after `lean_codes` the general path's loop mixes the event code,
+  finds the writer, keeps both in the frame and loads the writer's cursor into rbp (saved and restored like
+  rbx); the store takes them from there. Target: e1's top instruction of the loop (`lea r13,[r11+0x10]`,
+  5.3-10.2% of it). Exact everywhere locally (incl. 60M); laptop parse 1,747 against 1,712 ms (medians of
+  5, noise). In flight: CI against F12 (exp-hoist-a), e1's native pairs against F12.
+- **Cursor hoist (`22108d3`) REJECTED.** e1, native whole images against F12 (5 Intel draws): Xeon 8573C -3.8 /
+  -6.1 / +0.4 ms (7/18); 6975P-C +2.4 / +2.9 / +0.9 (14/18), +0.0 / +2.1 / -2.7 (10/18); 6973P-C +4.8 / -2.8 /
+  +2.1 (8/18, noisy runner), -5.7 / -4.0 / -4.5 (2/18): 41/90. e1's annotate of it (6975P-C): the store's
+  `lea r13,[rbp+16]` fell to 0.0%, but the first instruction after the hoisted load (`mov rax,r8`) rose to
+  10.1% of the loop: **the cursor load misses L1, and retiring stops behind a load wherever it sits** (two
+  hyperthreads leave about one row of the loop in flight each).
+- **Prefetch instead of load (09:00)**: `41a6af4` = F12 + the writer's line prefetched right after
+  `lean_codes` (mix and writer kept in the frame; the store reads the cursor as before); `8cb4843` = that
+  + the same for `event_lean_long`/`event_lean_wide` (the record's partition writer prefetched after the
+  event ID is read) + pass B prefetching, at each probe, the writer an unlinked user routes to (about half
+  the records). In flight: CI against F12 (exp-hpf-a, exp-allpf-a), e1's native pairs, the local sweep.
+- Ledger headings since 07:45 corrected to the clock (they had been rounded ahead by 4 to 9 minutes).
+
+### 09:11 UTC: the writer prefetches rejected; F12 stays the candidate
+
+- **`41a6af4` (assembly loop: the writer's line prefetched after `lean_codes`)** against F12: e1 native,
+  Xeon 8573C +2.3 / +2.9 / +6.8 (13/18), 6975P-C +2.5 / -5.4 / -0.4 (10/18) and +4.8 / -0.1 / -0.1 (10/18),
+  6973P-C -3.9 / -3.7 / -2.4 (6/18): 39/72; CI run 45005369497 (6975P-C) +1.2 / -0.6 / +7.4 ms (11/18). e1's
+  annotate: the store's cursor read fell from 8.8% of the loop to under 0.4%, but the hoisted mix, writer
+  and frame stores cost 13.3-13.7% of it (hoist plus store about 16% against F12's 18%): about 0.4% of
+  CPU, inside the noise. **REJECTED** (exact everywhere locally).
+- **`8cb4843` (that + the long-ID kernels' writer prefetch + pass B's prefetch of an unlinked user's
+  writer at the probe)** against F12: e1 native, 8573C -23.7 / -18.8 / -21.4 (1/18), 6975P-C -11.4 / -9.8 /
+  -8.6 (0/18) and -9.6 / -6.8 / -8.5 (1/18), 6973P-C -19.8 / -23.1 / -29.2 (1/18): 3/72, 1-3% slower; CI run
+  45005373920 (EPYC 7763) -5.4 / +0.7 / -9.1 ms (5/18). Exact everywhere locally. **REJECTED**: the
+  requests wasted on linked users and the extra work in the long-ID kernels cost more than they hide.
+  The laptop had shown both slower (parse 1,752 against 1,579 ms; forward 341 against 321).
+- Reading: in the hot loops, two hyperthreads leave about one row each in flight, so a miss at the end
+  of a row's chain is hard to hide, and any added work per row is paid in full. F12 stays.
+- **F12 against F11 on Emerald Rapids** (e1, native whole images, probe 28c8c3a, only Xeon 8573C/8370C
+  draws; six 8573C, no 8370C in 20 jobs): +13.1 / +15.8 / +8.2, +15.7 / +9.7 / +3.1, +14.9 / +14.8 / +12.6,
+  +9.2 / +12.8 / +14.5, +14.1 / +13.3 / +12.0, +11.2 / +15.1 / +11.9 ms: **99/108 pairs, every seed median
+  positive** (F11 A/A -5.2 to +4.3, one +12.7); about +1.0-1.5%. With the earlier five draws: 173/198 on
+  Intel. No Ice Lake draw.
+
+### 09:27 UTC: held campaign cells on the general path (in flight)
+
+- Row paths at 20M (new_s2_20m, diagnostic build): 25.8% of event rows leave the assembly loop; 1.5%
+  (299,791, nearly all malformed or edge forms: hour 24, second 60, month 13, lower-case `t`/`z`, no
+  seconds, fractional seconds, empty user, odd types) reach the compiled general kernel, 0.15% (30,902)
+  the general parser. Too varied and too few for a kernel of their own.
+- **`1718c6e` (SS_HOLD)**: index mode's compact per-cell counts (`held`, `held_sessions`: a 32-bit count
+  per (campaign, day), an eighth of `campaign_days`) used by the general path too: `finish_person` counts
+  credited sessions there and writes the cell itself only for a session with a purchase, each
+  partition's assists go there, index mode's overflow bound flushes early, and each worker adds what it
+  holds at its end. Target: e1's credited-cell and assist updates, 10-11% of pass C (about 2% of CPU).
+  Exact everywhere locally, incl. 60M and the large-revenue and many-values sets at 1, 4 and 8 threads
+  (a first build tripped `partition_core`'s index-mode invariant; the general path has its own flag
+  now). Laptop pass C unchanged (93 against 93 ms). In flight: CI against F12 with the SS_HOLD=0
+  variant (exp-hold-a), e1's native pairs against F12.
+- **Hold against F12, first measurements**: e1 native whole images, seven Intel draws (four 6975P-C, one
+  6973P-C, two 8573C): hold faster in **83/126 pairs, pooled median +2.8 ms** (F12 A/A 68/126, +0.2 ms);
+  per CPU 6975P-C 49/72 (+2.7), 6973P-C 10/18 (+0.8), 8573C 24/36 (+2.9). About 0.2-0.4%, about 2.7 sd
+  over the A/A. CI run 45007552566 (EPYC 7763): -0.7 / +2.8 / -2.6 ms (9/18); the same image with SS_HOLD=0
+  +10.1 / -6.0 / +3.9 (noise, +-100-200 ms outliers); pass C stage time unchanged there. Not yet the
+  repeatable gain a candidate needs: one more independent Intel batch and a fresh-seed CI pair (193 /
+  197 / 199, exp-hold-b) decide.
+- **F13 prepared**: scratch-f13 = `08c93db` = F12 `e89b50c` + `1718c6e` (build inputs = `1718c6e`). Its
+  local gate passed (same list as F12's plus SS_HOLD=0): all MATCH, 180/180 small and mutated sets, 60M.
+  Not pushed to `pipeline`; F12 stays the candidate unless the confirming batch holds.
+- **Hold, confirming batch** (e1, criterion fixed before the results: at least 60% of pooled pairs and a
+  positive pooled median; ten Intel draws): **123/180 pairs (68.3%), pooled median +2.7 ms: passes**
+  (F12 A/A 100/180, +0.5 ms). Per CPU: 6975P-C x5 64/90 (+2.8), 6973P-C x2 29/36 (+3.2), 8573C 13/18
+  (+2.4), **8370C (Ice Lake) x2 17/36 (-0.7; one run very noisy, the other -2.3 / -2.1 / +1.4, 7/18)**.
+  Both batches: 206/306 against the A/A's 168/306. About 0.35% on Granite and Emerald Rapids, nothing
+  on Ice Lake or AMD. Asked next: Ice Lake-only runs of F12 against F11 (F12 has no Ice Lake reading)
+  and of hold against F12, before F13 is published or set aside.
+- **Hold on fresh seeds** (CI run 45008438581, EPYC 9V45, seeds 193 / 197 / 199, never used before):
+  +0.1 / +0.2 / -5.1 ms (7/18). AMD: neutral to slightly negative.
+- **Hold at 60M** (CI run 45008902770, Xeon 8573C): -2.8 ms against F12 (2/6; A/A median abs 4.2 ms), the
+  20M part +1.8 / +1.9 / +4.2 ms (10/18); hold's 19/19 runs MATCH `/reference`; peak 2.13 GiB.
+- **Ice Lake (e1, Ice Lake-only probe 7e5d686, one Xeon 8370C caught in 60 draws, run 45009846005)**:
+  **F12 against F11 +16.6 / +17.1 / +10.3 ms, 18/18 pairs (about 1.4%)**; hold against F12 -0.4 / +10.0 /
+  +5.1 (14/18); F12 A/A -3.4 / +0.2 / -2.0 (7/18). Hold over the three 8370C runs so far: 31/54 pairs,
+  median +4.0 ms (A/A 28/54): not negative there, not clearly positive.
+
+### 10:08 UTC: F13 = F12 + held campaign cells, gated on its exact commit
+
+- **F13 = this commit** (branch scratch-f13; `pipeline` moves to it only if this commit's own CI run
+  against F6 with [60m] passes): F12 `e89b50c` + `1718c6e`; build inputs = `1718c6e`. Local gate on the
+  exact tree: all MATCH (incl. SS_HOLD=0, 180/180 small and mutated sets, 60M). Its case is small: about
+  +2.7 ms on Granite and Emerald Rapids (two batches, 206/306 pairs), neutral on Ice Lake and AMD, noise
+  at 60M. F12 stays the first fallback and is the more broadly measured of the two.
