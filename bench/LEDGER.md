@@ -921,3 +921,20 @@ base was `b890895` and the comparison was against candidate E.
   the timestamps already use both lanes of a row. The agent has stopped.
 - **Candidate F4 (this push):** F3 + `1b73234` + `60758b0`. Its CI run carries the 60M check; fresh
   seeds follow as a dispatch run.
+
+### 01:35 UTC
+
+- **Candidate F4 `bad5c1b1bc3178508db7de5d7459197741497236` VERIFIED** (F3 + lookup tables without one
+  allocation per product + declined rows straight to the general kernel), against F3:
+  | run | runner | seeds | paired median ms | pairs | A/A medians |
+  |---|---|---|---|---|---|
+  | 44968983694 (code without the last ledger commit) | EPYC 9V74 | 2 / 3 / 5 | +11.8 / +12.6 / +20.5 | 18/18 | -3.3 / -1.8 / +1.8 |
+  | 44969638463 | Xeon Platinum 8573C | 2 / 3 / 5 | +9.5 / +3.8 / +7.0 | 15/18 | -0.8 / -1.4 / -2.4 |
+  | 44969646367 (fresh) | Xeon Platinum 8573C | 53 / 59 / 61 | +8.2 / +6.6 / +8.1 | 17/18 | -1.8 / -1.0 / -0.9 |
+  60M (Xeon 6975P-C): MATCH, 1,846.6 against 1,845.1 ms, -6.2 ms median paired (2/6), inside the A/A
+  noise of that runner (median 13.9 ms): no change, as expected (the tables were not waited for at 60M).
+  Peak memory 1.70 GiB. Locally: ten switch settings and 180/180 small and mutated runs MATCH. Named in
+  the PR as the commit to submit; a small, CPU-dependent gain (7 to 20 ms in CI).
+- **Architecture rethink started** as a workflow (spec from the rules backward; three designs from
+  different families made blind to the current engine, then compared with it; three adversarial reviews
+  each; a ranking that picks at most two bounded prototypes). Results follow in the next entry.
