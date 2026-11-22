@@ -1529,17 +1529,21 @@ pub unsafe fn event_lean_long<const MODE: u32>(
     if ((quotes & !(starts | ends)) | (quotes & starts & ends)) != 0 || opened != pext128(quotes, ends) {
         return DECLINE;
     }
-    let c0 = commas.trailing_zeros() as usize;
-    let rest = commas & (commas - 1);
-    let c1 = rest.trailing_zeros() as usize;
-    let rest = rest & (rest - 1);
-    let c2 = rest.trailing_zeros() as usize;
-    let rest = rest & (rest - 1);
-    let c3 = rest.trailing_zeros() as usize;
-    let rest = rest & (rest - 1);
-    let c4 = rest.trailing_zeros() as usize;
-    let rest = rest & (rest - 1);
-    let c5 = rest.trailing_zeros() as usize;
+    // The six commas' places, each worked out on its own rather than one
+    // after another: comma k is the k-th set bit of the low word, or, when
+    // the low word holds k or fewer, set bit k - n of the high word.
+    let (comma_low, comma_high) = (commas as u64, (commas >> 64) as u64);
+    let low_count = comma_low.count_ones();
+    let place = |k: u32| -> usize {
+        let low = _pdep_u64(1u64 << k, comma_low).trailing_zeros() as usize;
+        let high = 64 + _pdep_u64(1u64.wrapping_shl(k.wrapping_sub(low_count)), comma_high).trailing_zeros() as usize;
+        if k < low_count {
+            low
+        } else {
+            high
+        }
+    };
+    let (c0, c1, c2, c3, c4, c5) = (place(0), place(1), place(2), place(3), place(4), place(5));
     let quoted = |index: u32| ((opened >> index) & 1) as usize;
     // Field 4's quotes are part of the type's text, matched below.
     let (q0, q1, q2, q3, q5, q6) = (quoted(0), quoted(1), quoted(2), quoted(3), quoted(5), quoted(6));
