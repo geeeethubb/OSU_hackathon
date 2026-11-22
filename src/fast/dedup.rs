@@ -92,8 +92,106 @@ fn for_each_record(lists: &[PartList], mut visit: impl FnMut(u64, u64, u64)) {
     }
 }
 
-/// Dedup one event-ID partition and forward the survivors.
-pub fn dedup_partition(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch: &mut ScratchB) {
+/// Dedup one event-ID partition and forward the survivors: the records of
+/// coded IDs (`lists`) and those of long hexadecimal IDs (`long_lists`),
+/// which are told apart by their value. No ID is in both.
+pub fn dedup_partition(
+    links: &LinkTable,
+    lists: &[PartList],
+    long_lists: &[PartList],
+    out: &mut PassBOut,
+    scratch: &mut ScratchB,
+) {
+    dedup_coded(links, lists, out, scratch);
+    if long_lists.iter().any(|list| list.words() != 0) {
+        dedup_long(links, long_lists, out, scratch);
+    }
+}
+
+/// Calls `visit(first, value, word0, word1, purchase_word)` for every record
+/// of long event IDs: value low and high words, the two record words, and
+/// the purchase word when the purchase bit of the second is set. `first` is
+/// the ID's first byte, kept in the top byte of word0.
+#[inline(always)]
+fn for_each_long_record(lists: &[PartList], mut visit: impl FnMut(u8, u128, u64, u64, u64)) {
+    for list in lists {
+        for block in list.blocks() {
+            let mut at = 0;
+            while at < block.len() {
+                // SAFETY: blocks hold whole records: four words, plus one
+                // when the purchase bit of the fourth is set.
+                let (low, high, word0, word1) = unsafe {
+                    (*block.get_unchecked(at), *block.get_unchecked(at + 1), *block.get_unchecked(at + 2), *block.get_unchecked(at + 3))
+                };
+                let has_purchase = (word1 & 1) as usize;
+                let purchase = if has_purchase == 1 { unsafe { *block.get_unchecked(at + 4) } } else { 0 };
+                at += 4 + has_purchase;
+                visit((word0 >> 56) as u8, u128::from(high) << 64 | u128::from(low), word0 & !(0xFF << 56), word1, purchase);
+            }
+        }
+    }
+}
+
+/// One slot of the per-partition table of long event IDs.
+#[derive(Clone, Copy, Default)]
+struct LongSlot {
+    /// Sequence number of the winning copy plus one; 0 marks an empty slot.
+    tag: u32,
+    ingest: u32,
+    first: u8,
+    value: u128,
+}
+
+/// Step 2 of the rules for the long event IDs of one partition: per ID the
+/// copy with the smallest ingest_ts (the first seen among equal ones, which
+/// are identical), then the survivors forwarded like the others.
+fn dedup_long(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, _scratch: &mut ScratchB) {
+    let words: usize = lists.iter().map(PartList::words).sum();
+    let most_records = words / 4;
+    let bits = (most_records.max(8) * 3 / 2).next_power_of_two().trailing_zeros();
+    let capacity = 1usize << bits;
+    let mut table = vec![LongSlot::default(); capacity];
+    let mut lost = vec![0u64; most_records / 64 + 1];
+    let mut sequence = 0u32;
+    for_each_long_record(lists, |first, value, _, word1, _| {
+        let ingest = ((word1 >> 1) & INGEST_MASK) as u32;
+        let folded = (value as u64) ^ ((value >> 64) as u64).rotate_left(29) ^ u64::from(first);
+        let mut at = (folded.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+        loop {
+            let slot = &mut table[at];
+            if slot.tag == 0 {
+                *slot = LongSlot { tag: sequence + 1, ingest, first, value };
+                break;
+            }
+            if slot.value == value && slot.first == first {
+                let loser = if ingest < slot.ingest {
+                    let previous = slot.tag - 1;
+                    slot.tag = sequence + 1;
+                    slot.ingest = ingest;
+                    previous
+                } else {
+                    sequence
+                };
+                lost[(loser >> 6) as usize] |= 1u64 << (loser & 63);
+                break;
+            }
+            at = (at + 1) & (capacity - 1);
+        }
+        sequence += 1;
+    });
+    let mut sequence = 0u32;
+    for_each_long_record(lists, |_, _, word0, word1, purchase| {
+        let is_lost = (lost[(sequence >> 6) as usize] >> (sequence & 63)) & 1;
+        sequence += 1;
+        if (word0 & 1) & !is_lost == 0 {
+            return;
+        }
+        forward(links, out, word0, word1, purchase);
+    });
+}
+
+/// Dedup the coded event IDs of one partition and forward the survivors.
+fn dedup_coded(links: &LinkTable, lists: &[PartList], out: &mut PassBOut, scratch: &mut ScratchB) {
     let words: usize = lists.iter().map(PartList::words).sum();
     if words == 0 {
         return;

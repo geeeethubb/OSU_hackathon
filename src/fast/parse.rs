@@ -52,6 +52,10 @@ pub struct ParseOut {
     pub events: Vec<PartWriter>,
     /// `mixed code >> event_shift` is an event's partition.
     pub event_shift: u32,
+    /// Per event partition, records of events whose ID is long and
+    /// hexadecimal (`codes::LONG_EVENT`): the ID's first byte and value, then
+    /// the record's two words (and the purchase word).
+    pub long_events: Vec<PartWriter>,
     /// Index mode: one list per run of `1 << index_shift` event indexes. Same
     /// record as `events`, except word 0 = index within the run (16) |
     /// unused (15) | user is a user number (1) | ts (31) | valid (1).
@@ -87,6 +91,7 @@ impl ParseOut {
             arena: Arena::new(),
             events: vec![PartWriter::EMPTY; ctx.event_parts()],
             event_shift: ctx.event_shift(),
+            long_events: vec![PartWriter::EMPTY; ctx.event_parts()],
             indexed: vec![PartWriter::EMPTY; ctx.keys.map_or(0, |keys| index_parts(&keys))],
             odd_event_users: Vec::new(),
             clicks: PartWriter::EMPTY,
@@ -207,6 +212,10 @@ pub fn emit_raw(
     ingest: u64,
     purchase: Option<(u32, u32)>,
 ) {
+    if event == super::codes::LONG_EVENT {
+        emit_long(out, ts, valid, user, ingest, purchase);
+        return;
+    }
     let mixed = mix(event);
     let part = (mixed >> out.event_shift) as usize;
     // The local key: the low 32 bits hold every bit below the partition's.
@@ -221,6 +230,41 @@ pub fn emit_raw(
         *at.add(1) = word1;
         if let Some((price, category)) = purchase {
             *at.add(2) = u64::from(price) | (u64::from(category) << 32);
+        }
+    }
+}
+
+/// The event partition of a long hexadecimal event ID: the same number of
+/// partitions as the coded IDs', picked by the value, so that every copy of
+/// one event lands in one partition.
+#[inline]
+pub fn long_part(first: u8, value: u128, event_shift: u32) -> usize {
+    let folded = (value as u64) ^ ((value >> 64) as u64).rotate_left(29) ^ u64::from(first);
+    let hashed = folded.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (hashed >> (64 - (super::codes::CODE_BITS - event_shift))) as usize
+}
+
+/// Stores the record of an event whose ID is long and hexadecimal: its first
+/// byte and value (from `codes::take_long_value`), then the usual words with
+/// no key in them.
+#[cold]
+#[inline(never)]
+fn emit_long(out: &mut ParseOut, ts: u64, valid: u64, user: u64, ingest: u64, purchase: Option<(u32, u32)>) {
+    let (first, value) = super::codes::take_long_value();
+    let part = long_part(first, value, out.event_shift);
+    let word0 = (u64::from(first) << 56) | (ts << 1) | valid;
+    let word1 = (user << 22) | (ingest << 1) | u64::from(purchase.is_some());
+    // SAFETY: `long_part` is below the number of event partitions, which
+    // sized `long_events`; `reserve` returns room for the words written.
+    unsafe {
+        let writer = out.long_events.get_unchecked_mut(part);
+        let at = writer.reserve(&mut out.arena, EVENT_BLOCK, 4 + usize::from(purchase.is_some()));
+        *at = value as u64;
+        *at.add(1) = (value >> 64) as u64;
+        *at.add(2) = word0;
+        *at.add(3) = word1;
+        if let Some((price, category)) = purchase {
+            *at.add(4) = u64::from(price) | (u64::from(category) << 32);
         }
     }
 }

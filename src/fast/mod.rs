@@ -204,7 +204,7 @@ impl Ctx {
             campaign_index: HashMap::default(),
             campaign_by_number: Vec::new(),
             organic: 0,
-            event_ids: Interner::default(),
+            event_ids: Interner::partition_local(),
             user_ids: Interner::default(),
             click_ids: Interner::default(),
             #[cfg(target_arch = "x86_64")]
@@ -687,6 +687,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let mut parse_out = parse_out.into_inner();
     let event_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+    // Events whose ID is long and hexadecimal, by the same partitions.
+    let long_event_lists: Vec<Vec<PartList>> =
+        parse_out.iter_mut().map(|out| out.long_events.iter_mut().map(|writer| writer.finish()).collect()).collect();
     // Index mode: per worker, one list per index partition.
     let indexed_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish()).collect()).collect();
@@ -705,13 +708,16 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         let mut scratch = ScratchB::default();
         scratch.measure = measure;
         let mut lists: Vec<PartList> = Vec::with_capacity(event_lists.len());
+        let mut long_lists: Vec<PartList> = Vec::with_capacity(long_event_lists.len());
         let mut clicks_spent = 0u64;
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             if at < event_parts {
                 lists.clear();
                 lists.extend(event_lists.iter().map(|per_thread| per_thread[at]));
-                dedup::dedup_partition(link_table, &lists, out, &mut scratch);
+                long_lists.clear();
+                long_lists.extend(long_event_lists.iter().map(|per_thread| per_thread[at]));
+                dedup::dedup_partition(link_table, &lists, &long_lists, out, &mut scratch);
             } else if let Some(batch) = click_batches.get(at - event_parts) {
                 let started = measure.then(Instant::now);
                 dedup::map_clicks(link_table, batch, out);

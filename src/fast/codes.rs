@@ -147,12 +147,32 @@ impl Hasher for HexHasher {
 type HexShard = HashMap<(u8, u128), u32, BuildHasherDefault<HexHasher>>;
 const HEX_SHARDS: usize = 256;
 
+/// The code event IDs of one character and 32 lowercase hexadecimal digits
+/// get from an interner made by `Interner::partition_local`: never a real
+/// code (no index comes near it). The ID's value waits in `take_long_value`
+/// for the record that is stored next on this thread.
+pub const LONG_EVENT: u64 = CODE_MASK;
+
+thread_local! {
+    static LONG_VALUE: std::cell::Cell<(u8, u128)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The first byte and value of the last long event ID coded on this thread.
+#[inline]
+pub fn take_long_value() -> (u8, u128) {
+    LONG_VALUE.with(std::cell::Cell::get)
+}
+
 /// Exotic IDs of one kind (events, users or clicks).
 pub struct Interner {
     /// The next exotic index, for both maps.
     next: AtomicU32,
     generic: Mutex<HashMap<Box<[u8]>, u32>>,
     hex: Box<[Mutex<HexShard>]>,
+    /// Event IDs: they only need to be equal or not, inside the partition
+    /// their value picks, so long hexadecimal ones are not interned here at
+    /// all (`LONG_EVENT`): the dedup step compares their values.
+    partition_local: bool,
 }
 
 impl Default for Interner {
@@ -161,15 +181,25 @@ impl Default for Interner {
             next: AtomicU32::new(0),
             generic: Mutex::new(HashMap::new()),
             hex: (0..HEX_SHARDS).map(|_| Mutex::new(HexShard::default())).collect(),
+            partition_local: false,
         }
     }
 }
 
 impl Interner {
+    /// An interner whose long hexadecimal IDs get `LONG_EVENT` (event IDs).
+    pub fn partition_local() -> Self {
+        Interner { partition_local: true, ..Interner::default() }
+    }
+
     /// The code of an exotic ID.
     #[inline(never)]
     pub fn code(&self, id: &[u8]) -> u64 {
         match hex_id(id) {
+            Some(value) if self.partition_local => {
+                LONG_VALUE.with(|cell| cell.set((id[0], value)));
+                LONG_EVENT
+            }
             Some(value) => EXOTIC_BASE + u64::from(self.hex_index(id[0], value)),
             None => self.generic_code(id),
         }
