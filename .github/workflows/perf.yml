@@ -1,0 +1,126 @@
+# Paired native timings on Intel runners only (diagnostics, labelled native).
+#
+# Builds two commits with the root Dockerfile, each from its own exact
+# source: F14's code df11202 and bitwin-long 8850bc1 (the same may-repeat
+# filter for the winners of long event IDs). Their /pipeline binaries are copied out and run natively, 4 threads
+# pinned to CPUs 0-3, warm page cache, on 20M seeds 2, 3 and 5. Per seed, six
+# interleaved pairs in the balanced order AB BA BA AB AB BA for each
+# comparison: bitwin-long against F14 (A = F14), F14 against itself (A/A), and
+# bitwin-long against F14 again (twelve pairs of it per seed in all). Each run: fresh
+# output folder, sync before it, then its in-process total (SS_TIMING
+# stage=total), its process wall clock, the dedup stage's wall time and the
+# summed thread times cpu_dedup_winners, cpu_dedup_forward and cpu_click_map.
+# A job that does not land on an Intel CPU stops at once.
+#
+# Ten jobs per push (two runner labels, five copies each).
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+  F14: df11202a0bed907079ab31f058ff5918d5661b30
+  BWLONG: 8850bc1beda81e0811eac338b2fc003d546b9a37
+
+jobs:
+  images:
+    name: images ${{ matrix.os }} ${{ matrix.copy }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04]
+        copy: [1, 2, 3, 4, 5]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Intel only
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "CPU: $model"
+          if lscpu | grep -q GenuineIntel; then
+            echo "intel=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "not Intel: nothing to do"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.cpu.outputs.intel == '1'
+      - name: Restore generator and dev answer
+        if: steps.cpu.outputs.intel == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator, two scored builds
+        if: steps.cpu.outputs.intel == '1'
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          for name in F14 BWLONG; do
+            sha="${!name}"
+            git fetch -q --depth=1 origin "$sha"
+            git worktree add -q --detach "$RUNNER_TEMP/src_$name" "$sha"
+            tag="ss-$(echo "$name" | tr 'A-Z' 'a-z')"
+            docker build -q -t "$tag" "$RUNNER_TEMP/src_$name" >/dev/null
+            id=$(docker create "$tag")
+            docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline_$name"
+            docker rm "$id" >/dev/null
+            echo "$name $sha $(sha256sum "$RUNNER_TEMP/pipeline_$name" | cut -c1-16)"
+          done
+          lscpu | grep -E "Model name|Thread|Core|L2|L3"
+      - name: Paired runs
+        if: steps.cpu.outputs.intel == '1'
+        run: |
+          cat > "$RUNNER_TEMP/pairs.py" <<'PYEOF'
+          import os, re, statistics, subprocess, sys, time
+          W = os.environ["RUNNER_TEMP"]
+          ORDER = ["AB", "BA", "BA", "AB", "AB", "BA"]
+          # Labels: binary and extra environment.
+          LABELS = {"F14": ("F14", {}), "BWLONG": ("BWLONG", {})}
+          # (name, A, B); saved = A - B, so positive means B is faster.
+          COMPARISONS = [("bitwin-long against F14", "F14", "BWLONG"), ("A/A F14", "F14", "F14"), ("bitwin-long against F14", "F14", "BWLONG")]
+
+          def run(data, label):
+              image, extra = LABELS[label]
+              out = f"{W}/out"
+              subprocess.run(["rm", "-rf", out], check=True)
+              os.makedirs(out)
+              subprocess.run(["sync"], check=True)
+              env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out, SCRATCH_DIR=out, NCPU="4", SS_TIMING="1", **extra)
+              start = time.perf_counter_ns()
+              p = subprocess.run(["taskset", "-c", "0-3", f"{W}/pipeline_{image}"], env=env, capture_output=True, text=True)
+              wall = (time.perf_counter_ns() - start) / 1e6
+              def num(pattern):
+                  m = re.search(pattern, p.stderr)
+                  return float(m.group(1)) if m else float("nan")
+              ok = p.returncode == 0 and os.listdir(f"{out}/user_daily") and os.listdir(f"{out}/campaign_daily")
+              if not ok:
+                  print(f"RUN FAILED {label} rc={p.returncode} {p.stderr[-500:]}")
+              return (num(r"stage=total ms=([\d.]+)"), wall, num(r"stage=dedup ms=([\d.]+)"),
+                      num(r"detail=cpu_dedup_winners ms=([\d.]+)"), num(r"detail=cpu_dedup_forward ms=([\d.]+)"),
+                      num(r"detail=cpu_click_map ms=([\d.]+)"))
+
+          for seed in sys.argv[1:]:
+              data = f"{W}/data_{seed}"
+              subprocess.run([f"{os.environ['HOME']}/ss-tools/generate", "--seed", seed, "--events", "20000000",
+                              "--clicks", "5000000", "--output", data], check=True, capture_output=True)
+              subprocess.run(f"find {data} -type f -exec cat {{}} + > /dev/null", shell=True, check=True)
+              for label in ("F14", "BWLONG"):
+                  run(data, label)  # first touch of each binary, not counted
+              for name, first, second in COMPARISONS:
+                  saved = []
+                  print(f"seed {seed} {name} (A = {first}, B = {second}): in-process ms, wall ms")
+                  for i, order in enumerate(ORDER):
+                      res = {}
+                      for label in order:
+                          res[label] = run(data, first if label == "A" else second)
+                      a, b = res["A"], res["B"]
+                      saved.append(a[0] - b[0])
+                      print(f"  pair {i+1} {order}: A {a[0]:8.1f} ({a[1]:7.1f})  B {b[0]:8.1f} ({b[1]:7.1f})  saved A-B {a[0]-b[0]:+7.1f}"
+                            f" | dedup {a[2]:.1f} {b[2]:.1f} | winners {a[3]:.1f} {b[3]:.1f} | forward {a[4]:.1f} {b[4]:.1f} | map {a[5]:.1f} {b[5]:.1f}")
+                  print(f"  SUMMARY seed {seed} {name}: median saved (A-B) {statistics.median(saved):+.1f} ms; B faster in {sum(s > 0 for s in saved)}/6 pairs")
+              subprocess.run(["rm", "-rf", data], check=True)
+          PYEOF
+          python3 "$RUNNER_TEMP/pairs.py" 2 3 5
