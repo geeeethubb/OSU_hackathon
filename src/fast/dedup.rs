@@ -33,6 +33,9 @@ pub struct PassBOut {
     /// records this way, spread over all partitions: small blocks then.
     pub event_block: usize,
     pub click_block: usize,
+    /// The person lists of events and of clicks, sealed by the worker itself
+    /// at the end of pass B (`seal`); left to the caller in index mode.
+    pub sealed: Option<(Vec<PartList>, Vec<PartList>)>,
 }
 
 impl PassBOut {
@@ -45,7 +48,18 @@ impl PassBOut {
             person_shift: ctx.person_shift(),
             event_block: if sparse { 32 } else { PERSON_BLOCK },
             click_block: if sparse { 32 } else { CLICK_BLOCK },
+            sealed: None,
         }
+    }
+
+    /// Seals the person lists on the worker's own thread, beside the other
+    /// workers (as `ParseOut::seal`). The writers are not used after it.
+    pub fn seal(&mut self) {
+        let (event_block, click_block) = (self.event_block, self.click_block);
+        self.sealed = Some((
+            self.events.iter_mut().map(|writer| writer.finish(event_block)).collect(),
+            self.clicks.iter_mut().map(|writer| writer.finish(click_block)).collect(),
+        ));
     }
 }
 

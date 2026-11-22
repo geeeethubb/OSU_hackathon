@@ -639,6 +639,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 }
             }
             out.click_ids = codes::take_thread_ids();
+            out.seal();
             event_nanos.fetch_add(events_spent, Ordering::Relaxed);
             click_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
         });
@@ -729,15 +730,21 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     // The long click IDs the workers kept, by worker slot (= thread).
     let kept_click_ids: Vec<Vec<(u8, u128)>> =
         parse_out.iter_mut().map(|out| std::mem::take(&mut out.click_ids)).collect();
-    let event_lists: Vec<Vec<PartList>> =
-        parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
-    // Events whose ID is long and hexadecimal, by the same partitions.
-    let long_event_lists: Vec<Vec<PartList>> =
-        parse_out.iter_mut().map(|out| out.long_events.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
+    // Each worker sealed its own lists (`ParseOut::seal`): per worker, the
+    // events by partition, the events whose ID is long and hexadecimal by
+    // the same partitions, and the clicks.
+    let mut event_lists: Vec<Vec<PartList>> = Vec::with_capacity(threads);
+    let mut long_event_lists: Vec<Vec<PartList>> = Vec::with_capacity(threads);
+    let mut click_lists: Vec<PartList> = Vec::with_capacity(threads);
+    for out in parse_out.iter_mut() {
+        let sealed = out.sealed.take().expect("every parse worker seals its lists");
+        event_lists.push(sealed.events);
+        long_event_lists.push(sealed.long_events);
+        click_lists.push(sealed.clicks);
+    }
     // Index mode: per worker, one list per index partition.
     let indexed_lists: Vec<Vec<PartList>> =
         parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
-    let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish(parse::RAW_CLICK_BLOCK)).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
@@ -795,6 +802,10 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         winners_nanos.fetch_add(scratch.winners_nanos, Ordering::Relaxed);
         forward_nanos.fetch_add(scratch.forward_nanos, Ordering::Relaxed);
         click_map_nanos.fetch_add(clicks_spent, Ordering::Relaxed);
+        // Index mode takes some of these lists back as writers after pass B.
+        if ctx.keys.is_none() {
+            out.seal();
+        }
     });
         snapshots.join().unwrap()
     });
@@ -970,10 +981,17 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
 
     // Pass C.
     let mut b_out = b_out.into_inner();
-    let person_events: Vec<Vec<PartList>> =
-        b_out.iter_mut().map(|out| { let block = out.event_block; out.events.iter_mut().map(|writer| writer.finish(block)).collect() }).collect();
-    let person_clicks: Vec<Vec<PartList>> =
-        b_out.iter_mut().map(|out| { let block = out.click_block; out.clicks.iter_mut().map(|writer| writer.finish(block)).collect() }).collect();
+    // Sealed by the workers at the end of pass B, except in index mode.
+    let mut person_events: Vec<Vec<PartList>> = Vec::with_capacity(threads);
+    let mut person_clicks: Vec<Vec<PartList>> = Vec::with_capacity(threads);
+    for out in b_out.iter_mut() {
+        if out.sealed.is_none() {
+            out.seal();
+        }
+        let (events, clicks) = out.sealed.take().expect("sealed just above");
+        person_events.push(events);
+        person_clicks.push(clicks);
+    }
     timing.detail("serial_sessions_setup", serial_started.elapsed().as_secs_f64() * 1e3);
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {
