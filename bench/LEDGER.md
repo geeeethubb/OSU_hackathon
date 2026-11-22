@@ -210,7 +210,8 @@ variable-width IDs, one in eight long hexadecimal). Scores on it are not compara
 
 | Commit | Official practice score | Receipt | Source |
 |---|---:|---|---|
-| `9735a63d039ee9ee843e0204f1d988bd5c822f41` (opaque IDs, general path) | **1.2745 s** (shopping-sessions-5) | BB-32BE0EA7 | relayed by the user 2026-11-22 about 03:20 UTC; current accepted baseline |
+| presumably `32b8fffd658af203da5e5809c9d3ce9eaede94ee` (F5, `pipeline` head when submitted; SHA not relayed, to confirm) | **0.7698 s** (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:45 UTC: rank 11, the team's best ever; board top 0.5528 s |
+| `9735a63d039ee9ee843e0204f1d988bd5c822f41` (opaque IDs, general path) | 1.2745 s (shopping-sessions-5) | BB-32BE0EA7 | relayed by the user 2026-11-22 about 03:20 UTC |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 5.6629 s (shopping-sessions-5) | not relayed | relayed by the user 2026-11-22 about 03:20 UTC: index mode, outside the new rules |
 | `bad5c1b1bc3178508db7de5d7459197741497236` (candidate F4) | 0.4648 s (previous dataset) | BB-9044646E | relayed by the user 2026-11-22 about 01:13 UTC |
 | `8dde2af12e542b0df94ba6d0be3da4f8660f896d` (candidate F3) | 0.4663 s | BB-9900D7A0 | relayed by the user 2026-11-22 about 00:45 UTC |
@@ -1056,3 +1057,23 @@ base was `b890895` and the comparison was against candidate E.
   +13 / +9 / -12 (10/18, run 44977877879): NOT DEMONSTRATED, neutral, left in the chain.
   Container of `1ffd278` on EPYC 7763: about 1,250-1,270 ms. Its startup stage is 18 ms (was 2):
   the user table's 32 MiB zeroed on one thread; `dffab6f` moves it to fresh zero pages (in CI).
+
+### 03:45 UTC: F5 validated and scored
+
+- **F5 = `32b8fff` (code of `3462185`) against `9735a63`:** 20M seeds 2/3/5 +650 / +726 / +675 ms
+  (18/18, EPYC 9V74, run 44980718708), containers 994-1,012 ms; fresh seeds 41/47/53 +856 / +844 / +871
+  ms (18/18, EPYC 7763, run 44980727559), containers 1,190-1,206 ms; 20M against `/reference`: 23/23 runs
+  MATCH on every seed of both runs; fixtures 36/36 and 43/43, dev MATCH. 60M: 3,833 ms against 6,212
+  ms (+2,368 ms, 6/6), peak 2.57 GiB, exit 0 - but **`/reference` was OOM-killed at 14 GiB on that
+  runner: the 60M comparison is INCOMPLETE**, not a MATCH (a local 60M comparison on the 31 GiB laptop
+  follows).
+- **Official: 0.7698 s** (relayed; presumably F5), rank 11; board top 0.5528 s.
+- **Calibration, two points on EPYC 7763 runners** (shopping-sessions-5): about 2,090 ms <-> 1.2745 s and
+  about 1,197 ms <-> 0.7698 s: official = about 94 ms + 0.565 x CI ms (two points; the old data gave 65-100
+  + 0.65). Below 0.6018 s needs CI about 900 ms on that runner type (-25%); below the board top 0.5528 s
+  about 815 ms (-32%).
+- Since F5, in CI: `f1121d0` clicks straight into person partitions (D1), `951373b` each user hashed and
+  ranked once in the forward rings. Hypothesis C bounded on Linux (`SS_DIAG_USERS=1`, run 44980589665):
+  user-table lookups are about 100 thread-ms of the parse at 4 threads (-25 ms of parse stage), net of
+  the forward's added work below the +15 ms bar: NOT BUILT. Long-row kernel for every row: 4% slower
+  (laptop): rejected.
