@@ -1,0 +1,164 @@
+# cpu-clock profile of F11 on Intel runners only, with source-line attribution (diagnostics).
+#
+# Two builds of the same source: the scored one (root Dockerfile, copied out of
+# the image) and an identical one with line tables only (same pinned Rust image,
+# same RUSTFLAGS, CARGO_PROFILE_RELEASE_DEBUG=line-tables-only), so that samples
+# can be attributed to source lines. Each is run natively on 20M seed 2, 4
+# threads on CPUs 0-3, warm page cache, under perf record at 9,999 Hz.
+# Reported: in-process stages and per-function shares of both builds (they
+# should agree); the line-table build's samples by (symbol, source line) as an
+# artifact; and the samples of the parse stage's time window by symbol (the
+# link builder thread's share of it). Jobs on a non-Intel CPU stop at once.
+#
+# Runs on a push to a branch named perf-probe*, which ci.yml ignores.
+name: Perf probe
+
+on:
+  push:
+    branches: ['perf-probe*']
+
+env:
+  TOOLS_KEY: ss-tools-v2
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Intel only
+        id: cpu
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          echo "CPU: $model"
+          if lscpu | grep -q GenuineIntel; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "not Intel: nothing to do"; fi
+      - uses: actions/checkout@v4
+        if: steps.cpu.outputs.go == '1'
+      - name: Restore generator and dev answer
+        if: steps.cpu.outputs.go == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ss-tools
+          key: ${{ env.TOOLS_KEY }}
+      - name: Generator, data, two builds
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          bash bench/fetch_tools.sh "$HOME/ss-tools"
+          "$HOME/ss-tools/generate" --seed 2 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/data"
+          docker build -q -t ss-probe . >/dev/null
+          id=$(docker create ss-probe)
+          docker cp "$id:/pipeline" "$RUNNER_TEMP/pipeline_scored"
+          docker rm "$id" >/dev/null
+          mkdir -p "$RUNNER_TEMP/lines"
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/lines:/work" -w /src rust:1.100.0-slim-bookworm bash -c '
+            set -euo pipefail
+            export RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3"
+            export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+            export CARGO_TARGET_DIR=/work/target
+            cargo build --release --locked --target x86_64-unknown-linux-gnu 2>&1 | tail -n 2
+            cp /work/target/x86_64-unknown-linux-gnu/release/pipeline /work/pipeline_lines'
+          sudo cp "$RUNNER_TEMP/lines/pipeline_lines" "$RUNNER_TEMP/pipeline_lines"
+          sudo chown "$(id -u)" "$RUNNER_TEMP/pipeline_lines"
+          sha256sum "$RUNNER_TEMP/pipeline_scored" "$RUNNER_TEMP/pipeline_lines"
+          lscpu | grep -E "Model name|Thread|Core|L1d|L2|L3"
+      - name: perf
+        if: steps.cpu.outputs.go == '1'
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1)
+          [ -x "$PERF" ] || PERF=$(command -v perf)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          W="$RUNNER_TEMP"
+          mkdir -p "$W/probe"
+          find "$W/data" -type f -exec cat {} + > /dev/null
+          for build in scored lines; do
+            rm -rf "$W/out" && mkdir -p "$W/out"
+            echo "=== $build build"
+            env DATA_DIR="$W/data" OUTPUT_DIR="$W/out" SCRATCH_DIR="$W/out" NCPU=4 SS_TIMING=1 \
+              "$PERF" record -F 9999 -e cpu-clock -o "$W/clock_$build.data" -- taskset -c 0-3 "$W/pipeline_$build" 2> "$W/probe/rec_$build.txt" || true
+            grep -E "stage=|cpu_|links_build" "$W/probe/rec_$build.txt" | sed 's/SS_TIMING //' | paste -sd' '
+            "$PERF" report -i "$W/clock_$build.data" --stdio --no-children --sort dso,symbol --percent-limit 0.3 2>&1 \
+              | grep -E "^ +[0-9]" | sed -E 's/ {2,}/ /g' | head -n 50 | tee "$W/probe/shares_$build.txt"
+          done
+          cat > "$W/inline_chains.py" <<'PYEOF'
+          """Per sampled address of chosen functions: sample count and the full inline chain.
+
+          usage: inline_chains.py PERF_SCRIPT_TXT BINARY OUT_TSV
+          PERF_SCRIPT_TXT is `perf script -F ip,sym,symoff` output. Each output row:
+          symbol <TAB> address <TAB> samples <TAB> frames, innermost first, as func@file:line joined by " | ".
+          """
+          import collections
+          import re
+          import subprocess
+          import sys
+
+          WANT = ('event_lean_long', 'click_lean_long', 'clicks_rows_loop', '{closure#11}', 'map_clicks', '{closure#30}',
+                  'finish_person', 'attribute_narrow', 'attribute_wide', 'sessions_by_buckets', 'sessions_by_network',
+                  'events_assembly_run_codes', 'event_row_declined')
+          # perf script -F ip,sym,symoff lines: "<ip> <symbol>+0x<offset>". The binary is
+          # position-independent, so a sample's address in the file is its runtime address
+          # less the load bias, found from symbols whose address `nm` knows.
+          symbols = {}
+          for line in subprocess.run(['nm', '-C', '--defined-only', sys.argv[2]], capture_output=True, text=True).stdout.splitlines():
+              parts = line.split(' ', 2)
+              if len(parts) == 3:
+                  symbols.setdefault(parts[2], int(parts[0], 16))
+          samples, biases = [], collections.Counter()
+          for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+              m = re.match(r'\s*([0-9a-f]+)\s+(.+)\+0x([0-9a-f]+)\s*$', line)
+              if not m:
+                  continue
+              ip, sym, off = int(m.group(1), 16), m.group(2).strip(), int(m.group(3), 16)
+              samples.append((ip, sym))
+              if sym in symbols:
+                  biases[ip - symbols[sym] - off] += 1
+          bias = biases.most_common(1)[0][0] if biases else 0
+          print(f'load bias {bias:#x} (agreed by {biases.most_common(1)[0][1] if biases else 0} of {len(samples)} samples)')
+          counts = collections.Counter()
+          for ip, sym in samples:
+              if any(w in sym for w in WANT):
+                  counts[(sym, ip - bias)] += 1
+          addresses = sorted({ip for _, ip in counts})
+          out = subprocess.run(['addr2line', '-i', '-f', '-C', '-a', '-e', sys.argv[2]],
+                               input='\n'.join(f'{a:#x}' for a in addresses), capture_output=True, text=True).stdout.splitlines()
+          chains, current, frames = {}, None, []
+          i = 0
+          while i < len(out):
+              text = out[i]
+              if re.match(r'^0x[0-9a-f]+$', text):
+                  if current is not None:
+                      chains[current] = frames
+                  current, frames = int(text, 16), []
+                  i += 1
+                  continue
+              func = text
+              where = out[i + 1] if i + 1 < len(out) else '??:0'
+              where = re.sub(r' \(discriminator \d+\)', '', where).rsplit('/', 1)[-1]
+              frames.append(f'{func.split("(")[0][-60:]}@{where}')
+              i += 2
+          if current is not None:
+              chains[current] = frames
+          with open(sys.argv[3], 'w', encoding='utf-8') as handle:
+              for (sym, ip), n in sorted(counts.items(), key=lambda kv: -kv[1]):
+                  handle.write(f'{sym}\t{ip:#x}\t{n}\t{" | ".join(chains.get(ip, []))}\n')
+          print(f'{len(counts)} (symbol, address) rows, {sum(counts.values())} samples, {len(addresses)} addresses resolved')
+          PYEOF
+          echo "=== inline chains of sampled addresses (line-table build), written to the artifact"
+          "$PERF" script -i "$W/clock_lines.data" -F ip,sym,symoff > "$W/ips.txt" 2>/dev/null || true
+          head -n 3 "$W/ips.txt"
+          python3 "$W/inline_chains.py" "$W/ips.txt" "$W/pipeline_lines" "$W/probe/chains.tsv"
+          head -n 5 "$W/probe/chains.tsv" | cut -c1-260
+          echo "=== samples by symbol and source line (line-table build), written to the artifact"
+          "$PERF" report -i "$W/clock_lines.data" --stdio --no-children --sort sym,srcline --percent-limit 0.01 2>/dev/null \
+            | grep -E "^ +[0-9]" > "$W/probe/srclines.txt" || true
+          wc -l "$W/probe/srclines.txt"; head -n 25 "$W/probe/srclines.txt" | sed -E 's/ {2,}/ /g' | cut -c1-160
+          window=$(awk '/stage=startup ms=/ {split($0,a,"ms="); s+=a[2]} /stage=links_parse ms=/ {split($0,a,"ms="); s+=a[2]} /stage=parse ms=/ {split($0,a,"ms="); p=a[2]} /stage=total ms=/ {split($0,a,"ms="); t=a[2]} END {printf "%d%%-%d%%", (s / t) * 100 + 1, ((s + p) / t) * 100}' "$W/probe/rec_lines.txt")
+          echo "=== parse stage window ($window of the run's samples), by symbol"
+          "$PERF" report -i "$W/clock_lines.data" --stdio --no-children --sort sym --percent-limit 0.2 --time "$window" 2>&1 \
+            | grep -E "^ +[0-9]" | sed -E 's/ {2,}/ /g' | tee "$W/probe/parse_window.txt" | head -n 40
+      - uses: actions/upload-artifact@v4
+        if: steps.cpu.outputs.go == '1'
+        with:
+          name: perf-lines
+          path: ${{ runner.temp }}/probe
