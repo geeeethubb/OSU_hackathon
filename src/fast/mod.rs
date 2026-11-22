@@ -1003,7 +1003,13 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 kernel.reserve_rows(out, 0);
                 kernel
             }
-            None => ScratchC::new(&ctx),
+            None => {
+                let mut scratch = ScratchC::new(&ctx);
+                if ScratchC::holds_cells_by_default() {
+                    scratch.hold_cells(out.campaign_days.len());
+                }
+                scratch
+            }
         };
         let mut events: Vec<PartList> = Vec::with_capacity(person_events.len());
         let mut clicks: Vec<PartList> = Vec::with_capacity(person_clicks.len());
@@ -1019,6 +1025,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             sessions::sessions_partition(&ctx, part, &events, &clicks, &click_exotic, out, &mut scratch);
             sink.drain(out);
         }
+        // What `hold_cells` (or the index pass) kept back goes into the
+        // campaign table now; it is written once every worker has ended.
+        scratch.flush(out);
         // No rows come after this: the thread's user_daily file is ended here.
         sink.finish(out);
     });
