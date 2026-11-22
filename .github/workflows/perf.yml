@@ -85,9 +85,12 @@ jobs:
               grep -E "stage=total|samples" "$W/rec.txt" | paste -sd' '
               "$PERF" report -i "$W/clock.data" --stdio --no-children --sort dso,symbol --percent-limit 0.25 2>&1 | grep -v "^#" | grep -v "^$" | head -n 40
               for sym in 'ss::fast::simd::event_lean_long::<0>' 'ss::fast::run_once::{closure#10}' 'ss::fast::parse::events_assembly_run_codes'; do
-                echo "=== annotate $sym: hottest instructions (percent of the function's samples)"
-                "$PERF" annotate -i "$W/clock.data" --stdio --no-source "$sym" 2>/dev/null \
-                  | grep -E '^ +[0-9]+\.[0-9]+ +:' | sort -t: -k1,1 -rn | head -n 45
+                "$PERF" annotate -i "$W/clock.data" --stdio --no-source "$sym" > "$W/ann.txt" 2>/dev/null || true
+                echo "=== annotate $sym: the 6 hottest instructions, each with the 16 before it"
+                for at in $(awk '/^ +[0-9]+\.[0-9]+ +:/ {print $1 " " NR}' "$W/ann.txt" | sort -rn | head -n 6 | cut -d' ' -f2); do
+                  echo "--- line $at"
+                  sed -n "$((at > 16 ? at - 16 : 1)),$((at + 1))p" "$W/ann.txt" | cut -c1-150
+                done
               done
             done
           done
