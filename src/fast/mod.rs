@@ -601,6 +601,12 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                     out.user_clicks.iter_mut().map(|writer| writer.finish()).collect()
                 })
                 .collect();
+            // Unless `SS_CLICK_GROUP=0` asks for the phase below, a range of
+            // users is grouped when the index pass first asks for one of
+            // them, by the thread that asks, right before it reads them.
+            if !std::env::var_os("SS_CLICK_GROUP").is_some_and(|value| value == "0") {
+                return (indexed::ClickIndex::on_demand(user_click_lists), started.elapsed());
+            }
             // Counting walks every block of every list: all threads share it.
             let ranges = user_click_lists.first().map_or(0, Vec::len);
             let counts: Vec<AtomicU32> = (0..ranges).map(|_| AtomicU32::new(0)).collect();
@@ -715,7 +721,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
             // SAFETY: as above.
             let out = unsafe { b_out.get(0) };
             let extras = indexed::Extras::collect(keys, link_table, &odd_lists, out);
-            indexed::forward_complex_clicks(keys, link_table, &click_index, out);
+            if !click_index.is_on_demand() {
+                indexed::forward_complex_clicks(keys, link_table, &click_index, out);
+            }
             Some((click_index, extras))
         }
         _ => None,
@@ -805,6 +813,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
         {
             // SAFETY: no parallel phase is running; no other reference exists.
             let (b, c, runner) = unsafe { (b_out.get(0), c_out.get(0), runners.get(0)) };
+            if click_index.is_on_demand() {
+                // Grouped on demand, the clicks of complex components are
+                // sent on here, when the index pass has grouped nearly every
+                // range: before it, this one thread would group them all.
+                // Nothing reads these lists before the general pass, and no
+                // other click is written to them in between.
+                indexed::forward_complex_clicks(keys, link_table, click_index, b);
+            }
             indexed::leftover_extras(&shared, runner, b, c);
         }
         let runners = runners.into_inner();

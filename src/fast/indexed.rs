@@ -23,15 +23,16 @@
 //! - A run that reaches a partition's edge may continue in the next one, so
 //!   first and last runs are set aside and joined afterwards (`chains`).
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use super::arena::PartList;
 use super::codes::{unmix, CODE_MASK};
 use super::dedup::{forward, forward_click, forward_named, PassBOut};
 use super::keys::Keys;
 use super::links::{LinkTable, SIMPLE, SLOW};
-use super::parse::CLICK_USERS;
+use super::parse::{CLICK_SHIFT, CLICK_USERS};
 use super::sessions::{PassCOut, Person, ScratchC, Sessions};
 
 const INGEST_MASK: u64 = 0x1F_FFFF;
@@ -269,7 +270,11 @@ fn place_as<const MODE: u8>(lists: &[PartList], scratch: &mut ScratchI) -> bool 
     any
 }
 
-/// The valid clicks of generated user IDs, grouped by user index.
+/// The valid clicks of generated user IDs, grouped by user index: all of
+/// them laid out in a phase of its own (`ClickIndexBuilder`), or a range of
+/// `CLICK_USERS` users at a time, when the first of its users is asked for
+/// (`ClickIndex::on_demand`). Either way `of` gives the same clicks in the
+/// same order.
 pub struct ClickIndex {
     /// `ends[user]` is one past the user's last click in `clicks`; its first
     /// is at `ends[user - 1]` (0 for user 0).
@@ -277,11 +282,158 @@ pub struct ClickIndex {
     /// `[ts since seven days before the window (32 low) | alias (9 bits
     /// above), click code (42 low) | campaign]`.
     clicks: Vec<[u64; 2]>,
+    /// The ranges grouped on demand; `ends` and `clicks` are then empty.
+    on_demand: Option<OnDemand>,
+}
+
+/// A range that nobody has asked for yet.
+const RANGE_NEW: u8 = 0;
+/// A range that one thread is grouping.
+const RANGE_BUSY: u8 = 1;
+/// A range that is grouped: its group is not written to any more.
+const RANGE_READY: u8 = 2;
+/// A range without clicks: it has no group.
+const RANGE_EMPTY: u8 = 3;
+
+/// One range of users of an index grouped on demand.
+struct ClickRange {
+    state: AtomicU8,
+    /// The range's own `ends` (counted from the range's first click) and
+    /// `clicks`. Written once, by the thread that took `state` from new to
+    /// busy, before the range is ready.
+    group: UnsafeCell<(Box<[u32]>, Box<[[u64; 2]]>)>,
+}
+
+/// The click lists of index mode as the parse left them, and what has been
+/// grouped of them so far.
+struct OnDemand {
+    /// Per worker, its click lists by user range.
+    lists: Vec<Vec<PartList>>,
+    ranges: Vec<ClickRange>,
+    /// Clicks in the ranges grouped so far.
+    grouped: AtomicUsize,
+}
+
+// SAFETY: a range's group is written by the one thread that made the range
+// busy, and read only once the range is ready (`OnDemand::of`).
+unsafe impl Sync for OnDemand {}
+
+impl OnDemand {
+    #[inline]
+    fn of(&self, user: u64) -> &[[u64; 2]] {
+        let Some(range) = self.ranges.get((user >> CLICK_SHIFT) as usize) else {
+            return &[];
+        };
+        let mut state = range.state.load(Ordering::Acquire);
+        if state < RANGE_READY {
+            state = self.group((user >> CLICK_SHIFT) as usize);
+        }
+        if state == RANGE_EMPTY {
+            return &[];
+        }
+        // SAFETY: the range is ready, so its group is written and stays as it is.
+        let (ends, clicks) = unsafe { &*range.group.get() };
+        let user = user as usize & (CLICK_USERS - 1);
+        let start = if user == 0 { 0 } else { ends[user - 1] as usize };
+        &clicks[start..ends[user] as usize]
+    }
+
+    /// Groups the range, or waits for the thread that is grouping it; the
+    /// range's state afterwards (ready or empty). The clicks of a user come
+    /// out in the order `ClickIndexBuilder::fill` gives them: list by list.
+    #[cold]
+    #[inline(never)]
+    fn group(&self, at: usize) -> u8 {
+        let range = &self.ranges[at];
+        let mut waited = 0u32;
+        loop {
+            match range.state.compare_exchange(RANGE_NEW, RANGE_BUSY, Ordering::Acquire, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(RANGE_BUSY) => {
+                    // Another thread is at it, for some tens of microseconds.
+                    waited += 1;
+                    if waited % 64 == 0 {
+                        std::thread::yield_now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(state) => return state,
+            }
+        }
+        let mut counts = [0u32; CLICK_USERS];
+        let mut total = 0usize;
+        for per_thread in &self.lists {
+            for block in per_thread[at].blocks() {
+                for click in block.chunks_exact(2) {
+                    counts[((click[0] >> 41) as usize) & (CLICK_USERS - 1)] += 1;
+                }
+                total += block.len() / 2;
+            }
+        }
+        if total == 0 {
+            range.state.store(RANGE_EMPTY, Ordering::Release);
+            return RANGE_EMPTY;
+        }
+        assert!(total <= u32::MAX as usize);
+        let mut ends = vec![0u32; CLICK_USERS].into_boxed_slice();
+        let mut cursors = [0u32; CLICK_USERS];
+        let mut running = 0u32;
+        for user in 0..CLICK_USERS {
+            cursors[user] = running;
+            running += counts[user];
+            ends[user] = running;
+        }
+        let mut clicks: Vec<[u64; 2]> = Vec::with_capacity(total);
+        let target = clicks.as_mut_ptr();
+        for per_thread in &self.lists {
+            for block in per_thread[at].blocks() {
+                for click in block.chunks_exact(2) {
+                    let user = ((click[0] >> 41) as usize) & (CLICK_USERS - 1);
+                    // SAFETY: the same clicks were counted just above, so
+                    // the cursor stays below `total`.
+                    unsafe { *target.add(cursors[user] as usize) = [click[0] & ((1 << 41) - 1), click[1]] };
+                    cursors[user] += 1;
+                }
+            }
+        }
+        // SAFETY: every one of the `total` entries was written just above.
+        unsafe { clicks.set_len(total) };
+        // SAFETY: this thread made the range busy, so no other touches the
+        // group, and none reads it before the range is ready.
+        unsafe { *range.group.get() = (ends, clicks.into_boxed_slice()) };
+        self.grouped.fetch_add(total, Ordering::Relaxed);
+        range.state.store(RANGE_READY, Ordering::Release);
+        RANGE_READY
+    }
 }
 
 impl ClickIndex {
+    /// An index over the per-user-range click lists of index mode (`lists`:
+    /// per worker, its lists by range) that groups a range when the first
+    /// of its users is asked for, on the thread that asks.
+    pub fn on_demand(lists: Vec<Vec<PartList>>) -> Self {
+        let ranges = lists.first().map_or(0, Vec::len);
+        let ranges = (0..ranges)
+            .map(|_| ClickRange { state: AtomicU8::new(RANGE_NEW), group: UnsafeCell::new(Default::default()) })
+            .collect();
+        Self {
+            ends: Vec::new(),
+            clicks: Vec::new(),
+            on_demand: Some(OnDemand { lists, ranges, grouped: AtomicUsize::new(0) }),
+        }
+    }
+
+    /// Whether the ranges are grouped on demand.
+    pub fn is_on_demand(&self) -> bool {
+        self.on_demand.is_some()
+    }
+
     #[inline]
     pub fn of(&self, user: u64) -> &[[u64; 2]] {
+        if let Some(on_demand) = &self.on_demand {
+            return on_demand.of(user);
+        }
         let user = user as usize;
         if user >= self.ends.len() {
             return &[];
@@ -290,12 +442,17 @@ impl ClickIndex {
         &self.clicks[start..self.ends[user] as usize]
     }
 
+    /// The clicks in the index; grouped on demand, those of the ranges
+    /// grouped so far.
     pub fn len(&self) -> usize {
-        self.clicks.len()
+        match &self.on_demand {
+            Some(on_demand) => on_demand.grouped.load(Ordering::Relaxed),
+            None => self.clicks.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clicks.is_empty()
+        self.len() == 0
     }
 }
 
@@ -395,7 +552,7 @@ impl ClickIndexBuilder {
     }
 
     pub fn finish(self) -> ClickIndex {
-        ClickIndex { ends: self.ends, clicks: self.clicks }
+        ClickIndex { ends: self.ends, clicks: self.clicks, on_demand: None }
     }
 }
 
