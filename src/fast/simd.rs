@@ -2492,7 +2492,7 @@ macro_rules! lean_bought_store {
     () => {
         concat!(
             "pext r8, r9, qword ptr [rdx + {part_mask}]\n",
-            "shl r8, 5\n",
+            "shl r8, 4\n",
             "add r8, qword ptr [rdx + {writers}]\n",
             "mov r11, qword ptr [r8]\n",
             "lea r14, [r11 + 24]\n",
@@ -2557,7 +2557,7 @@ macro_rules! lean_store {
     () => {
         concat!(
             "pext r8, r9, qword ptr [rdx + {part_mask}]\n",
-            "shl r8, 5\n",
+            "shl r8, 4\n",
             "add r8, qword ptr [rdx + {writers}]\n",
             "mov r11, qword ptr [r8]\n",
             "lea r13, [r11 + 16]\n",
@@ -2716,7 +2716,7 @@ macro_rules! lean_mix_codes {
             "shr r8, 22\n",
             "mov r15, qword ptr [rdx + {event_shift}]\n",
             "shrx r15, r8, r15\n",
-            "shl r15, 5\n",
+            "shl r15, 4\n",
             "add r15, qword ptr [rdx + {writers}]\n",
         )
     };
@@ -3070,7 +3070,7 @@ pub struct LeanFrame {
     lead: u64,
 }
 
-/// Whether a `PartWriter` is what the loop in assembly takes it for: four
+/// Whether a `PartWriter` is what the loop in assembly takes it for: two
 /// words, the cursor first and the end of the block second, a record of two
 /// words going where the cursor is as long as the end is not passed. Asked
 /// of `reserve` itself, once: with room for exactly one record it must hand
@@ -3079,20 +3079,20 @@ pub struct LeanFrame {
 fn writer_as_assumed() -> bool {
     static ASSUMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ASSUMED.get_or_init(|| {
-        if std::mem::size_of::<PartWriter>() != 32 {
+        if std::mem::size_of::<PartWriter>() != 16 {
             return false;
         }
         let mut block = [0u64; 8];
         let base = block.as_mut_ptr();
         let mut arena = super::arena::Arena::new();
-        // SAFETY: four pointers into `block`, as a writer has them; whatever
-        // their order, `reserve` and `grow` only write `block[1..3]`.
+        // SAFETY: two pointers into `block`, as a writer has them; with room
+        // for exactly one record, `reserve` touches nothing but the writer.
         let assumed = unsafe {
-            let words: [*mut u64; 4] = [base, base.add(2), base.add(1), base.add(1)];
+            let words: [*mut u64; 2] = [base, base.add(2)];
             let mut writer: PartWriter = std::mem::transmute(words);
             let at = writer.reserve(&mut arena, super::EVENT_BLOCK, 2);
-            let after: [*mut u64; 4] = std::mem::transmute(writer);
-            at == base && after == [base.add(2), base.add(2), base.add(1), base.add(1)]
+            let after: [*mut u64; 2] = std::mem::transmute(writer);
+            at == base && after == [base.add(2), base.add(2)]
         };
         if std::env::var_os("SS_TIMING").is_some() {
             eprintln!("SS_TIMING note=event_store_in_assembly={assumed}");
@@ -6013,7 +6013,7 @@ mod tests {
         let mut lists = Vec::new();
         for writer in out.events.iter_mut().chain(out.indexed.iter_mut()) {
             let mut words = Vec::new();
-            writer.finish().copy_into(&mut words);
+            writer.finish(crate::fast::EVENT_BLOCK).copy_into(&mut words);
             lists.push(words);
         }
         lists.push(out.odd_event_users.clone());
@@ -6073,8 +6073,12 @@ mod tests {
                         parse_clicks_chunk_with(&ctx, file, 0, file.len(), &mut out, kernel);
                     }
                     times[kernel as usize].push(started.elapsed().as_secs_f64() * 1e3);
-                    stored[kernel as usize] = out.clicks.finish().words()
-                        + out.user_clicks.iter_mut().map(|writer| writer.finish().words()).sum::<usize>();
+                    stored[kernel as usize] = out.clicks.finish(crate::fast::parse::RAW_CLICK_BLOCK).words()
+                        + out
+                            .user_clicks
+                            .iter_mut()
+                            .map(|writer| writer.finish(crate::fast::parse::USER_CLICK_BLOCK).words())
+                            .sum::<usize>();
                 }
             }
             // Every kernel must have stored the same number of words.

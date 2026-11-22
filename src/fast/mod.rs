@@ -669,7 +669,7 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 .map(|thread| {
                     // SAFETY: the parse workers have finished; no other reference exists.
                     let out = unsafe { parse_out.get(thread) };
-                    out.user_clicks.iter_mut().map(|writer| writer.finish()).collect()
+                    out.user_clicks.iter_mut().map(|writer| writer.finish(parse::USER_CLICK_BLOCK)).collect()
                 })
                 .collect();
             // Counting walks every block of every list: all threads share it.
@@ -730,14 +730,14 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     let kept_click_ids: Vec<Vec<(u8, u128)>> =
         parse_out.iter_mut().map(|out| std::mem::take(&mut out.click_ids)).collect();
     let event_lists: Vec<Vec<PartList>> =
-        parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+        parse_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
     // Events whose ID is long and hexadecimal, by the same partitions.
     let long_event_lists: Vec<Vec<PartList>> =
-        parse_out.iter_mut().map(|out| out.long_events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+        parse_out.iter_mut().map(|out| out.long_events.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
     // Index mode: per worker, one list per index partition.
     let indexed_lists: Vec<Vec<PartList>> =
-        parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish()).collect()).collect();
-    let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish()).collect();
+        parse_out.iter_mut().map(|out| out.indexed.iter_mut().map(|writer| writer.finish(EVENT_BLOCK)).collect()).collect();
+    let click_lists: Vec<PartList> = parse_out.iter_mut().map(|out| out.clicks.finish(parse::RAW_CLICK_BLOCK)).collect();
     let click_blocks: Vec<&[u64]> = click_lists.iter().flat_map(PartList::blocks).collect();
     let click_batches: Vec<&[&[u64]]> = click_blocks.chunks(CLICK_BATCH).collect();
     let b_out: Slots<PassBOut> = Slots::new(threads, || PassBOut::new(&ctx));
@@ -812,7 +812,8 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
                 .map(|thread| {
                     // SAFETY: no parallel phase is running; no other reference exists.
                     let out = unsafe { b_out.get(thread) };
-                    out.events.iter_mut().map(|writer| std::mem::replace(writer, PartWriter::EMPTY).finish()).collect()
+                    let block = out.event_block;
+                    out.events.iter_mut().map(|writer| std::mem::replace(writer, PartWriter::EMPTY).finish(block)).collect()
                 })
                 .collect();
             // SAFETY: as above.
@@ -970,9 +971,9 @@ fn run_once(data: &Path, output: &Path, threads: usize, indexed: bool) -> std::i
     // Pass C.
     let mut b_out = b_out.into_inner();
     let person_events: Vec<Vec<PartList>> =
-        b_out.iter_mut().map(|out| out.events.iter_mut().map(|writer| writer.finish()).collect()).collect();
+        b_out.iter_mut().map(|out| { let block = out.event_block; out.events.iter_mut().map(|writer| writer.finish(block)).collect() }).collect();
     let person_clicks: Vec<Vec<PartList>> =
-        b_out.iter_mut().map(|out| out.clicks.iter_mut().map(|writer| writer.finish()).collect()).collect();
+        b_out.iter_mut().map(|out| { let block = out.click_block; out.clicks.iter_mut().map(|writer| writer.finish(block)).collect() }).collect();
     timing.detail("serial_sessions_setup", serial_started.elapsed().as_secs_f64() * 1e3);
     let next = AtomicUsize::new(0);
     parallel(threads, |thread| {

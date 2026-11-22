@@ -2445,9 +2445,9 @@ mod tests {
         };
         for partition in partitions {
             let workers = rng.range(1, 4) as usize;
-            // Two header words per block, and room for at least one record.
-            let event_block = rng.pick(&[4, 5, 7, 512]);
-            let click_block = rng.pick(&[4, 5, 6, 256]);
+            // Three header words per block, and room for at least one record.
+            let event_block = rng.pick(&[5, 6, 7, 512]);
+            let click_block = rng.pick(&[5, 6, 7, 256]);
             let mut arenas: Vec<Arena> = (0..workers).map(|_| Arena::new()).collect();
             let mut event_writers = vec![PartWriter::EMPTY; workers];
             let mut click_writers = vec![PartWriter::EMPTY; workers];
@@ -2475,8 +2475,8 @@ mod tests {
                     *at.add(1) = click.code | (u64::from(click.campaign) << 42);
                 }
             }
-            let event_lists: Vec<PartList> = event_writers.iter_mut().map(PartWriter::finish).collect();
-            let click_lists: Vec<PartList> = click_writers.iter_mut().map(PartWriter::finish).collect();
+            let event_lists: Vec<PartList> = event_writers.iter_mut().map(|writer| writer.finish(event_block)).collect();
+            let click_lists: Vec<PartList> = click_writers.iter_mut().map(|writer| writer.finish(click_block)).collect();
             partition_core(partition.part, &event_lists, &click_lists, &world.exotic, &mut out, &mut scratch);
         }
         tables_of(&out)

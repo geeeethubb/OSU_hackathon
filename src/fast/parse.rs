@@ -240,7 +240,7 @@ impl ParseOut {
 pub const CLICK_SHIFT: u32 = 9;
 pub const CLICK_USERS: usize = 1 << CLICK_SHIFT;
 /// Words per block of those lists: a list holds a few hundred clicks.
-const USER_CLICK_BLOCK: usize = 128;
+pub const USER_CLICK_BLOCK: usize = 128;
 
 /// How many click lists cover every user index below the keys' bound.
 pub fn click_parts(keys: &Keys) -> usize {
