@@ -6,8 +6,6 @@
 
 use super::arena::{Arena, PartWriter};
 use super::codes::{id_code, mix};
-use super::dedup::{forward_click, PassBOut};
-use super::links::LinkTable;
 use super::keys::{base36_value, Keys};
 use super::{Ctx, EVENT_BLOCK};
 use crate::util::{parse_price, parse_ts, split_fields, LATE_MS, WEEK_MS};
@@ -83,72 +81,6 @@ pub struct ParseOut {
     pub links: Vec<(u64, u64)>,
     /// The long click IDs this worker kept (`Interner::per_thread`).
     pub click_ids: Vec<(u8, u128)>,
-    /// While a click task runs with the link table at hand: where its clicks
-    /// go instead of the raw list (`DirectClicks`).
-    pub direct: Option<DirectClicks>,
-}
-
-/// Clicks waiting in `DirectClicks` while their link-table slot loads.
-const DIRECT_AHEAD: usize = 16;
-
-/// Clicks of the general path sent to their person's partition as they are
-/// parsed, when the link table is ready by the time their task starts (it is
-/// built beside the event tasks, which all come first): the record
-/// `dedup::map_clicks` would write later, without the raw list in between
-/// and without the pass that reads it again. A click's person does not
-/// depend on any other click, and the order of a person's clicks never
-/// matters (the sessions pass orders them itself).
-pub struct DirectClicks {
-    links: *const LinkTable,
-    out: *mut PassBOut,
-    /// User, click code and campaign, ts: what `emit_code_click` was given;
-    /// then what `LinkTable::probe` returned for the user.
-    ring: [[u64; 5]; DIRECT_AHEAD],
-    waiting: usize,
-    slot: usize,
-}
-
-// SAFETY: a `DirectClicks` is made for one task on one worker thread, which
-// owns the `PassBOut` slot it writes to for the whole phase; the link table
-// is only read.
-unsafe impl Send for DirectClicks {}
-
-impl DirectClicks {
-    /// # Safety
-    /// `links` and `out` outlive the value, and nothing else uses `out`
-    /// while it is alive.
-    pub unsafe fn new(links: &LinkTable, out: &mut PassBOut) -> Self {
-        DirectClicks { links, out, ring: [[0; 5]; DIRECT_AHEAD], waiting: 0, slot: 0 }
-    }
-
-    /// One click: its slot starts loading now; the click 16 before it goes.
-    #[inline(never)]
-    fn push(&mut self, user: u64, code_and_campaign: u64, ts: u64) {
-        // SAFETY: as `new` requires.
-        let (links, out) = unsafe { (&*self.links, &mut *self.out) };
-        let [hash, at] = links.probe(user);
-        if self.waiting == DIRECT_AHEAD {
-            let [old_user, old_code, old_ts, old_hash, old_at] = self.ring[self.slot];
-            forward_click(out, links.person_probed(old_user, [old_hash, old_at]), old_ts, old_code);
-        } else {
-            self.waiting += 1;
-        }
-        self.ring[self.slot] = [user, code_and_campaign, ts, hash, at];
-        self.slot = (self.slot + 1) % DIRECT_AHEAD;
-    }
-
-    /// Forwards the clicks still waiting, oldest first.
-    pub fn flush(&mut self) {
-        // SAFETY: as `new` requires.
-        let (links, out) = unsafe { (&*self.links, &mut *self.out) };
-        let first = if self.waiting == DIRECT_AHEAD { self.slot } else { 0 };
-        for offset in 0..self.waiting {
-            let [user, code, ts, hash, at] = self.ring[(first + offset) % DIRECT_AHEAD];
-            forward_click(out, links.person_probed(user, [hash, at]), ts, code);
-        }
-        self.waiting = 0;
-        self.slot = 0;
-    }
 }
 
 /// Words per block of a worker's click list, and words per click in it.
@@ -170,7 +102,6 @@ impl ParseOut {
             index_shift: ctx.keys.map_or(0, |keys| keys.index_shift),
             links: Vec::new(),
             click_ids: Vec::new(),
-            direct: None,
         }
     }
 }
@@ -203,10 +134,6 @@ pub fn click_indexed_form(keys: &Keys, click: ClickRecord) -> ClickRecord {
 /// worker's click list.
 #[inline(always)]
 pub fn emit_code_click(out: &mut ParseOut, user: u64, code_and_campaign: u64, ts: u64) {
-    if let Some(direct) = out.direct.as_mut() {
-        direct.push(user, code_and_campaign, ts);
-        return;
-    }
     let at = out.clicks.reserve(&mut out.arena, RAW_CLICK_BLOCK, RAW_CLICK_WORDS);
     // SAFETY: `reserve` returned room for three words.
     unsafe {
